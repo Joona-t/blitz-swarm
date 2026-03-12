@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+output/
+*.db
+memory_vectors/
+.venv/
+*.egg-info/
+dist/
+build/
+compass_artifact_*.md

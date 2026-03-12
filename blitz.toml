@@ -1,0 +1,31 @@
+# Blitz-Swarm Configuration
+
+[swarm]
+max_rounds = 5
+default_model = "sonnet"
+timeout_seconds = 180
+max_agents = 12
+
+[memory]
+max_context_tokens = 2000
+top_k_retrieval = 2
+hop_expansion = 1
+insight_dedup_threshold = 0.85
+query_link_threshold = 0.7
+llm_ops_threshold = 10  # activate LLM memory ops after this many queries
+
+[redis]
+host = "localhost"
+port = 6379
+db = 0
+
+[storage]
+sqlite_path = "memory.db"
+lancedb_path = "./memory_vectors"
+output_dir = "./output"
+
+[eviction]
+query_archive_days = 90
+interaction_purge_days = 30
+max_archive_per_cycle = 50
+cycle_frequency = 10  # run eviction every N tasks

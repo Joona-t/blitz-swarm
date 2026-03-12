@@ -1,0 +1,17 @@
+[project]
+name = "blitz-swarm"
+version = "0.1.0"
+description = "Parallel multi-agent swarm architecture for collective AI intelligence"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+authors = [{ name = "Joona", email = "joona@darkfire.dev" }]
+dependencies = [
+    "redis>=5.0",
+    "aiosqlite>=0.20",
+    "lancedb>=0.6",
+    "sentence-transformers>=3.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio"]
