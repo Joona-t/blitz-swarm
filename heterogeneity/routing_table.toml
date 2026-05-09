@@ -1,0 +1,41 @@
+# Cross-CLI routing table for blitz-swarm v0.2.
+#
+# Maps (domain, role) -> cli_id. Defaults under [default] apply when no
+# domain-specific override exists. Fallback to claude if a CLI is missing.
+#
+# Anchor: Maryanskyy 2603.20324 — heterogeneity helps iff paired with
+# judge-driven selection (selector_synth, Phase 1). Without selection,
+# heterogeneous teams underperform homogeneous; the routing here only
+# pays off when selector.enabled = true.
+
+[default]
+researcher       = "claude"
+critic_factual   = "gemini"     # web grounding
+critic_logical   = "claude"
+critic_counterfactual = "claude"
+synthesizer      = "claude"
+selector_synth   = "claude"
+debater          = "codex"      # adversarial bias
+judge            = "claude"
+fact_checker     = "gemini"
+
+[domain.code]
+researcher       = "codex"
+critic_factual   = "claude"
+synthesizer      = "claude"
+
+[domain.logical-reasoning]
+researcher       = "claude"
+critic_logical   = "claude"
+debater          = "gemini"
+
+[domain.factual]
+researcher       = "gemini"
+critic_factual   = "gemini"
+
+[domain.crypto]
+# Crypto-specialized: keep the v0.1.x homogeneous path by default since
+# the prompts are deeply tuned for Claude. Heterogeneity opt-in here.
+researcher       = "claude"
+critic_factual   = "claude"
+synthesizer      = "claude"
