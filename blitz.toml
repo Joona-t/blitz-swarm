@@ -5,6 +5,14 @@ max_rounds = 4
 default_model = "sonnet"
 timeout_seconds = 300
 max_agents = 10
+# Domain preset for role prompts. Loads from prompts/<domain>/.
+# Built-in: "general" (default), "crypto" (v0.1.x trading-research preset).
+# Custom domains: drop a folder in prompts/ with the same role files.
+domain = "crypto"
+# MAR-style persona-typed critics (factual / logical / counterfactual).
+# Off by default — flip to true to use the persona registry from
+# prompts/loader.py::assign_personas. Phase 1 mechanism (arXiv 2512.20845).
+persona_critics = false
 
 [memory]
 max_context_tokens = 2000

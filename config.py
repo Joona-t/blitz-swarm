@@ -16,6 +16,8 @@ class SwarmConfig:
     default_model: str = "sonnet"
     timeout_seconds: int = 180
     max_agents: int = 12
+    domain: str = "general"           # which prompts/<domain>/ preset to load
+    persona_critics: bool = False     # MAR-style persona-typed critics (Phase 1 opt-in)
 
 
 @dataclass

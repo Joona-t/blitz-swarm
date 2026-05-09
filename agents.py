@@ -1,7 +1,24 @@
-"""Agent definitions, role prompts, and swarm planning for Blitz-Swarm."""
+"""Agent definitions, role prompts, and swarm planning for Blitz-Swarm.
+
+v0.2: prompts are loaded from `prompts/<domain>/<role>[_<persona>].md`
+via `prompts.loader.PromptLoader`. The legacy inline ROLE_PROMPTS dict
+below is kept as a backward-compat fallback when no prompt files are on
+disk; v0.3 will drop it.
+
+Domain selection comes from `blitz.toml [swarm] domain = "..."`. Persona
+critics activate when `[swarm] persona_critics = true` (MAR mechanism,
+arXiv 2512.20845).
+"""
 
 import json
 from dataclasses import dataclass, field
+
+from prompts.loader import (
+    PromptLoader,
+    PromptLoaderError,
+    PromptSet,
+    assign_personas,
+)
 
 # ---------------------------------------------------------------------------
 # Agent output schema — passed to claude --json-schema for structured output
@@ -86,6 +103,14 @@ class BlitzAgent:
     system_prompt: str
     model: str = "sonnet"
     max_iterations: int = 3
+    # v0.2: persona-typed critics (MAR mechanism). None for non-critic roles
+    # or single-critic mode. Populated by `plan_agents` when
+    # blitz.toml `[swarm] persona_critics = true`.
+    persona: str | None = None
+    # Path to the prompt file used (for trace metadata in metrics.jsonl).
+    prompt_path: str | None = None
+    # SHA-256 of the prompt file content (for cross-version diffing).
+    prompt_sha256: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -298,12 +323,59 @@ PLANNING_SCHEMA = json.dumps({
 })
 
 
-def plan_agents(topic: str, use_llm: bool = True) -> list[BlitzAgent]:
+def _resolve_role_prompt(
+    loader: PromptLoader,
+    role: str,
+    *,
+    persona: str | None = None,
+) -> tuple[str, str | None, str | None]:
+    """Load a role prompt via PromptLoader; fall back to ROLE_PROMPTS dict on miss.
+
+    Returns: (system_prompt, prompt_path_str_or_None, sha256_or_None).
+    Fallback path returns (None, None) for path/sha so the metrics layer
+    can distinguish disk-loaded prompts from inline-fallback prompts.
+    """
+    try:
+        prompt_set: PromptSet = loader.load(role, persona=persona)
+        return prompt_set.system, str(prompt_set.template_path), prompt_set.sha256
+    except PromptLoaderError:
+        if role in ROLE_PROMPTS:
+            return ROLE_PROMPTS[role], None, None
+        raise
+
+
+def plan_agents(
+    topic: str,
+    use_llm: bool = True,
+    *,
+    domain: str | None = None,
+    persona_critics: bool | None = None,
+) -> list[BlitzAgent]:
     """Plan which agents to spawn for a given topic.
 
     When use_llm=True, invokes an LLM to analyze the topic and determine
     optimal agent count and subtopic assignments. Falls back to heuristic.
+
+    `domain` selects which preset under prompts/<domain>/ is used. If None,
+    reads from blitz.toml [swarm] domain.
+
+    `persona_critics` enables MAR-style persona-typed critic prompts (Phase 1).
+    If None, reads from blitz.toml [swarm] persona_critics.
     """
+    if domain is None or persona_critics is None:
+        try:
+            from config import load_config
+            cfg = load_config()
+            if domain is None:
+                domain = cfg.swarm.domain
+            if persona_critics is None:
+                persona_critics = cfg.swarm.persona_critics
+        except Exception:
+            domain = domain or "general"
+            persona_critics = bool(persona_critics)
+
+    loader = PromptLoader(domain=domain)
+
     plan = None
 
     if use_llm:
@@ -321,62 +393,104 @@ def plan_agents(topic: str, use_llm: bool = True) -> list[BlitzAgent]:
     critic_count = plan["critic_count"]
     needs_fc = plan["needs_fact_checker"]
 
-    # Get subtopics
     subtopics = plan.get("subtopics")
     if subtopics and len(subtopics) >= researcher_count:
         subtopics = [f"{topic} — focusing on {st}" for st in subtopics[:researcher_count]]
     else:
         subtopics = _split_subtopics_heuristic(topic, researcher_count)
 
-    agents = []
+    agents: list[BlitzAgent] = []
 
-    # Spawn researchers
+    # Researchers
     for i, subtopic in enumerate(subtopics):
+        sys_prompt, path, sha = _resolve_role_prompt(loader, "researcher")
         agents.append(BlitzAgent(
             id=f"researcher_{i:02d}",
             role="researcher",
             subtopic=subtopic,
-            system_prompt=ROLE_PROMPTS["researcher"],
+            system_prompt=sys_prompt,
             model=ROLE_MODEL_OVERRIDES.get("researcher", "sonnet"),
+            prompt_path=path,
+            prompt_sha256=sha,
         ))
 
-    # Spawn critics
-    for i in range(critic_count):
-        suffix = f"_{i:02d}" if critic_count > 1 else ""
-        agents.append(BlitzAgent(
-            id=f"critic{suffix}",
-            role="critic",
-            subtopic=topic,
-            system_prompt=ROLE_PROMPTS["critic"],
-            model="sonnet",
-        ))
+    # Critics — with personas if persona_critics enabled and we have files for them
+    use_personas = bool(persona_critics) and critic_count >= 1
+    if use_personas:
+        # assign_personas returns N persona names for N slots
+        personas = assign_personas(critic_count, round_n=1, has_unresolved_dissent=False)
+        # Verify each persona prompt actually exists for the active domain (with fallback);
+        # if any is missing, drop back to plain critic.
+        for p in personas:
+            try:
+                loader.load("critic", persona=p)
+            except PromptLoaderError:
+                use_personas = False
+                break
 
-    # Spawn fact-checker
+    if use_personas:
+        for i, persona in enumerate(personas):
+            sys_prompt, path, sha = _resolve_role_prompt(loader, "critic", persona=persona)
+            suffix = f"_{persona}" if critic_count > 1 else f"_{persona}"
+            agents.append(BlitzAgent(
+                id=f"critic{suffix}",
+                role="critic",
+                subtopic=topic,
+                system_prompt=sys_prompt,
+                model="sonnet",
+                persona=persona,
+                prompt_path=path,
+                prompt_sha256=sha,
+            ))
+    else:
+        for i in range(critic_count):
+            sys_prompt, path, sha = _resolve_role_prompt(loader, "critic")
+            suffix = f"_{i:02d}" if critic_count > 1 else ""
+            agents.append(BlitzAgent(
+                id=f"critic{suffix}",
+                role="critic",
+                subtopic=topic,
+                system_prompt=sys_prompt,
+                model="sonnet",
+                prompt_path=path,
+                prompt_sha256=sha,
+            ))
+
+    # Fact-checker
     if needs_fc:
+        sys_prompt, path, sha = _resolve_role_prompt(loader, "fact_checker")
         agents.append(BlitzAgent(
             id="fact_checker",
             role="fact_checker",
             subtopic=topic,
-            system_prompt=ROLE_PROMPTS["fact_checker"],
+            system_prompt=sys_prompt,
             model="sonnet",
+            prompt_path=path,
+            prompt_sha256=sha,
         ))
 
-    # Always: 1 quality judge
+    # Quality judge — always exactly 1
+    sys_prompt, path, sha = _resolve_role_prompt(loader, "quality_judge")
     agents.append(BlitzAgent(
         id="quality_judge",
         role="quality_judge",
         subtopic=topic,
-        system_prompt=ROLE_PROMPTS["quality_judge"],
+        system_prompt=sys_prompt,
         model=ROLE_MODEL_OVERRIDES.get("quality_judge", "sonnet"),
+        prompt_path=path,
+        prompt_sha256=sha,
     ))
 
-    # Always: 1 synthesizer
+    # Synthesizer — always exactly 1
+    sys_prompt, path, sha = _resolve_role_prompt(loader, "synthesizer")
     agents.append(BlitzAgent(
         id="synthesizer",
         role="synthesizer",
         subtopic=topic,
-        system_prompt=ROLE_PROMPTS["synthesizer"],
+        system_prompt=sys_prompt,
         model=ROLE_MODEL_OVERRIDES.get("synthesizer", "sonnet"),
+        prompt_path=path,
+        prompt_sha256=sha,
     ))
 
     return agents
