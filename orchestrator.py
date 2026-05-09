@@ -12,6 +12,7 @@ import re
 import subprocess
 import sys
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -20,6 +21,7 @@ from agents import (
     BlitzAgent,
     plan_agents,
 )
+from config import load_config
 from consensus import (
     check_consensus,
     extract_dissent,
@@ -27,15 +29,20 @@ from consensus import (
     format_dissent_section,
     should_override_holdout,
 )
+from metrics import MetricsCollector
 
 # ---------------------------------------------------------------------------
-# Constants
+# Constants — loaded from config.py / blitz.toml
 # ---------------------------------------------------------------------------
 
-DEFAULT_MAX_ROUNDS = 5
-AGENT_TIMEOUT_SECONDS = 180
-OUTPUT_DIR = Path(__file__).parent / "output"
-MAX_CONTEXT_TOKENS = 2000
+_config = load_config()
+
+DEFAULT_MAX_ROUNDS = _config.swarm.max_rounds
+AGENT_TIMEOUT_SECONDS = _config.swarm.timeout_seconds
+OUTPUT_DIR = Path(_config.storage.output_dir) if not Path(_config.storage.output_dir).is_absolute() else Path(_config.storage.output_dir)
+if not OUTPUT_DIR.is_absolute():
+    OUTPUT_DIR = Path(__file__).parent / _config.storage.output_dir
+MAX_CONTEXT_TOKENS = _config.memory.max_context_tokens
 MAX_CONTEXT_CHARS = MAX_CONTEXT_TOKENS * 4
 
 # ---------------------------------------------------------------------------
@@ -43,53 +50,111 @@ MAX_CONTEXT_CHARS = MAX_CONTEXT_TOKENS * 4
 # ---------------------------------------------------------------------------
 
 
-def invoke_agent(agent: BlitzAgent, context: str, task: str) -> dict:
+def invoke_agent(agent: BlitzAgent, context: str, task: str,
+                  max_retries: int = 1) -> dict:
     """Invoke a single agent as a subprocess via the Claude CLI.
 
-    Returns parsed JSON output from the agent, or an error dict on failure.
+    Retries once on parse failure. Extracts cost data from the CLI envelope.
+    Attempts partial output recovery on timeout.
     """
-    user_prompt = _build_user_prompt(agent, context, task)
-
-    cmd = [
-        "claude",
-        "-p", user_prompt,
-        "--system-prompt", agent.system_prompt,
-        "--output-format", "json",
-        "--model", agent.model,
-        "--dangerously-skip-permissions",
-    ]
-
-    start = time.monotonic()
     agent_label = f"{agent.role}({agent.id})"
+    trace_id = str(uuid.uuid4())
+    _envelope_cost = {}  # cost data extracted from CLI envelope
 
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=AGENT_TIMEOUT_SECONDS,
-        )
+    def _tag(output: dict) -> dict:
+        """Inject trace metadata and cost data into every output."""
+        output["_trace_id"] = trace_id
+        output["_wall_clock_s"] = round(time.monotonic() - _invoke_start, 1)
+        output.update(_envelope_cost)
+        return output
 
-        elapsed = time.monotonic() - start
-        print(f"  {agent_label} done [{elapsed:.1f}s]")
+    _invoke_start = time.monotonic()
 
-        if result.returncode != 0:
-            print(f"  {agent_label} ERROR: exit code {result.returncode}")
-            stderr_snippet = (result.stderr or "")[:200]
-            if stderr_snippet:
-                print(f"    stderr: {stderr_snippet}")
-            return _error_output(agent, f"Process exited with code {result.returncode}")
+    for attempt in range(1 + max_retries):
+        user_prompt = _build_user_prompt(agent, context, task)
 
-        return _parse_agent_output(agent, result.stdout)
+        cmd = [
+            "claude",
+            "-p", user_prompt,
+            "--system-prompt", agent.system_prompt,
+            "--output-format", "json",
+            "--model", agent.model,
+            "--max-turns", "3",
+            "--dangerously-skip-permissions",
+        ]
 
-    except subprocess.TimeoutExpired:
-        elapsed = time.monotonic() - start
-        print(f"  {agent_label} TIMEOUT [{elapsed:.1f}s]")
-        return _error_output(agent, f"Timed out after {AGENT_TIMEOUT_SECONDS}s")
+        start = time.monotonic()
 
-    except Exception as e:
-        print(f"  {agent_label} EXCEPTION: {e}")
-        return _error_output(agent, str(e))
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=AGENT_TIMEOUT_SECONDS,
+            )
+            elapsed = time.monotonic() - start
+
+            # Extract cost data from CLI envelope before parsing
+            try:
+                _env = json.loads(result.stdout)
+                if isinstance(_env, dict):
+                    _envelope_cost["_cost_usd"] = _env.get("total_cost_usd", 0)
+                    _usage = _env.get("usage", {})
+                    _envelope_cost["_input_tokens"] = _usage.get("input_tokens", 0)
+                    _envelope_cost["_output_tokens"] = _usage.get("output_tokens", 0)
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+            if result.returncode != 0:
+                stderr = (result.stderr or "")[:300]
+                stdout_preview = (result.stdout or "")[:300]
+                print(f"  {agent_label} ERROR: exit {result.returncode}")
+                if stderr:
+                    print(f"    stderr: {stderr}")
+                if stdout_preview:
+                    print(f"    stdout: {stdout_preview}")
+                return _tag(_error_output(agent, f"Exit code {result.returncode}"))
+
+            output = _parse_agent_output(agent, result.stdout)
+
+            # Retry on malformed output (raw text, not structured JSON)
+            if output.get("_raw") and attempt < max_retries:
+                print(f"  {agent_label} malformed output, retrying [{elapsed:.1f}s]")
+                task = (
+                    f"{task}\n\n"
+                    f"IMPORTANT: Your previous response was not valid JSON. "
+                    f"Respond with ONLY a JSON object, no other text."
+                )
+                continue
+
+            if not output.get("_error"):
+                retry_note = f" (retry {attempt})" if attempt > 0 else ""
+                print(f"  {agent_label} done [{elapsed:.1f}s]{retry_note}")
+            return _tag(output)
+
+        except subprocess.TimeoutExpired as e:
+            elapsed = time.monotonic() - start
+            # Try to recover partial output from the timed-out process
+            partial_stdout = ""
+            if e.stdout:
+                partial_stdout = (
+                    e.stdout if isinstance(e.stdout, str)
+                    else e.stdout.decode("utf-8", errors="replace")
+                )
+            if partial_stdout.strip():
+                output = _parse_agent_output(agent, partial_stdout)
+                if not output.get("_raw") and not output.get("_error"):
+                    output["_partial"] = True
+                    print(f"  {agent_label} TIMEOUT [{elapsed:.1f}s] (recovered partial output)")
+                    return _tag(output)
+            print(f"  {agent_label} TIMEOUT [{elapsed:.1f}s]")
+            return _tag(_error_output(agent, f"Timed out after {AGENT_TIMEOUT_SECONDS}s"))
+
+        except Exception as e:
+            print(f"  {agent_label} EXCEPTION: {e}")
+            return _tag(_error_output(agent, str(e)))
+
+    return _tag(_error_output(agent, "All retries exhausted"))
 
 
 def _build_user_prompt(agent: BlitzAgent, context: str, task: str) -> str:
@@ -105,7 +170,9 @@ def _build_user_prompt(agent: BlitzAgent, context: str, task: str) -> str:
 
     sections.append(
         "## Output Format\n"
-        "Respond with a JSON object containing these fields:\n"
+        "CRITICAL: Do NOT use any tools. Do NOT read files or run commands. "
+        "Respond directly from your knowledge with ONLY a JSON object.\n\n"
+        "JSON fields:\n"
         "- findings (string): Your detailed analysis in markdown\n"
         "- key_points (array of strings): Most important takeaways\n"
         "- confidence (number 0-1): Your confidence in accuracy\n"
@@ -115,25 +182,69 @@ def _build_user_prompt(agent: BlitzAgent, context: str, task: str) -> str:
         "- dissent (string): Any disagreements with other findings"
     )
 
+    if agent.role == "quality_judge":
+        sections.append(
+            "## Quality Scores (REQUIRED for quality_judge)\n"
+            "Include these numeric fields in your JSON:\n"
+            "- coverage_score (number 0-10)\n"
+            "- accuracy_score (number 0-10)\n"
+            "- clarity_score (number 0-10)\n"
+            "- depth_score (number 0-10)"
+        )
+
     return "\n\n".join(sections)
 
 
 def _parse_agent_output(agent: BlitzAgent, stdout: str) -> dict:
     """Parse agent stdout into a structured dict.
 
-    Tries JSON parsing first, then falls back to extracting JSON from
-    markdown code blocks if the raw output isn't valid JSON.
+    Handles CLI envelope unwrapping, then tries JSON parsing, markdown
+    code blocks, and brace extraction. Sets _raw flag on unstructured output.
     """
     stdout = stdout.strip()
     if not stdout:
         return _error_output(agent, "Empty output")
 
+    # --output-format json wraps response in a CLI envelope.
+    # Unwrap the "result" field first.
+    try:
+        envelope = json.loads(stdout)
+        if isinstance(envelope, dict) and "result" in envelope:
+            inner = envelope["result"]
+            if isinstance(inner, dict):
+                inner["agent_id"] = agent.id
+                inner["role"] = agent.role
+                return inner
+            if inner is None:
+                return _error_output(agent, "No result (model may have exhausted turns)")
+            # result is a string — continue parsing below
+            stdout = str(inner).strip()
+        elif isinstance(envelope, dict) and "type" in envelope and "num_turns" in envelope:
+            # CLI envelope without result — model exhausted turns
+            return {
+                "agent_id": agent.id,
+                "role": agent.role,
+                "findings": f"Agent exhausted {envelope.get('num_turns', '?')} turns",
+                "_raw": True,
+                "key_points": [],
+                "confidence": 0.0,
+                "quality_vote": "needs_work",
+                "quality_notes": "Agent exhausted turn limit",
+                "dissent": "",
+            }
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    if not stdout:
+        return _error_output(agent, "Empty result after envelope unwrap")
+
     # Try direct JSON parse
     try:
         data = json.loads(stdout)
-        data["agent_id"] = agent.id
-        data["role"] = agent.role
-        return data
+        if isinstance(data, dict):
+            data["agent_id"] = agent.id
+            data["role"] = agent.role
+            return data
     except json.JSONDecodeError:
         pass
 
@@ -142,9 +253,10 @@ def _parse_agent_output(agent: BlitzAgent, stdout: str) -> dict:
     if json_match:
         try:
             data = json.loads(json_match.group(1))
-            data["agent_id"] = agent.id
-            data["role"] = agent.role
-            return data
+            if isinstance(data, dict):
+                data["agent_id"] = agent.id
+                data["role"] = agent.role
+                return data
         except json.JSONDecodeError:
             pass
 
@@ -153,13 +265,14 @@ def _parse_agent_output(agent: BlitzAgent, stdout: str) -> dict:
     if brace_match:
         try:
             data = json.loads(brace_match.group(0))
-            data["agent_id"] = agent.id
-            data["role"] = agent.role
-            return data
+            if isinstance(data, dict):
+                data["agent_id"] = agent.id
+                data["role"] = agent.role
+                return data
         except json.JSONDecodeError:
             pass
 
-    # Last resort: wrap raw text as findings
+    # Last resort: wrap raw text as findings (flagged as _raw for retry)
     return {
         "agent_id": agent.id,
         "role": agent.role,
@@ -170,6 +283,7 @@ def _parse_agent_output(agent: BlitzAgent, stdout: str) -> dict:
         "quality_vote": "needs_work",
         "quality_notes": "Agent produced unstructured output",
         "dissent": "",
+        "_raw": True,
     }
 
 
@@ -452,9 +566,15 @@ async def run_swarm(
     re-blasts with updated blackboard context. The synthesizer runs once
     after consensus or max rounds.
     """
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+
     print(f"\n{'='*60}")
     print(f"BLITZ-SWARM — {topic}")
     print(f"{'='*60}\n")
+
+    # --- METRICS: Initialize ---
+    mc = MetricsCollector()
+    mc.start_run(run_id, topic)
 
     # --- SPAWN ---
     agents = plan_agents(topic)
@@ -494,11 +614,16 @@ async def run_swarm(
     accumulated_outputs = []  # flat list of all outputs across rounds
     consensus_reached = False
     override_applied = False
+    final_round_n = 0
 
     # --- BLAST + CHECK loop ---
     for round_n in range(1, max_rounds + 1):
+        final_round_n = round_n
         if bb:
             bb.advance_round()
+
+        round_label = f"round_{round_n}"
+        mc.start_round(round_label)
 
         print(f"--- Round {round_n}/{max_rounds}: "
               f"{len(blast_agents_list)} agents blasting ---")
@@ -564,6 +689,9 @@ async def run_swarm(
         all_round_outputs.append(round_outputs)
         accumulated_outputs = [o for rnd in all_round_outputs for o in rnd]
 
+        # --- METRICS: End round ---
+        mc.end_round(round_label, round_outputs)
+
         # --- CHECK ---
         eval_votes = [o for o in round_outputs
                       if o.get("role") in ("critic", "fact_checker", "quality_judge")]
@@ -576,6 +704,15 @@ async def run_swarm(
             sum(v.get("confidence", 0) for v in voters) / total_voters
             if total_voters > 0 else 0
         )
+
+        # --- METRICS: Record consensus state ---
+        mc.record_consensus_state(round_label, ready_count, total_voters, avg_conf)
+
+        # --- METRICS: Record quality scores from judge ---
+        judge_outputs = [o for o in round_outputs if o.get("role") == "quality_judge"]
+        for jo in judge_outputs:
+            if jo.get("coverage_score") is not None:
+                mc.record_quality_scores(jo)
 
         print(f"\n  Consensus: {ready_count}/{total_voters} ready | "
               f"avg confidence: {avg_conf:.0%}")
@@ -604,6 +741,8 @@ async def run_swarm(
             print(f"  Max rounds ({max_rounds}) reached. Force-finalizing.\n")
 
     # --- FINALIZE: Synthesizer ---
+    mc.start_round("synthesis")
+
     synth_context = build_context(accumulated_outputs, for_role="synthesizer")
     synth_task = (
         f"Synthesize all findings on: {topic}\n\n"
@@ -625,25 +764,46 @@ async def run_swarm(
     print(f"  Synthesis complete [{elapsed:.1f}s]\n")
     all_round_outputs.append(synth_outputs)
 
+    mc.end_round("synthesis", synth_outputs)
+
     synth_output = synth_outputs[0] if synth_outputs else None
 
-    # --- Persist to memory ---
-    _persist_to_memory(
-        mem_writer, bb, topic, consensus_reached, override_applied,
-        all_round_outputs, agents,
-    )
+    # --- METRICS: Record consensus result + finalize + save ---
+    mc.record_consensus_result(final_round_n, consensus_reached, override_applied)
+    mc.finalize()
+    metrics_record = mc.save()
+
+    # --- Persist to memory (non-fatal if it fails) ---
+    try:
+        _persist_to_memory(
+            mem_writer, bb, topic, consensus_reached, override_applied,
+            all_round_outputs, agents,
+        )
+    except Exception as e:
+        print(f"Warning: Memory persistence failed ({e})")
 
     # --- Output ---
     final_doc = format_final_output(topic, all_round_outputs, synth_output)
     filepath = save_output(topic, final_doc)
 
     total_agents_invoked = sum(len(rnd) for rnd in all_round_outputs)
+    cost_str = f"${metrics_record.get('total_cost_usd', 0):.4f}"
+    tokens_str = f"{metrics_record.get('total_input_tokens', 0) + metrics_record.get('total_output_tokens', 0):,}"
+
     print(f"{'='*60}")
     print(f"OUTPUT SAVED: {filepath}")
-    print(f"Rounds: {len(all_round_outputs) - 1} + synthesis")
+    print(f"Rounds: {final_round_n} + synthesis")
     print(f"Total agent invocations: {total_agents_invoked}")
     print(f"Consensus: {'yes' if consensus_reached else 'no'}"
           f"{' (override)' if override_applied else ''}")
+    print(f"Cost: {cost_str} | Tokens: {tokens_str}")
+    print(f"Quality: avg={metrics_record.get('avg_quality', 0)} "
+          f"(cov={metrics_record.get('coverage', 0)} "
+          f"acc={metrics_record.get('accuracy', 0)} "
+          f"clar={metrics_record.get('clarity', 0)} "
+          f"dep={metrics_record.get('depth', 0)})")
+    print(f"Wall clock: {metrics_record.get('total_wall_clock_s', 0):.1f}s")
+    print(f"Metrics saved to: metrics.jsonl")
     print(f"{'='*60}\n")
 
     return filepath

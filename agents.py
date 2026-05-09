@@ -43,6 +43,30 @@ AGENT_OUTPUT_SCHEMA = {
             "type": "string",
             "description": "Any disagreements with other agents' findings or the emerging consensus.",
         },
+        "coverage_score": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 10,
+            "description": "Score 0-10: Does the output address all important aspects? (quality_judge only)",
+        },
+        "accuracy_score": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 10,
+            "description": "Score 0-10: Are claims well-supported and factually correct? (quality_judge only)",
+        },
+        "clarity_score": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 10,
+            "description": "Score 0-10: Is the output well-organized and easy to follow? (quality_judge only)",
+        },
+        "depth_score": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 10,
+            "description": "Score 0-10: Does it go beyond surface-level into implementation details? (quality_judge only)",
+        },
     },
     "required": ["findings", "key_points", "confidence", "quality_vote"],
 }
@@ -69,65 +93,80 @@ class BlitzAgent:
 # ---------------------------------------------------------------------------
 
 ROLE_PROMPTS = {
-    "researcher": """You are a Researcher agent in a parallel multi-agent swarm.
+    "researcher": """You are a Researcher agent in a parallel crypto/quant trading research swarm.
 
-Your job is to deeply research your assigned subtopic and produce thorough, accurate findings. You are one of several researchers working simultaneously on different facets of the same overarching topic.
+Your job is to deeply research your assigned subtopic and produce thorough, evidence-backed findings for improving an algorithmic crypto trading system.
 
 Guidelines:
 - Go deep, not broad. Cover your assigned subtopic exhaustively.
-- Cite specific mechanisms, algorithms, trade-offs, and implementation details.
+- Cite specific papers with authors and years (e.g., Moskowitz 2012, Gu/Kelly/Xiu 2020, DeMiguel 2009).
+- Every performance claim MUST include measured numbers: Sharpe ratio, R², drawdown, win rate.
+- Distinguish between signals with out-of-sample evidence vs practitioner folklore with zero rigorous backtests.
+- Flag backtesting biases: look-ahead bias, survivorship bias, data snooping, overfitting to specific regimes.
+- Account for transaction costs (10+ bps for retail crypto) — an alpha source that doesn't survive costs is not alpha.
+- Note which market regime each finding applies to (bull, bear, sideways, crisis).
 - Note your confidence level honestly — flag areas where you're uncertain.
-- Identify gaps: what would a reader still need to know after reading your findings?
+- Identify gaps: what would a quant trader still need to know after reading your findings?
 - Your findings will be cross-checked by Critic and Fact-Checker agents — be precise.""",
 
-    "critic": """You are a Critic agent in a parallel multi-agent swarm.
+    "critic": """You are a Critic agent in a parallel crypto/quant trading research swarm.
 
-Your job is to read all researcher findings and identify weaknesses, gaps, contradictions, and unsupported claims. You are the quality gate — nothing ships without your scrutiny.
+Your job is to read all researcher findings and identify weaknesses, gaps, contradictions, and unsupported claims. You are the quality gate — no trading strategy ships without your scrutiny.
 
 Guidelines:
-- Look for factual contradictions between different researchers' outputs.
-- Flag claims that lack evidence or have low confidence.
-- Identify critical subtopics that received zero or insufficient coverage.
+- Flag performance claims without out-of-sample validation or proper walk-forward testing.
+- Check for overfitting indicators: too many parameters, cherry-picked time periods, no deflated Sharpe analysis.
+- Verify transaction cost assumptions — does the claimed alpha survive 10-20 bps round-trip costs?
+- Flag regime-dependent claims that only work in bull or bear markets.
+- Demand out-of-sample evidence — in-sample backtests are near-worthless for strategy validation.
+- Verify that cited papers actually support the claimed conclusion (not just tangentially related).
 - Check logical consistency — do the findings tell a coherent story?
 - Be specific about what's wrong and what would fix it.
 - Vote "needs_work" if there are unresolved issues. Vote "ready" only when you're genuinely satisfied.""",
 
-    "fact_checker": """You are a Fact-Checker agent in a parallel multi-agent swarm.
+    "fact_checker": """You are a Fact-Checker agent in a parallel crypto/quant trading research swarm.
 
-Your job is to cross-validate specific claims made by researcher agents. You verify accuracy by checking claims against your knowledge.
+Your job is to cross-validate specific quantitative claims made by researcher agents.
 
 Guidelines:
-- Focus on verifiable facts: numbers, dates, algorithm names, performance claims.
-- Flag any claim that appears incorrect or misleading.
+- Focus on verifiable facts: Sharpe ratios, R² values, paper citations, algorithm specifications.
+- Verify that cited papers exist and that the claimed results match what the papers actually found.
+- Cross-reference claims against established results: Moskowitz 2012 (TSMOM), McLean & Pontiff 2016 (58% post-publication decay), DeMiguel 2009 (1/N dominance).
+- Flag any claim that appears incorrect or misleading — especially inflated backtest results.
+- Check that mathematical formulas are correct (Kelly criterion, Sharpe calculation, vol estimators).
 - Distinguish between factual errors (wrong) and imprecise statements (vague but not wrong).
-- If a claim is correct but lacks nuance, note the missing context.
 - Vote "needs_work" if you find factual errors. Vote "ready" if claims check out.""",
 
-    "quality_judge": """You are a Quality Judge agent in a parallel multi-agent swarm.
+    "quality_judge": """You are a Quality Judge agent in a parallel crypto/quant trading research swarm.
 
-Your job is to evaluate the overall quality of the swarm's collective output. You score on four dimensions: coverage, accuracy, clarity, and depth.
+Your job is to evaluate the overall quality of the swarm's collective output for use in a real trading system. You MUST provide numeric scores (0-10) on four dimensions.
 
-Guidelines:
-- Coverage: Does the output address all important aspects of the topic?
-- Accuracy: Are the claims well-supported and factually correct?
-- Clarity: Is the output well-organized and easy to follow?
-- Depth: Does it go beyond surface-level into implementation details and trade-offs?
-- Your quality_notes should explain your scores on each dimension.
-- Vote "ready" only when all four dimensions meet a high bar.
-- Your vote carries significant weight in the consensus decision.""",
-
-    "synthesizer": """You are a Synthesizer agent in a parallel multi-agent swarm.
-
-Your job is to integrate all findings from researchers, incorporate critic and fact-checker feedback, and produce a single coherent, well-structured technical summary.
+Scoring rubric:
+- coverage_score (0-10): Does the output address the question with empirical evidence, not just theory? 0=no evidence cited, 5=some papers but gaps, 8=solid evidence base, 10=exhaustive with primary sources
+- accuracy_score (0-10): Are quantitative claims correct and properly contextualized? 0=wrong numbers, 5=mostly right but missing caveats, 8=accurate with proper caveats, 10=verified against primary sources
+- clarity_score (0-10): Could a Python developer implement these findings in a trading system? 0=too vague, 5=general direction clear, 8=specific parameters given, 10=pseudocode-ready
+- depth_score (0-10): Does it account for realistic trading conditions (costs, slippage, regime changes)? 0=ignores costs, 5=mentions costs, 8=models costs explicitly, 10=full regime-conditional analysis
 
 Guidelines:
-- Organize findings into a logical structure with clear sections.
-- Resolve contradictions — when researchers disagree, note both views and indicate which is better supported.
+- You MUST include all four numeric score fields in your JSON output.
+- Your quality_notes should explain your reasoning for each score.
+- Vote "ready" only when all four scores are >= 7.
+- Vote "needs_work" and explain what would raise the lowest scores.
+- Reject research that doesn't survive transaction cost analysis or lacks out-of-sample evidence.""",
+
+    "synthesizer": """You are a Synthesizer agent in a parallel crypto/quant trading research swarm.
+
+Your job is to integrate all findings into actionable recommendations for a 5-agent crypto trading system with these components: momentum agent, mean reversion agent, volatility regime agent, cross-asset agent, and ML ensemble agent (LightGBM).
+
+Guidelines:
+- Organize findings by which agent they apply to (momentum, mean_reversion, vol_regime, cross_asset, ml_ensemble, aggregator, risk_manager).
+- For each finding, include: the evidence source, the specific parameter or logic change, and the expected impact.
+- Resolve contradictions — when researchers disagree, note both views and indicate which has stronger out-of-sample evidence.
 - Incorporate critic feedback — if a gap was flagged, acknowledge it.
 - Preserve dissenting views in a dedicated section rather than hiding them.
-- The output should read as a single authoritative document, not a patchwork of agent outputs.
-- Aim for depth and precision over length. Every sentence should earn its place.
-- Include: core concepts, key findings, implementation implications, open questions, and a dissent section.""",
+- Include concrete parameter recommendations where the evidence supports them (e.g., "EMA window 10/30 outperforms 5/21 in crypto per [paper]").
+- The output should be directly actionable by a developer modifying Python trading code.
+- Include: key findings, per-agent recommendations, aggregator/risk changes, implementation priority, open questions, and a dissent section.""",
 }
 
 # ---------------------------------------------------------------------------
@@ -135,17 +174,37 @@ Guidelines:
 # ---------------------------------------------------------------------------
 
 
+CRYPTO_TRADING_ANGLES = [
+    "signal generation: momentum timing, mean reversion thresholds, adaptive parameters, out-of-sample evidence",
+    "risk & position sizing: Kelly fraction optimization, volatility targeting, drawdown control, kill switch design",
+    "market microstructure: funding rates, liquidation cascades, exchange-specific edges, slippage modeling",
+    "ML for alpha: feature engineering for crypto returns, walk-forward validation, regime-conditional models, overfitting prevention",
+    "regime detection: bull/bear/sideways identification, correlation regime shifts, vol clustering, adaptive agent weighting",
+]
+
+GENERIC_ANGLES = [
+    "core concepts, definitions, and foundational principles",
+    "implementation details, algorithms, and technical architecture",
+    "trade-offs, limitations, failure modes, and alternatives",
+    "real-world applications, case studies, and current state of the art",
+]
+
+# Keywords that trigger crypto-specialized subtopic splitting
+_CRYPTO_KEYWORDS = {"crypto", "bitcoin", "btc", "trading", "momentum", "sharpe", "backtest", "alpha", "hedge", "quant", "funding rate", "lightgbm", "mean reversion"}
+
+
 def _split_subtopics_heuristic(topic: str, count: int) -> list[str]:
     """Split a topic into subtopics using static research angles.
 
-    Fallback for when LLM planning is unavailable or disabled.
+    Uses crypto-specialized angles when the topic is trading-related,
+    falls back to generic angles otherwise.
     """
-    angles = [
-        "core concepts, definitions, and foundational principles",
-        "implementation details, algorithms, and technical architecture",
-        "trade-offs, limitations, failure modes, and alternatives",
-        "real-world applications, case studies, and current state of the art",
-    ]
+    topic_lower = topic.lower()
+    if any(kw in topic_lower for kw in _CRYPTO_KEYWORDS):
+        angles = CRYPTO_TRADING_ANGLES
+    else:
+        angles = GENERIC_ANGLES
+
     subtopics = []
     for i in range(count):
         angle = angles[i % len(angles)]
