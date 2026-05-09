@@ -1,10 +1,10 @@
 # Blitz-Swarm Configuration
 
 [swarm]
-max_rounds = 5
+max_rounds = 4
 default_model = "sonnet"
-timeout_seconds = 180
-max_agents = 12
+timeout_seconds = 300
+max_agents = 10
 
 [memory]
 max_context_tokens = 2000
