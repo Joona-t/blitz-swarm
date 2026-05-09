@@ -851,10 +851,15 @@ def main():
     parser = argparse.ArgumentParser(
         description="Blitz-Swarm: parallel multi-agent research swarm",
     )
-    parser.add_argument("topic", help="The topic to research")
+    parser.add_argument("topic", help="The topic / task spec")
+    parser.add_argument(
+        "--mode", choices=["consensus", "mythos"], default="consensus",
+        help="Swarm mode: 'consensus' (default, flat parallel) or "
+             "'mythos' (hierarchical planner+executors+verifier)",
+    )
     parser.add_argument(
         "--max-rounds", type=int, default=DEFAULT_MAX_ROUNDS,
-        help=f"Maximum consensus rounds (default: {DEFAULT_MAX_ROUNDS})",
+        help=f"Maximum consensus rounds (default: {DEFAULT_MAX_ROUNDS}) — consensus mode only",
     )
     parser.add_argument(
         "--no-redis", action="store_true",
@@ -862,7 +867,7 @@ def main():
     )
     parser.add_argument(
         "--no-llm-plan", action="store_true",
-        help="Use heuristic agent planning instead of LLM",
+        help="Use heuristic agent planning instead of LLM — consensus mode only",
     )
     parser.add_argument(
         "--dry-run", action="store_true",
@@ -872,8 +877,21 @@ def main():
         "--verbose", action="store_true",
         help="Enable detailed logging",
     )
+    # Mythos-mode flags
+    parser.add_argument(
+        "--max-replans", type=int, default=None,
+        help="Mythos mode: max planner→exec→verify→replan rounds (default: 3)",
+    )
+    parser.add_argument(
+        "--cost-ceiling", type=float, default=None,
+        help="Mythos mode: hard $ ceiling per task (default: 5.0)",
+    )
 
     args = parser.parse_args()
+
+    if args.mode == "mythos":
+        _run_mythos_mode(args)
+        return
 
     if args.dry_run:
         _dry_run(args.topic, use_llm=not args.no_llm_plan)
@@ -887,6 +905,36 @@ def main():
         )
     )
     print(f"Done. Output at: {filepath}")
+
+
+def _run_mythos_mode(args) -> None:
+    """Dispatch to the mythos package."""
+    from mythos import load_mythos_config, run_mythos
+
+    cfg = load_mythos_config()
+    if args.max_replans is not None:
+        cfg.max_replans = args.max_replans
+    if args.cost_ceiling is not None:
+        cfg.cost_ceiling_usd = args.cost_ceiling
+    if args.no_redis:
+        cfg.use_redis = False
+
+    if args.dry_run:
+        print(f"\n{'='*60}")
+        print(f"MYTHOS DRY RUN — {args.topic}")
+        print(f"{'='*60}\n")
+        print(f"Config:")
+        print(f"  planner_model     = {cfg.planner_model}")
+        print(f"  executor_model    = {cfg.executor_model}")
+        print(f"  verifier_model    = {cfg.verifier_model}")
+        print(f"  max_replans       = {cfg.max_replans}")
+        print(f"  max_executors     = {cfg.max_executors}")
+        print(f"  cost_ceiling_usd  = {cfg.cost_ceiling_usd}")
+        print(f"  output_dir        = {cfg.output_dir}")
+        print(f"\nNo CLI calls will be made. Use without --dry-run to execute.")
+        return
+
+    asyncio.run(run_mythos(args.topic, cfg))
 
 
 if __name__ == "__main__":

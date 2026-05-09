@@ -1,0 +1,32 @@
+# Mythos Swarm — config overlay
+# Loaded by mythos.policies.load_mythos_config().
+# Keep blitz.toml separate; this overlays only when --mode mythos is active.
+
+[models]
+# Aliases resolved via mythos.policies.MODEL_ALIASES.
+# Default: planner + verifier on Mythos (extended-thinking Opus),
+# executor on Sonnet for cheap parallelism.
+planner_model = "mythos"
+executor_model = "sonnet"
+verifier_model = "mythos"
+
+[policies]
+# Loop budget
+max_replans = 3
+max_executors = 8
+
+# Hard cost ceiling per task (USD). Run aborts and emits partial artifact if hit.
+# CLI probe showed a single trivial Mythos call costs ~$0.33; $5 gives 15× headroom.
+cost_ceiling_usd = 5.0
+
+# Timeouts (seconds)
+planner_timeout_s = 600
+executor_timeout_s = 300
+verifier_timeout_s = 600
+
+# Where to write artifacts
+output_dir = "./output/mythos"
+
+# Infrastructure
+use_redis = false
+use_memory = true

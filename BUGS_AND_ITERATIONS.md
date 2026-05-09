@@ -36,6 +36,34 @@
 
 **Commit:** v0.2.0-alpha.0 follow-up (Phase 0 foundation commit).
 
+## 2026-05-09: ITER-MYTHOS-001 — New `mythos/` mode added to blitz-swarm
+
+**Problem:** Blitz-swarm consensus mode is excellent for parallel research summaries but architecturally wrong for the "Mythos-worthy" use cases the prior `/blitz-swarm` token-economics research surfaced (legacy modernization, multi-hop security audit, formal verification, distributed-systems debugging, compiler construction). Those tasks need long-horizon coherence + strict gating, not flat consensus voting across peer researchers.
+
+**Root cause:** Topology mismatch. Flat consensus is symmetric; the Mythos-worthy pattern is asymmetric — one deep planner + N cheap parallel executors + one deep verifier with replan loops. Prior research recommended this hybrid pattern (Mythos orchestrator, Sonnet executors) as ~90% Mythos quality at 30–40% full-Mythos cost.
+
+**Fix:** Added a `mythos/` package as a peer mode of consensus. New CLI surface `--mode mythos`, with a thin `mythos_swarm.py` shim entrypoint. Architecture:
+
+- `mythos/policies.py` — `MODEL_ALIASES` dict (`"mythos" → ("opus", effort="max")`), `CostBudget`, `MythosConfig`, `load_mythos_config()`. The alias layer decouples our code from Anthropic's naming churn — when a real Mythos model ships, change one dict entry.
+- `mythos/schemas.py` — JSON schemas for planner/executor/verifier output, enforced via `claude --json-schema`.
+- `mythos/_invoke.py` — shared `claude -p` subprocess wrapper with cost extraction.
+- `mythos/planner.py` — `decompose()` and `replan()`.
+- `mythos/executor.py` — synchronous + parallel runner via `asyncio.to_thread`.
+- `mythos/verifier.py` — gate check, returns structured `pass | needs_work` with required_fixes for replan.
+- `mythos/runner.py` — full orchestration loop with hard cost ceiling.
+- `mythos/artifact.py` — writes plan/executors/verification/final to disk per round.
+- `mythos.toml` — config overlay (separate from blitz.toml so consensus mode is unaffected).
+- `MYTHOS-SWARM-RESEARCH.md`, `MYTHOS-SWARM-PLAN.md`, `MYTHOS-SWARM.md` — research → plan → user-facing doc per CLAUDE.md workflow.
+- `tests/test_mythos_smoke.py` — 9 passing smoke tests (imports, config, schemas, prompts, CLI, dry-run).
+
+CLI probe (2026-05-09): `claude -p --model opus` routes to `claude-opus-4-7` with 1M context; `--effort max` is the thinking-budget knob. Single trivial round-trip cost $0.33; default cost ceiling set to $5.00 (~15× headroom).
+
+**Compliance:** Rule #10 audit clean — all LLM calls go through Joona's `claude` CLI subscription, no `ANTHROPIC_API_KEY` paths. Rule #1 satisfied — `MYTHOS-SWARM-PLAN.md` written before any code. Rule #6 — no `Co-Authored-By` in the commit. Rule #11 — this entry. 238 existing tests still pass; 9 new mythos smoke tests pass.
+
+**Deferred to v2:** Live full-task execution (binary-search formal-verification target prepared but not yet run — would burn budget mid-build). Head-to-head benchmark vs consensus mode is the gating experiment for declaring Mythos mode "worth it". Cross-CLI heterogeneity, persona-typed verifiers, cascade-guard escalation.
+
+**Commit:** TBD (this commit).
+
 <!-- Format:
 ## YYYY-MM-DD: Short Title
 
