@@ -1,0 +1,327 @@
+# Blitz-Swarm Bench Slate v1
+#
+# 30 research-synthesis prompts across easy/medium/hard tiers,
+# spanning technical / open-ended / adversarial / multi-domain / compositional.
+#
+# Each prompt has six metadata fields:
+#   tier            easy / medium / hard
+#   domain          technical / open / adversarial / multi / compositional
+#   parallelizable  whether parallel agents should outperform sequential
+#                   (per Shen 2603.29632 + Google scaling 2512.08296)
+#   tool_heavy      whether topic requires external tool use (web, code exec)
+#   budget_usd      per-prompt cost cap
+#   expected_coverage  list of keyword strings the judge checks for
+#
+# Tier counts: 15 easy, 10 medium, 5 hard.
+# Adversarial: 5. Multi-domain: 6. Compositional: 5.
+
+schema_version = 1
+slate_id = "v1"
+created_utc = "2026-05-09"
+prompt_count = 30
+
+# ---------- EASY (15) ----------
+
+[[prompt]]
+id = "s001"
+tier = "easy"
+domain = "technical"
+parallelizable = true
+tool_heavy = false
+budget_usd = 0.05
+expected_coverage = ["WAL file structure", "checkpointing", "rollback journal vs WAL", "concurrency guarantees", "fsync semantics"]
+text = "Explain SQLite WAL mode internals: how the WAL file is structured, when checkpointing happens, and what concurrency guarantees it provides."
+
+[[prompt]]
+id = "s002"
+tier = "easy"
+domain = "technical"
+parallelizable = true
+tool_heavy = false
+budget_usd = 0.05
+expected_coverage = ["witness data separation", "transaction malleability", "block weight", "BIP141", "effective block size"]
+text = "How does Bitcoin's SegWit (BIP141) improve transaction throughput? Cover witness data separation, malleability fix, and effective block-size implications."
+
+[[prompt]]
+id = "s003"
+tier = "easy"
+domain = "technical"
+parallelizable = true
+tool_heavy = false
+budget_usd = 0.05
+expected_coverage = ["head-of-line blocking", "0-RTT handshake", "connection migration", "QUIC streams", "UDP transport"]
+text = "What does HTTP/3's QUIC transport layer change relative to TCP? Cover head-of-line blocking, 0-RTT handshakes, and connection migration."
+
+[[prompt]]
+id = "s004"
+tier = "easy"
+domain = "technical"
+parallelizable = true
+tool_heavy = false
+budget_usd = 0.05
+expected_coverage = ["consistency", "availability", "partition tolerance", "CP example", "AP example"]
+text = "Explain the CAP theorem and provide one concrete production system per partition tolerance trade-off (CP, AP)."
+
+[[prompt]]
+id = "s005"
+tier = "easy"
+domain = "technical"
+parallelizable = true
+tool_heavy = false
+budget_usd = 0.05
+expected_coverage = ["xmin xmax", "vacuum", "long transactions", "tuple visibility", "MVCC"]
+text = "How does Postgres MVCC work? Cover xmin/xmax, vacuum, and the relationship to long-running transactions."
+
+[[prompt]]
+id = "s006"
+tier = "easy"
+domain = "open"
+parallelizable = true
+tool_heavy = false
+budget_usd = 0.05
+expected_coverage = ["Phi-3", "Qwen", "Gemma", "edge inference", "capability gap"]
+text = "What is the current state of small-language-model (SLM) research relative to frontier LLMs? Touch on Phi-3, Qwen, and Gemma families."
+
+[[prompt]]
+id = "s007"
+tier = "easy"
+domain = "open"
+parallelizable = true
+tool_heavy = false
+budget_usd = 0.05
+expected_coverage = ["latent attention", "KV cache compression", "DeepSeek-V2", "performance trade-offs"]
+text = "Summarize capabilities and known weaknesses of MLA (multi-head latent attention) as in DeepSeek-V2."
+
+[[prompt]]
+id = "s008"
+tier = "easy"
+domain = "open"
+parallelizable = true
+tool_heavy = false
+budget_usd = 0.05
+expected_coverage = ["retrieval augmented generation", "chunking strategy", "embedding drift", "irrelevant retrieval", "context limits"]
+text = "What is retrieval-augmented generation (RAG) and what are its three main failure modes in production?"
+
+[[prompt]]
+id = "s009"
+tier = "easy"
+domain = "technical"
+parallelizable = true
+tool_heavy = false
+budget_usd = 0.05
+expected_coverage = ["leader election", "log replication", "safety", "term", "majority quorum"]
+text = "Explain how Raft achieves consensus: leader election, log replication, and safety arguments."
+
+[[prompt]]
+id = "s010"
+tier = "easy"
+domain = "technical"
+parallelizable = true
+tool_heavy = false
+budget_usd = 0.05
+expected_coverage = ["ownership", "lifetimes", "Send", "Sync", "data race prevention"]
+text = "How does Rust's borrow checker prevent data races at compile time? Cover ownership, lifetimes, and Send/Sync."
+
+[[prompt]]
+id = "s011"
+tier = "easy"
+domain = "technical"
+parallelizable = true
+tool_heavy = false
+budget_usd = 0.05
+expected_coverage = ["JSON Schema", "constrained decoding", "logit masking", "function calling", "validation"]
+text = "Summarize how OpenAI's structured outputs (JSON Schema) work end-to-end including constrained decoding."
+
+[[prompt]]
+id = "s012"
+tier = "easy"
+domain = "technical"
+parallelizable = true
+tool_heavy = false
+budget_usd = 0.05
+expected_coverage = ["FA3", "Hopper architecture", "FP8", "warp specialization", "throughput claims"]
+text = "What is FlashAttention-3 and what are its key throughput claims relative to FA2?"
+
+[[prompt]]
+id = "s013"
+tier = "easy"
+domain = "technical"
+parallelizable = true
+tool_heavy = false
+budget_usd = 0.05
+expected_coverage = ["draft model", "target model", "acceptance ratio", "throughput", "rejection sampling"]
+text = "Explain Speculative Decoding: draft model, target model, acceptance ratio, and where it helps."
+
+[[prompt]]
+id = "s014"
+tier = "easy"
+domain = "open"
+parallelizable = true
+tool_heavy = false
+budget_usd = 0.05
+expected_coverage = ["GRPO", "group relative", "advantage normalization", "reward modeling", "DeepSeekMath"]
+text = "Summarize the design of GRPO (Group Relative Policy Optimization) used in DeepSeekMath."
+
+[[prompt]]
+id = "s015"
+tier = "easy"
+domain = "technical"
+parallelizable = true
+tool_heavy = false
+budget_usd = 0.05
+expected_coverage = ["snapshots", "manifests", "ACID semantics", "schema evolution", "Hive metastore comparison"]
+text = "How does Apache Iceberg's metadata layer differ from Hive's? Cover snapshots, manifests, and ACID semantics."
+
+# ---------- MEDIUM (10) ----------
+
+[[prompt]]
+id = "s016"
+tier = "medium"
+domain = "adversarial"
+parallelizable = true
+tool_heavy = false
+budget_usd = 0.20
+expected_coverage = ["Finland 2017-2018", "Stockton SEED 2019", "labour participation effects", "automation argument", "fiscal sustainability critique"]
+text = "Compare strongest arguments for and against Universal Basic Income, including empirical results from Finland (2017-2018) and Stockton SEED (2019)."
+
+[[prompt]]
+id = "s017"
+tier = "medium"
+domain = "adversarial"
+parallelizable = false
+tool_heavy = false
+budget_usd = 0.20
+expected_coverage = ["scaling laws", "Chinchilla", "compute-optimal", "AGI timeline disagreement", "data wall argument"]
+text = "What is the academic disagreement on whether scaling laws are evidence for or against AGI on a near-term timeline? Steelman both sides."
+
+[[prompt]]
+id = "s018"
+tier = "medium"
+domain = "adversarial"
+parallelizable = true
+tool_heavy = false
+budget_usd = 0.20
+expected_coverage = ["Kelton", "Krugman", "Summers", "fiat currency", "inflation constraint", "MMT framework"]
+text = "Compare the case for and against Modern Monetary Theory (MMT) as a policy framework, citing Kelton vs Krugman/Summers critiques."
+
+[[prompt]]
+id = "s019"
+tier = "medium"
+domain = "adversarial"
+parallelizable = true
+tool_heavy = false
+budget_usd = 0.20
+expected_coverage = ["Yampolskiy 2024", "Anthropic interp", "calibration", "self-correction", "training-time fixes"]
+text = "Strongest argument that LLM hallucinations are intrinsic vs strongest argument they are eliminable? Cite specific 2024-2026 research."
+
+[[prompt]]
+id = "s020"
+tier = "medium"
+domain = "multi"
+parallelizable = true
+tool_heavy = false
+budget_usd = 0.20
+expected_coverage = ["perpetual funding rate", "deleveraging cascade", "on-chain liquidity", "market microstructure", "behavioral feedback"]
+text = "How does perpetual-funding-rate carry interact with on-chain liquidity dynamics during deleveraging cascades? Combine market microstructure, behavioural-econ, and crypto."
+
+[[prompt]]
+id = "s021"
+tier = "medium"
+domain = "multi"
+parallelizable = false
+tool_heavy = false
+budget_usd = 0.20
+expected_coverage = ["attention sparsity", "cortical sparse coding", "energy efficiency", "analog compute", "in-memory compute"]
+text = "Connect transformer attention sparsity, neuroscience papers on cortical sparse coding, and energy-efficiency claims for analog/in-memory compute."
+
+[[prompt]]
+id = "s022"
+tier = "medium"
+domain = "compositional"
+parallelizable = false
+tool_heavy = false
+budget_usd = 0.20
+expected_coverage = ["LightGBM advantages", "leaf-wise growth", "XGBoost comparison", "1-hour bar applicability", "tabular feature performance"]
+text = "First, list top 3 reasons LightGBM tends to outperform XGBoost on tabular data. Then, evaluate which apply to crypto-return prediction at 1-hour bar resolution."
+
+[[prompt]]
+id = "s023"
+tier = "medium"
+domain = "compositional"
+parallelizable = false
+tool_heavy = false
+budget_usd = 0.20
+expected_coverage = ["G-Memory three tiers", "interaction graph", "query graph", "insight graph", "7B replacement viability"]
+text = "First, summarize G-Memory (NeurIPS 2025) thesis. Then, evaluate whether its three-tier architecture would still hold if you replaced the LLM with a 7B-class small model."
+
+[[prompt]]
+id = "s024"
+tier = "medium"
+domain = "compositional"
+parallelizable = false
+tool_heavy = false
+budget_usd = 0.20
+expected_coverage = ["MAST taxonomy", "FM-1.X codes", "FM-2.X codes", "FM-3.X codes", "named blog post failures"]
+text = "First, summarize the MAST taxonomy. Then, classify three named multi-agent failure modes from published agent-system blog posts (Anthropic, DeepMind, OpenAI 2025) into MAST FM codes."
+
+[[prompt]]
+id = "s025"
+tier = "medium"
+domain = "technical"
+parallelizable = true
+tool_heavy = false
+budget_usd = 0.20
+expected_coverage = ["auxiliary-loss-free balancing", "expert collapse", "DeepSeek-V3", "OLMoE", "router instability"]
+text = "Explain Mixture-of-Experts routing instabilities (auxiliary-loss-free balancing, expert collapse) with reference to DeepSeek-V3 and OLMoE."
+
+# ---------- HARD (5) ----------
+
+[[prompt]]
+id = "s026"
+tier = "hard"
+domain = "open"
+parallelizable = false
+tool_heavy = false
+budget_usd = 0.60
+expected_coverage = ["scalable oversight", "mechanistic interpretability", "debate", "RLAIF", "constitutional AI", "open empirical disagreements"]
+text = "State of AI alignment research as of mid-2026? Cover scalable oversight, mechanistic interpretability, debate, RLAIF, and constitutional approaches; identify strongest open empirical disagreements."
+
+[[prompt]]
+id = "s027"
+tier = "hard"
+domain = "compositional"
+parallelizable = false
+tool_heavy = false
+budget_usd = 0.60
+expected_coverage = ["MAST findings", "Google scaling paper", "MultiAgentBench", "Shen et al", "resolved disagreements"]
+text = "Position on whether multi-agent LLM systems beat single-agent baselines on long-horizon research, citing MAST (Cemri 2025), Google scaling (2512.08296), MultiAgentBench, and Shen et al. (2603.29632). Resolve apparent disagreements."
+
+[[prompt]]
+id = "s028"
+tier = "hard"
+domain = "adversarial"
+parallelizable = false
+tool_heavy = false
+budget_usd = 0.60
+expected_coverage = ["NIST PQC migration", "quantum volume papers", "NISQ era", "logical qubits required", "10-year timeline argument"]
+text = "Case for and against current public-key crypto being broken by NISQ-era quantum hardware in next 10 years. Steelman both sides using NIST PQC migration data and recent quantum-volume papers."
+
+[[prompt]]
+id = "s029"
+tier = "hard"
+domain = "multi"
+parallelizable = false
+tool_heavy = false
+budget_usd = 0.60
+expected_coverage = ["HBM bandwidth", "SRAM cache", "MQA GQA MLA", "speculative decoding", "70B inference economics", "100k QPS"]
+text = "Synthesize: how do GPU memory-tier hierarchies (HBM, SRAM), KV-cache compression (MQA/GQA/MLA), and speculative decoding jointly affect inference economics for a 70B-class model serving 100k QPS?"
+
+[[prompt]]
+id = "s030"
+tier = "hard"
+domain = "compositional"
+parallelizable = false
+tool_heavy = false
+budget_usd = 0.60
+expected_coverage = ["bitter lesson", "test-time compute scaling", "structured prompting evidence", "2027 prediction", "defended position"]
+text = "Three-part: (1) state the bitter lesson; (2) describe strongest empirical counter-evidence in 2024-2026 (e.g., test-time-compute scaling, structured prompting); (3) defend a position on which view will dominate AI research in 2027."
