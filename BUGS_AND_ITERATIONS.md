@@ -62,6 +62,25 @@ CLI probe (2026-05-09): `claude -p --model opus` routes to `claude-opus-4-7` wit
 
 **Deferred to v2:** Live full-task execution (binary-search formal-verification target prepared but not yet run — would burn budget mid-build). Head-to-head benchmark vs consensus mode is the gating experiment for declaring Mythos mode "worth it". Cross-CLI heterogeneity, persona-typed verifiers, cascade-guard escalation.
 
+**Commit:** 54631d7.
+
+## 2026-05-09: BUG-MYTHOS-001 — claude --json-schema returns parsed object in `structured_output`, not `result`
+
+**Problem:** First live Mythos run (`mythos_swarm.py "Implement and verify binary_search ..."`) reported `planner_failed` in 77s with $0 cost. Run dir contained an empty plan with `error: "planner exit 1: "` and no parsed sub-specs. Same test in dry-run had passed; smoke tests passed; the failure only surfaced when actually invoking `claude -p`.
+
+**Root cause:** Two distinct issues in `mythos/_invoke.py`:
+1. **Parsing:** When `claude -p --output-format json --json-schema <s>` is used, the model emits the structured object via a tool call. The CLI surfaces it in envelope key `structured_output`, leaving `result` as an empty string. My `_parse_inner_result` only inspected `result`, so it always saw nothing and returned `parsed=None`.
+2. **Turn budget:** `--max-turns 1` is insufficient with `--json-schema` because the structured-output tool call itself consumes a turn — the model needs at least 2 turns (call + completion). The default of 1 caused the CLI to terminate with `error_max_turns` (and in some flag combos, exit code 1 with empty stderr).
+
+**Fix:** In `mythos/_invoke.py`:
+- `_parse_inner_result` now checks `envelope["structured_output"]` first, then falls back to `result` (dict or string with embedded JSON).
+- `invoke()` default `max_turns` bumped from 1 to 4 — gives headroom for the tool-call round-trip plus any internal retries.
+- Added `is_error` envelope check so envelope-level errors that come back with shell exit 0 (e.g. `error_max_turns`, `error_during_execution`) are surfaced in `InvokeResult.error` rather than silently parsed as success.
+
+**Validation:** Re-ran the same task. Result: status `passed`, 1 round, $1.07 / $5.00 budget, 203s wall. Extracted both deliverables to `/tmp/mythos_smoke_test/` and ran `pytest -q test_binary_search.py`: **9/9 passed in 0.10s**. Verifier verdict matched reality — not just hand-waving.
+
+**Lesson:** when integrating with a CLI surface, the `--help` text rarely tells you which envelope field carries the parsed output. Probe with a real schema call before assuming, and always check `is_error` even when `returncode == 0`.
+
 **Commit:** TBD (this commit).
 
 <!-- Format:

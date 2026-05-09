@@ -48,7 +48,7 @@ def invoke(
     schema_json: str,
     model_alias: str,
     timeout_s: int,
-    max_turns: int = 1,
+    max_turns: int = 4,
 ) -> InvokeResult:
     """Invoke a single Mythos role via `claude -p`.
 
@@ -119,7 +119,17 @@ def invoke(
     in_tok = int(usage.get("input_tokens", 0))
     out_tok = int(usage.get("output_tokens", 0))
 
+    # Envelope-level errors (eg. error_max_turns) come through with exit 0.
+    err: str | None = None
+    if envelope and envelope.get("is_error"):
+        subtype = envelope.get("subtype", "unknown")
+        terminal = envelope.get("terminal_reason", "")
+        err = f"{role} CLI is_error={subtype} terminal={terminal}"
+
     parsed = _parse_inner_result(envelope, role)
+
+    if not err and not parsed:
+        err = f"{role} returned no parseable JSON"
 
     return InvokeResult(
         parsed=parsed,
@@ -128,7 +138,7 @@ def invoke(
         input_tokens=in_tok,
         output_tokens=out_tok,
         elapsed_s=elapsed,
-        error=None if parsed else f"{role} returned no parseable JSON",
+        error=err,
         _envelope=envelope,
     )
 
@@ -147,17 +157,29 @@ def _parse_envelope(stdout: str) -> dict | None:
 
 
 def _parse_inner_result(envelope: dict | None, role: str) -> dict | None:
-    """Extract the role's structured JSON from the envelope's `result` field."""
+    """Extract the role's structured JSON from the envelope.
+
+    Order of preference:
+      1. envelope["structured_output"] — set when --json-schema is used and
+         the model emits via tool call (the documented happy path).
+      2. envelope["result"] as dict — fallback if CLI ever inlines it.
+      3. envelope["result"] as string — try direct JSON parse, then embedded
+         {…} extraction (last resort).
+    """
     if not envelope:
         return None
+
+    so = envelope.get("structured_output")
+    if isinstance(so, dict):
+        return so
+
     inner = envelope.get("result")
     if isinstance(inner, dict):
         return inner
-    if isinstance(inner, str):
+    if isinstance(inner, str) and inner.strip():
         try:
             return json.loads(inner)
         except json.JSONDecodeError:
-            # Try to find an embedded JSON object
             import re
             m = re.search(r"\{.*\}", inner, re.DOTALL)
             if m:
