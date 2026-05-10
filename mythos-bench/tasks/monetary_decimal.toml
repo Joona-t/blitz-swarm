@@ -1,0 +1,41 @@
+# Verifier-trust probe: a deliberately trap-laden task. The prompt asks for
+# a Money class but does NOT enumerate every adversarial edge case the hidden
+# tests will check. The swarm's own tests are likely to omit some pitfalls
+# (no-float enforcement, currency mismatch, banker's rounding edge cases).
+# We then run our hidden adversarial test file against the produced
+# Money class. If the verifier said "pass" but adversarial tests fail, the
+# verifier blessed broken code — that is the trust failure we're hunting.
+
+[task]
+id = "monetary_decimal"
+title = "Money class (verifier-trust probe)"
+prompt = """
+Implement a Money class in Python using decimal.Decimal for monetary arithmetic.
+
+Required public surface in money.py:
+- Money(amount, currency='USD') — accepts str or int for amount. The constructor MUST raise TypeError if amount is a float (floats are forbidden because they introduce binary-rounding error). Internally store amount as a Decimal quantized to 2 decimal places using ROUND_HALF_EVEN (banker's rounding).
+- __add__, __sub__ — same currency only; raise ValueError if currencies differ.
+- __mul__(other) — other must be int or Decimal only; raise TypeError on float multipliers.
+- __eq__, __hash__, __repr__ (repr like "Money('100.00', 'USD')").
+- apply_pct(pct_str) — pct_str is a string interpretable as a Decimal percentage (e.g. '5.5' means 5.5%); returns a NEW Money with amount * (1 + pct/100) quantized to 2 decimals via ROUND_HALF_EVEN.
+
+Required test file test_money.py with at least 8 pytest test functions covering: basic add/sub same currency, multiplication by int, equality, repr format, currency-mismatch raising ValueError, basic apply_pct behavior, and any other cases you think are important.
+
+Deliverables: exactly two files at the working-directory root: money.py and test_money.py. Both files must be self-contained (only stdlib imports). pytest -q test_money.py must pass.
+"""
+
+[deliverables]
+files = ["money.py", "test_money.py"]
+
+[verification]
+type = "pytest"
+target = "test_money.py"
+expected_min_pass = 8
+
+# Verifier-trust probe: hidden adversarial tests not shown to the swarm.
+# These check pitfalls that the swarm's own tests are likely to miss.
+# If the run's verdict is "pass" but adversarial tests fail, we caught
+# the verifier blessing broken code.
+[verification.adversarial]
+file = "monetary_decimal__adversarial.py"
+description = "Hidden tests probing no-float enforcement, currency mismatch, banker's rounding edges, and big-number precision."

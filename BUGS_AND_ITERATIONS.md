@@ -108,6 +108,49 @@ CLI probe (2026-05-09): `claude -p --model opus` routes to `claude-opus-4-7` wit
 
 **Next:** run on a task where one mode actually has a structural disadvantage we can prove (e.g., a debug task with a non-obvious root cause to test verifier trust; or a research-style question to confirm consensus mode wins on its home turf). Until then, default code-production tasks to Mythos.
 
+**Commit:** 44f2961.
+
+## 2026-05-10: ITER-MYTHOS-003 — mythos-bench harness + first verifier-trust probe
+
+**What landed:** A real bench harness at `mythos-bench/`. Task specs are TOML; the runner shells out to `orchestrator.py`, extracts deliverables (mythos: per-executor `.md`; consensus: synthesized `.md`), runs pytest, optionally runs hidden adversarial tests, and writes a structured row to `results/runs.jsonl`. `bench.py compare` emits a markdown comparison table.
+
+**Why now:** doing head-to-head runs by hand was already painful at n=3. The Karpathy move is to build the instrument, not run more comparisons by eye.
+
+**First verifier-trust probe — `monetary_decimal`:** task asks for a Money class using `decimal.Decimal` with banker's rounding, no-float enforcement, currency-mismatch checks. The visible spec doesn't enumerate every adversarial edge case. Hidden adversarial tests at `mythos-bench/adversarial/monetary_decimal__adversarial.py` check 6 probe categories: float forbidden on construction, float forbidden on multiplication, currency-mismatch raises ValueError, banker's-rounding edge cases (0.005 → 0.00, 0.025 → 0.02, NOT half-up), large-number precision (Decimal must not route through float anywhere), and repr format.
+
+**Result:** Mythos passed all 12 swarm-written tests AND all 17 hidden adversarial tests. Verifier verdict was `pass`; adversarial tests confirmed it. **No verifier-trust failure caught.** Cost: $1.50, 4:16 wall, 3 invocations, 1 round.
+
+**What this tells us — and what it doesn't:**
+- Mythos planner produced an aggressive spec that pre-empted most pitfalls (banker's rounding was already mandated in the planner output, so executors implemented it).
+- The verifier was well-calibrated — no false-pass on this probe.
+- This is one probe. We have not refuted the verifier-trust failure mode; we just didn't trigger it. Designing harder probes is the next priority — candidate: tasks where the natural Sonnet implementation has an emergent stress-test bug (e.g. concurrent state, hash collisions, IEEE-754 boundary behavior).
+
+**Bench results so far** (4 runs):
+
+| Task | Mode | Verdict | Cost | Wall | Inv | Primary | Adversarial |
+|---|---|---|---|---|---|---|---|
+| binary_search | mythos | passed | $1.07 | 203s | 4 | 9p/0f | — |
+| binary_search | consensus | passed | $1.43 | 481s | 11 | 31p/0f | — |
+| merge_sort | mythos | passed | $1.56 | 294s | 4 | 7p/0f | — |
+| monetary_decimal | mythos | passed | $1.50 | 256s | 3 | 12p/0f | **17p/0f** |
+
+**Files:**
+- `mythos-bench/bench.py` — CLI
+- `mythos-bench/lib.py` — task spec, runner, extractor, pytest runner, result io
+- `mythos-bench/BENCH.md` — user doc
+- `mythos-bench/tasks/{binary_search,merge_sort,monetary_decimal}.toml`
+- `mythos-bench/adversarial/monetary_decimal__adversarial.py`
+- `mythos-bench/results/{runs.jsonl,comparison.md}`
+
+**Operational notes:**
+- The backfill command's consensus-mode `.md` detection picks the first match in the run dir — if the dir contains many old outputs, it picks wrong. Workaround: copy the specific output file to an isolated dir and backfill from there. Fix to land in v2 — accept explicit `--output-path`.
+- The `[verification.adversarial]` table is honor-system hidden — the swarm doesn't see the file. If Mythos ever gains shell/file access, this contract needs hardening.
+
+**Next probes to design:**
+1. A task with a non-local invariant (e.g. a small state machine where wrong handling of one transition breaks an invariant in a different transition).
+2. A task where Sonnet's natural implementation has an IEEE-754 stress bug only visible at boundaries.
+3. A debug-style task (give it broken code + a failure trace, ask to fix without breaking other invariants).
+
 **Commit:** TBD.
 
 <!-- Format:

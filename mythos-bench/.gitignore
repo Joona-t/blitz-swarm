@@ -1,0 +1,5 @@
+# Per-run extracted deliverables and CLI logs are reproducible from the
+# orchestrator's run dir. Keep them out of the repo to avoid bloat.
+artifacts/
+__pycache__/
+*.pyc

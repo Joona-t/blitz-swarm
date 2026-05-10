@@ -1,0 +1,14 @@
+[task]
+id = "merge_sort"
+title = "Stable merge sort with termination + stability proofs"
+prompt = """
+Implement and verify a stable merge sort in Python: (1) a sort module that defines merge_sort(items, key=None) returning a NEW sorted list (does not mutate input); (2) the implementation must be top-down recursive merge sort using an iterative merge step; (3) include a module-level Pre/Post conditions docstring stating: pre = items is a list (possibly empty), key is None or callable; post = result is sorted by key (or by identity if key is None), result is a permutation of items (same multiset), and for any two elements a, b with equal keys appearing in items at indices i < j, a appears before b in result (stability); (4) include a labeled '# Termination:' comment proving termination by strong induction on len(items) (the recursive calls operate on strictly smaller sub-lists); (5) include a labeled '# Stability proof:' comment block explaining why the merge step preserves original order for equal keys (the '<=' tie-breaking convention); (6) a pytest test file that uses property-based assertions (no hypothesis dependency required — implement a deterministic 500-iteration loop with a seeded RNG) checking: output is sorted, output is a permutation of input, stability is preserved for adjacent equal-key items (use tuples (key, original_index) and verify original_index is non-decreasing within each equal-key run), and edge cases: empty list, single element, all-equal elements, already-sorted, reverse-sorted, with key= function used for stability check. Deliver as exactly two files: merge_sort.py and test_merge_sort.py.
+"""
+
+[deliverables]
+files = ["merge_sort.py", "test_merge_sort.py"]
+
+[verification]
+type = "pytest"
+target = "test_merge_sort.py"
+expected_min_pass = 5

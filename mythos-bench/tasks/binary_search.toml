@@ -1,0 +1,14 @@
+[task]
+id = "binary_search"
+title = "Binary search with explicit loop invariant + tests"
+prompt = """
+Implement and verify a Python binary_search(arr, target) function over a sorted list of ints. Provide the implementation, a stated loop invariant, a one-paragraph informal correctness argument, and a pytest-runnable test file covering empty list, single-element list (hit and miss), duplicates, target less than min, target greater than max, target at boundaries, and a 1000-element randomized check. The deliverable must be a single self-contained Python file plus a single test file.
+"""
+
+[deliverables]
+files = ["binary_search.py", "test_binary_search.py"]
+
+[verification]
+type = "pytest"
+target = "test_binary_search.py"
+expected_min_pass = 9
