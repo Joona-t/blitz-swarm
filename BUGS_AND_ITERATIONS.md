@@ -81,7 +81,34 @@ CLI probe (2026-05-09): `claude -p --model opus` routes to `claude-opus-4-7` wit
 
 **Lesson:** when integrating with a CLI surface, the `--help` text rarely tells you which envelope field carries the parsed output. Probe with a real schema call before assuming, and always check `is_error` even when `returncode == 0`.
 
-**Commit:** TBD (this commit).
+**Commit:** b995365.
+
+## 2026-05-10: ITER-MYTHOS-002 — Head-to-head: Mythos beats consensus on artifact-producing tasks
+
+**Observation:** Ran three live tasks to compare swarm topologies:
+- (A) Consensus mode (`--max-rounds 2`) on binary search w/ tests: **$1.43, 8:01 wall, 11 invocations, no consensus reached, judge avg 6.2/10. Critic flagged twice that researchers truncated code blocks; synthesizer backfilled the deliverable. Pytest after extraction: 31/31 pass.**
+- (Mythos orig) on the same binary-search task: **$1.07, 3:23 wall, 4 invocations, 1 round, verifier pass 0.95. Pytest: 9/9 pass.**
+- (B) Mythos on a harder task — stable merge sort with Pre/Post conditions, termination by strong induction, stability proof via `<=` tie-breaking, 7 property-based tests: **$1.56, 4:54 wall, 4 invocations, 1 round, verifier pass 0.95. Pytest: 7/7 pass. `grep -E '(Termination|Stability|Pre/Post)' merge_sort.py` confirms the labeled proof blocks are present and substantive.**
+
+**Verdict:** On the same binary-search task, Mythos was 25% cheaper, 58% faster, used 64% fewer agent calls, and emitted an artifact-shaped output (plan / executor outputs / verification trace / final_artifact.md) rather than a research-summary-shaped one. On the harder merge-sort task it still one-shot the work at similar cost.
+
+**Structural reason:** consensus mode's researchers default to summarizing; the topology can't force them to emit complete artifacts (only the synthesizer's final pass backfilled the code). Mythos's planner-executor-verifier hierarchy is the right shape when the *deliverable IS the work*. Confirms the prior `/blitz-swarm` research thesis empirically — at least for this task class.
+
+**Caveats not to forget:**
+1. Consensus mode wasn't designed for code production — this isn't a fair benchmark *of consensus mode*; it's a sanity check that Mythos is the right tool for code-as-deliverable tasks.
+2. n=3 runs. Strong directional signal, not a benchmark.
+3. Verifier-blesses-broken-code is the failure mode to watch. We got pass-and-actually-correct twice; need to find a case where the verifier is overconfident before trusting it on higher-stakes work.
+
+**Operational note:** First attempt at running consensus mode in the harness's background-task system died with exit 144 (signal 16 / SIGURG, empty stdout). Retried in foreground — ran cleanly. There's a sandbox interaction worth investigating before relying on background swarm runs.
+
+**Run dirs:**
+- `output/implement_and_verify_a_python_binary_search_arr_ta_20260510_081107.md` (A)
+- `output/mythos/implement_and_verify_a_python_binary_search_arr_ta_20260509_185053/` (Mythos orig)
+- `output/mythos/implement_and_verify_a_stable_merge_sort_in_python_20260510_075734/` (B)
+
+**Next:** run on a task where one mode actually has a structural disadvantage we can prove (e.g., a debug task with a non-obvious root cause to test verifier trust; or a research-style question to confirm consensus mode wins on its home turf). Until then, default code-production tasks to Mythos.
+
+**Commit:** TBD.
 
 <!-- Format:
 ## YYYY-MM-DD: Short Title
