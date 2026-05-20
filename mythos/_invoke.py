@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from backends import AgentCall, make_backend, parse_json_loose
+from backends import AgentCall, make_backend
 from config import load_config
 from .policies import resolve_model
 
@@ -63,18 +63,19 @@ def invoke(
         model, effort = resolve_model(model_alias)
         cfg = load_config()
         backend_id = os.environ.get("BLITZ_BACKEND") or cfg.backend.default or "codex"
-        provider = getattr(cfg.backend, backend_id, cfg.backend.codex)
+        provider = cfg.backend.get_provider(backend_id)
         sandbox = os.environ.get("BLITZ_SANDBOX") or provider.sandbox
         backend_model = provider.model or model
-        if backend_id == "claude":
-            backend_model = model
         backend = make_backend(
             backend_id,
+            adapter=provider.adapter,
             model=backend_model,
             reasoning_effort=provider.reasoning_effort,
             sandbox=sandbox,
             approval_policy=provider.approval_policy,
             ephemeral=provider.ephemeral,
+            base_url=provider.base_url,
+            **provider.metadata,
         )
         schema = json.loads(schema_json)
     except Exception as e:
@@ -101,7 +102,7 @@ def invoke(
         ephemeral=provider.ephemeral,
     ))
 
-    parsed = res.parsed or parse_json_loose(res.text)
+    parsed = res.parsed
     err = res.error
     if not err and not parsed:
         err = f"{role} returned no parseable JSON"

@@ -28,15 +28,18 @@ def _memory_backend_json(prompt: str, system_prompt: str, schema: dict, timeout_
 
         cfg = load_config()
         backend_id = cfg.backend.default or "codex"
-        provider = getattr(cfg.backend, backend_id, cfg.backend.codex)
-        model = "haiku" if backend_id == "claude" else (provider.model or cfg.swarm.default_model)
+        provider = cfg.backend.get_provider(backend_id)
+        model = provider.model or cfg.swarm.default_model
         backend = make_backend(
             backend_id,
+            adapter=provider.adapter,
             model=model,
             reasoning_effort=provider.reasoning_effort,
             sandbox=provider.sandbox,
             approval_policy=provider.approval_policy,
             ephemeral=provider.ephemeral,
+            base_url=provider.base_url,
+            **provider.metadata,
         )
         result = backend.call(AgentCall(
             role="memory_writer",

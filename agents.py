@@ -547,18 +547,19 @@ def _planning_backend_json(
 
         cfg = load_config()
         backend_id = backend_id or cfg.backend.default or "codex"
-        provider = getattr(cfg.backend, backend_id, cfg.backend.codex)
+        provider = cfg.backend.get_provider(backend_id)
         model = provider.model or cfg.swarm.default_model
-        if model_hint == "cheap" and backend_id == "claude":
-            model = "haiku"
         resolved_sandbox = sandbox or provider.sandbox
         backend = make_backend(
             backend_id,
+            adapter=provider.adapter,
             model=model,
             reasoning_effort=provider.reasoning_effort,
             sandbox=resolved_sandbox,
             approval_policy=provider.approval_policy,
             ephemeral=provider.ephemeral,
+            base_url=provider.base_url,
+            **provider.metadata,
         )
         result = backend.call(AgentCall(
             role="planner",

@@ -21,7 +21,7 @@ from agents import (
     BlitzAgent,
     plan_agents,
 )
-from backends import AgentBackend, AgentCall, make_backend, parse_json_loose
+from backends import AgentBackend, AgentCall, make_backend
 from config import load_config
 from consensus import (
     check_consensus,
@@ -91,8 +91,9 @@ def _backend_settings(
     """Resolve backend/provider settings without mutating loaded config."""
     cfg = cfg or load_config()
     selected = backend_id or cfg.backend.default or "codex"
-    provider = getattr(cfg.backend, selected, None)
-    if provider is None:
+    try:
+        provider = cfg.backend.get_provider(selected)
+    except KeyError:
         raise ValueError(f"Unknown backend '{selected}'")
     resolved_sandbox = sandbox or provider.sandbox or "read-only"
     return cfg, selected, provider, resolved_sandbox
@@ -100,9 +101,7 @@ def _backend_settings(
 
 def _model_for_agent(agent: BlitzAgent, backend_id: str, provider, cfg) -> str:
     """Map legacy role models to backend-native models."""
-    if backend_id == "claude":
-        return agent.model or provider.model or cfg.swarm.default_model
-    return provider.model or cfg.swarm.default_model or agent.model
+    return provider.model or agent.model or cfg.swarm.default_model
 
 
 def _make_runtime_backend(
@@ -118,11 +117,14 @@ def _make_runtime_backend(
     )
     return make_backend(
         selected,
+        adapter=provider.adapter,
         model=provider.model or cfg.swarm.default_model,
         reasoning_effort=provider.reasoning_effort,
         sandbox=resolved_sandbox,
         approval_policy=provider.approval_policy,
         ephemeral=provider.ephemeral,
+        base_url=provider.base_url,
+        **provider.metadata,
     )
 
 
@@ -727,7 +729,7 @@ def _make_judge_fn(
         seed: int,
         rubric_dims: tuple[str, ...],
     ) -> JudgeVote:
-        model = provider.model if backend_id != "claude" else model_alias
+        model = provider.model or model_alias or cfg.swarm.default_model
         prompt = (
             f"You are {judge_id}, an independent quality judge.\n\n"
             f"Evaluate this candidate research output for the task.\n"
@@ -751,7 +753,7 @@ def _make_judge_fn(
             reasoning_effort=provider.reasoning_effort,
             ephemeral=provider.ephemeral,
         ))
-        parsed = result.parsed or parse_json_loose(result.text) or {}
+        parsed = result.parsed or {}
         if result.errored and not parsed:
             return JudgeVote(
                 judge_id=judge_id,
@@ -891,7 +893,7 @@ def _make_pairwise_judge_fn(
     """Build SelectorSynth's pairwise judge hook on top of AgentBackend."""
 
     def _pairwise(span_a: Span, span_b: Span, topic: str, judge_id: str, seed: int) -> PairwiseVerdict:
-        model = provider.model if backend_id != "claude" else cfg.swarm.default_model
+        model = provider.model or cfg.swarm.default_model
         prompt = (
             f"You are {judge_id}, judging two candidate research spans for: {topic}\n\n"
             "Choose the span that is more accurate, specific, complete, and clear. "
@@ -912,7 +914,7 @@ def _make_pairwise_judge_fn(
             reasoning_effort=provider.reasoning_effort,
             ephemeral=provider.ephemeral,
         ))
-        parsed = result.parsed or parse_json_loose(result.text) or {}
+        parsed = result.parsed or {}
         winner = parsed.get("winner", "tie")
         if winner not in ("a", "b", "tie"):
             winner = "tie"
@@ -1095,7 +1097,7 @@ async def run_swarm(
     print(f"{'='*60}\n")
     print(
         f"Backend: {selected_backend} | model={provider.model or runtime_cfg.swarm.default_model} "
-        f"| profile={profile} | sandbox={resolved_sandbox}"
+        f"| adapter={provider.adapter} | profile={profile} | sandbox={resolved_sandbox}"
     )
     print(
         "Mechanisms: "
@@ -1475,7 +1477,7 @@ def _dry_run(
     print(f"{'='*60}\n")
     print(
         f"Backend: {selected_backend} | model={provider.model or cfg.swarm.default_model} "
-        f"| profile={profile} | sandbox={resolved_sandbox}"
+        f"| adapter={provider.adapter} | profile={profile} | sandbox={resolved_sandbox}"
     )
     print()
 
@@ -1534,8 +1536,8 @@ def main():
         help="Use heuristic agent planning instead of LLM — consensus mode only",
     )
     parser.add_argument(
-        "--backend", choices=["codex", "claude", "gemini"], default=None,
-        help="Local invocation backend (default: blitz.toml [backend].default)",
+        "--backend", default=None,
+        help="Backend provider id from blitz.toml [backend.providers]",
     )
     parser.add_argument(
         "--quality-profile", choices=["max", "balanced", "cheap"], default=None,
@@ -1640,7 +1642,9 @@ def _run_mythos_mode(args) -> None:
         print(f"  cost_ceiling_usd  = {cfg.cost_ceiling_usd}")
         print(f"  output_dir        = {cfg.output_dir}")
         print(f"  backend           = {os.environ.get('BLITZ_BACKEND') or load_config().backend.default}")
-        print(f"  sandbox           = {os.environ.get('BLITZ_SANDBOX') or load_config().backend.codex.sandbox}")
+        loaded = load_config()
+        default_provider = loaded.backend.get_provider(loaded.backend.default)
+        print(f"  sandbox           = {os.environ.get('BLITZ_SANDBOX') or default_provider.sandbox}")
         print(f"\nNo CLI calls will be made. Use without --dry-run to execute.")
         return
 

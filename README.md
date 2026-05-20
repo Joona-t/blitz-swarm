@@ -2,23 +2,23 @@
 
 **A parallel multi-agent architecture for consensus-driven research synthesis, with hierarchical memory, frontier-paper mechanisms, and a recursive self-improvement loop.**
 
-[![Tests](https://img.shields.io/badge/tests-260_passing-brightgreen)](#testing)
-[![Version](https://img.shields.io/badge/version-v0.2.1-blue)](CHANGELOG.md)
+[![Tests](https://img.shields.io/badge/tests-264_passing-brightgreen)](#testing)
+[![Version](https://img.shields.io/badge/version-v0.2.2-blue)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 ---
 
 ## Abstract
 
-Blitz-Swarm is a multi-agent research system where agents execute simultaneously, share memory through a live blackboard, and iterate toward consensus through voting rounds. The default local backend is now Codex CLI through one typed invocation layer, with Claude and Gemini retained as explicit fallback adapters. Unlike sequential pipelines, Blitz-Swarm fires agents in parallel, filters tainted outputs before future context, and can halt when an N-judge ensemble's score distribution stabilizes. Dissenting views are explicitly preserved.
+Blitz-Swarm is a multi-agent research system where agents execute simultaneously, share memory through a live blackboard, and iterate toward consensus through voting rounds. The default local backend is Codex CLI through a typed harness-agnostic backend layer, with Claude, Gemini, Ollama, and future harnesses exposed as adapters. Unlike sequential pipelines, Blitz-Swarm fires agents in parallel, filters tainted outputs before future context, and can halt when an N-judge ensemble's score distribution stabilizes. Dissenting views are explicitly preserved.
 
-v0.2.1 adds Codex-first orchestration: `backends.py` owns `AgentCall`, `AgentResult`, and backend adapters; consensus mode, Mythos mode, planning, memory LLM helpers, judge hooks, and selector hooks now route through that layer.
+v0.2.2 makes the backend layer harness-agnostic: `backends/` owns `AgentCall`, `AgentResult`, `RuntimePolicy`, `BackendCapabilities`, a registry, CLI adapters, and an Ollama HTTP example. Consensus mode, Mythos mode, planning, memory LLM helpers, judge hooks, and selector hooks route through that contract.
 
 Recursion is hard-capped at L3 — humans audit any change beyond the L2 allow-list.
 
 ---
 
-## What ships in v0.2.1
+## What ships in v0.2.2
 
 | Layer | Module | Anchor | LOC | Tests |
 |---|---|---|---|---|
@@ -30,10 +30,10 @@ Recursion is hard-capped at L3 — humans audit any change beyond the L2 allow-l
 | Memory | `gmemory/{schema.sql, query_graph.py, insight_graph.py, promotion.py, retrieval.py, hybrid.py, meta.py}` | Zhang 2506.07398, GAM 2604.12285 | ~1100 | 31 |
 | Evolve | `evolve/{aflow_search.py, meta_loop.py, gepa_adapter.py}` | Liu 2410.10762, GEPA 2507.19457 | ~700 | 22 |
 | Heterogeneity | `heterogeneity/{cli_router.py, routing_table.toml}` | Maryanskyy 2603.20324 | ~280 | 6 |
-| Backends | `backends.py` | Codex CLI + structured output validation | ~470 | 7 |
+| Backends | `backends/` | Harness-agnostic contract + Codex/Claude/Gemini/Ollama adapters | ~850 | 10 |
 | Managed Agents | `managed_agents/adapter.py` | Anthropic May 7 2026 beta | ~180 | 13 |
 
-**Total**: 260 passing tests, 14 conditional skips, scipy-optional, framework-free.
+**Total**: 264 passing tests, 14 conditional skips, scipy-optional, framework-free.
 
 ---
 
@@ -86,7 +86,7 @@ Optional dependencies (graceful degradation when absent):
 - `gepa` — `pip install gepa-ai/gepa` to run `scripts/optimize_prompts.py`
 - `anthropic` — only if you opt into the Managed Agents backend
 
-Required by default: local `codex` CLI. Optional fallback backends: `claude` CLI or `gemini` CLI, enabled only when selected via CLI/config.
+Required by default: local `codex` CLI. Optional local backends include `claude`, `gemini`, and Ollama via HTTP, enabled only when selected via CLI/config.
 
 ### Run
 
@@ -120,14 +120,20 @@ persona_critics = false      # MAR personas (factual/logical/counterfactual)
 
 [backend]
 default = "codex"
-fallback = ""                # fail clearly unless fallback is explicit
+fallback = []                # fail clearly unless fallback is explicit
 
-[backend.codex]
+[backend.providers.codex]
+adapter = "codex_cli"
 model = "gpt-5.5"
 reasoning_effort = "high"
 sandbox = "read-only"
 approval_policy = "never"
 ephemeral = true
+
+[backend.providers.ollama]
+adapter = "ollama_http"
+model = "qwen2.5:7b"
+base_url = "http://localhost:11434"
 
 [guard]                      # cascade_guard
 enabled = true
@@ -163,17 +169,17 @@ A v0.1.x config file runs unchanged on v0.2 — every new feature is gated.
 
 ## Methodology
 
-The MAST regression scoreboard at `bench/mast_scoreboard.md` reports detector coverage of the 14 named failure modes from Cemri 2503.13657. **v0.1.1 baseline: 9/14 detected.** v0.2.1 wires cascade guard, judge ensemble, and selector synthesis into the main run loop; full n≥20 live benchmark results are still pending.
+The MAST regression scoreboard at `bench/mast_scoreboard.md` reports detector coverage of the 14 named failure modes from Cemri 2503.13657. **v0.1.1 baseline: 9/14 detected.** v0.2.2 wires cascade guard, judge ensemble, selector synthesis, and harness-agnostic backend routing into the main run loop; full n>=20 live benchmark results are still pending.
 
 The bench runner `bench/runner.py` is `swarm_fn`-injectable so any future swarm topology can be scored without the orchestrator-integration coupling. Statistical analysis (`bench/stats.py`) uses paired t-test, Cohen's d_z, and bootstrap CI — scipy is optional and the module degrades to a normal-CDF approximation when scipy is missing.
 
-A baseline run on v0.1.1 — costs API tokens and lands in `bench/runs/baseline_v0.1.1/` — remains pending. It should now compare against the Codex-first v0.2.1 stack rather than the earlier module-only v0.2.0 state.
+A baseline run on v0.1.1 — costs API tokens and lands in `bench/runs/baseline_v0.1.1/` — remains pending. It should now compare against the harness-agnostic v0.2.2 stack rather than the earlier module-only v0.2.0 state.
 
 ---
 
 ## Honest limitations
 
-- **No real bench run yet.** Mechanisms and backend plumbing have unit/integration tests with mocked LLM hooks; no n≥20 live Codex-vs-baseline slate has been executed.
+- **No real bench run yet.** Mechanisms and backend plumbing have unit/integration tests with mocked LLM hooks; no n>=20 live harness-vs-baseline slate has been executed.
 - **Cascade guard LLM adjudication is still heuristic.** The guard is wired into orchestration and filters errored/raw/blocked outputs, but claim decomposition/screening still uses the LLM-free hooks unless replaced.
 - **Empirical-CDF KS instead of parametric BB mixture in `judge_ensemble`.** Honest deviation from Hu 2510.12697 — at N=3-7 the empirical CDF gives the same halt signal without scipy or EM, but at higher N the parametric variant may be sharper.
 - **GAM "promotion gate" is N=3-distinct-query, not LLM-discrimination.** GAM uses LLM-discrimination at session boundaries that don't exist in a sessionless swarm. The structural rule is documented in `gmemory/promotion.py` docstring — not a citation claim.
@@ -189,7 +195,7 @@ A baseline run on v0.1.1 — costs API tokens and lands in `bench/runs/baseline_
 blitz-swarm/
 ├── orchestrator.py              # main entrypoint, run_swarm()
 ├── agents.py                    # plan_agents, BlitzAgent, persona registry
-├── backends.py                  # AgentCall/AgentResult + codex/claude/gemini adapters
+├── backends/                    # backend contract, registry, CLI/Ollama adapters
 ├── consensus.py                 # convergence voting, dissent extraction
 ├── blackboard.py                # Redis blackboard + in-memory fallback
 ├── embedder.py                  # MiniLM wrapper (loaded once at startup)
@@ -217,7 +223,7 @@ blitz-swarm/
 │   ├── ROADMAP.md               # post-v0.2 work
 │   ├── CLAIMS_AND_EVIDENCE.md   # claim → evidence mapping
 │   └── LIMITATIONS.md           # what we don't know
-├── tests/                       # 260 passing, 14 skipped
+├── tests/                       # 264 passing, 14 skipped
 ├── BUGS_AND_ITERATIONS.md       # patch trail
 ├── research.md                  # source-of-truth research backbone
 └── plan.md                      # phase-by-phase TDD plan
@@ -230,10 +236,10 @@ blitz-swarm/
 ```bibtex
 @software{tyrninoksa2026blitzswarm_v02,
   author = {Tyrninoksa, Joona},
-  title = {Blitz-Swarm v0.2.1: Codex-first multi-agent research swarm},
+  title = {Blitz-Swarm v0.2.2: Harness-agnostic multi-agent research swarm},
   year = {2026},
   url = {https://github.com/Joona-t/blitz-swarm},
-  version = {0.2.1},
+  version = {0.2.2},
   license = {MIT}
 }
 ```

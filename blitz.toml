@@ -17,20 +17,34 @@ persona_critics = false
 
 [backend]
 default = "codex"
-# Leave unset to fail clearly when Codex is unavailable. Set to "claude" or
-# "gemini" only when you explicitly want a fallback backend.
-fallback = ""
+# Leave empty to fail clearly when Codex is unavailable. Add provider ids like
+# ["claude", "gemini", "ollama"] only when you explicitly want fallback.
+fallback = []
 
-[backend.codex]
+[backend.providers.codex]
+adapter = "codex_cli"
 model = "gpt-5.5"
 reasoning_effort = "high"
 sandbox = "read-only"
 approval_policy = "never"
 ephemeral = true
 
-[backend.claude]
+[backend.providers.claude]
+adapter = "claude_cli"
 model = "sonnet"
 reasoning_effort = "high"
+sandbox = "read-only"
+approval_policy = "never"
+ephemeral = true
+
+[backend.providers.gemini]
+adapter = "gemini_cli"
+model = ""
+
+[backend.providers.ollama]
+adapter = "ollama_http"
+model = "qwen2.5:7b"
+base_url = "http://localhost:11434"
 sandbox = "read-only"
 approval_policy = "never"
 ephemeral = true

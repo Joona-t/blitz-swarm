@@ -2,9 +2,9 @@
 
 ## Data Limitations
 
-1. **No n>=20 live benchmark yet.** The mechanism and backend suites are green, but the Codex-first stack has not been run against a statistically meaningful bench slate.
+1. **No n>=20 live benchmark yet.** The mechanism and backend suites are green, but the harness-agnostic stack has not been run against a statistically meaningful bench slate.
 
-2. **No baseline comparison yet.** The v0.1.1 baseline metrics exist for a few historical runs, but there is not yet a controlled Codex-first vs Claude-first vs single-agent comparison.
+2. **No baseline comparison yet.** The v0.1.1 baseline metrics exist for a few historical runs, but there is not yet a controlled Codex/Claude/Gemini/Ollama/single-agent comparison.
 
 3. **Codex cost telemetry is partial.** `AgentResult` standardizes `cost_usd`, `input_tokens`, and `output_tokens`, but Codex CLI does not currently expose the same cost envelope as Claude CLI. Cost fields are optional.
 
@@ -20,7 +20,7 @@
 
 ## External Validity
 
-8. **Codex is the default, not the only supported backend.** Claude and Gemini adapters exist, but Codex is the only first-class local target in v0.2.1.
+8. **Codex is the default, not the only supported backend.** Claude, Gemini, and Ollama adapters exist, and future harnesses should plug into the same registry contract.
 
 9. **Local CLI behavior can drift.** The implementation is grounded in `codex-cli 0.132.0`; future CLI flag changes may require adapter updates.
 

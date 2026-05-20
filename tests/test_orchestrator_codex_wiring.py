@@ -1,4 +1,4 @@
-"""Regression tests for Codex-first orchestrator wiring."""
+"""Regression tests for harness-agnostic orchestrator wiring."""
 
 from __future__ import annotations
 
@@ -145,7 +145,7 @@ def test_judge_ensemble_produces_quality_judge_vote_with_fake_backend():
         backend=fake,
         cfg=cfg,
         backend_id="codex",
-        provider=cfg.backend.codex,
+        provider=cfg.backend.get_provider("codex"),
         sandbox="read-only",
     )
 
@@ -175,7 +175,7 @@ def test_selector_synthesis_replaces_final_blended_synth_with_fake_backend():
         backend=fake,
         cfg=cfg,
         backend_id="codex",
-        provider=cfg.backend.codex,
+        provider=cfg.backend.get_provider("codex"),
         sandbox="read-only",
     )
 
@@ -216,3 +216,8 @@ def test_no_direct_claude_subprocess_calls_remain_on_active_paths(repo_root: Pat
         text = (repo_root / rel).read_text(encoding="utf-8")
         assert '"claude", "-p"' not in text
         assert "--dangerously-skip-permissions" not in text
+        assert 'if backend_id == "claude"' not in text
+        assert "getattr(cfg.backend" not in text
+        assert "CodexLocalBackend" not in text
+        assert "ClaudeCLIBackend" not in text
+        assert "GeminiCLIBackend" not in text

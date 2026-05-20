@@ -34,24 +34,64 @@ class MemoryConfig:
 
 @dataclass
 class BackendProviderConfig:
+    adapter: str = ""
     model: str = ""
     reasoning_effort: str = "high"
     sandbox: str = "read-only"
     approval_policy: str = "never"
     ephemeral: bool = True
+    base_url: str = ""
+    metadata: dict = field(default_factory=dict)
+
+
+def _default_backend_providers() -> dict[str, BackendProviderConfig]:
+    return {
+        "codex": BackendProviderConfig(adapter="codex_cli", model="gpt-5.5"),
+        "claude": BackendProviderConfig(adapter="claude_cli", model="sonnet"),
+        "gemini": BackendProviderConfig(adapter="gemini_cli"),
+        "ollama": BackendProviderConfig(
+            adapter="ollama_http",
+            model="qwen2.5:7b",
+            base_url="http://localhost:11434",
+        ),
+    }
 
 
 @dataclass
 class BackendConfig:
     default: str = "codex"
-    fallback: str | None = None
-    codex: BackendProviderConfig = field(
-        default_factory=lambda: BackendProviderConfig(model="gpt-5.5")
+    fallback: list[str] = field(default_factory=list)
+    providers: dict[str, BackendProviderConfig] = field(default_factory=_default_backend_providers)
+    codex: BackendProviderConfig = field(default_factory=lambda: BackendProviderConfig(adapter="codex_cli", model="gpt-5.5"))
+    claude: BackendProviderConfig = field(default_factory=lambda: BackendProviderConfig(adapter="claude_cli", model="sonnet"))
+    gemini: BackendProviderConfig = field(default_factory=lambda: BackendProviderConfig(adapter="gemini_cli"))
+    ollama: BackendProviderConfig = field(
+        default_factory=lambda: BackendProviderConfig(
+            adapter="ollama_http",
+            model="qwen2.5:7b",
+            base_url="http://localhost:11434",
+        )
     )
-    claude: BackendProviderConfig = field(
-        default_factory=lambda: BackendProviderConfig(model="sonnet")
-    )
-    gemini: BackendProviderConfig = field(default_factory=BackendProviderConfig)
+
+    def sync_aliases(self) -> None:
+        for name in ("codex", "claude", "gemini", "ollama"):
+            provider = self.providers.get(name) or getattr(self, name)
+            if not provider.adapter:
+                provider.adapter = {
+                    "codex": "codex_cli",
+                    "claude": "claude_cli",
+                    "gemini": "gemini_cli",
+                    "ollama": "ollama_http",
+                }[name]
+            self.providers[name] = provider
+            setattr(self, name, provider)
+
+    def get_provider(self, name: str) -> BackendProviderConfig:
+        self.sync_aliases()
+        provider = self.providers.get(name)
+        if provider is None:
+            raise KeyError(name)
+        return provider
 
 
 @dataclass
@@ -137,16 +177,36 @@ def load_config(path: Path = CONFIG_PATH) -> BlitzConfig:
 
     if "backend" in raw:
         for k, v in raw["backend"].items():
-            if isinstance(v, dict):
+            if k == "providers" and isinstance(v, dict):
+                for provider_name, provider_raw in v.items():
+                    if not isinstance(provider_raw, dict):
+                        continue
+                    provider = config.backend.providers.get(
+                        provider_name,
+                        BackendProviderConfig(),
+                    )
+                    for pk, pv in provider_raw.items():
+                        if hasattr(provider, pk):
+                            setattr(provider, pk, pv)
+                        else:
+                            provider.metadata[pk] = pv
+                    config.backend.providers[provider_name] = provider
+            elif isinstance(v, dict):
                 provider = getattr(config.backend, k, None)
                 if provider is not None:
                     for pk, pv in v.items():
                         if hasattr(provider, pk):
                             setattr(provider, pk, pv)
+                        else:
+                            provider.metadata[pk] = pv
+                    config.backend.providers[k] = provider
             elif hasattr(config.backend, k):
                 setattr(config.backend, k, v)
-        if config.backend.fallback == "":
-            config.backend.fallback = None
+        if config.backend.fallback in ("", None):
+            config.backend.fallback = []
+        elif isinstance(config.backend.fallback, str):
+            config.backend.fallback = [config.backend.fallback]
+        config.backend.sync_aliases()
 
     if "guard" in raw:
         for k, v in raw["guard"].items():

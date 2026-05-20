@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.2.2] — 2026-05-21
+
+### Harness-agnostic backend package
+
+- Replaced the single `backends.py` module with a `backends/` package containing the core call/result contract, registry, CLI adapters, Ollama HTTP adapter, and harness adapter template.
+- Added `RuntimePolicy` and `BackendCapabilities` while keeping the existing `AgentCall` and `AgentResult` fields compatible.
+- Added provider registry config under `[backend.providers.<id>]` with compatibility loading for legacy `[backend.codex]`, `[backend.claude]`, and `[backend.gemini]` sections.
+- Removed backend-specific Claude branches from orchestration, planning, memory helpers, and Mythos invocation; adapter selection and model mapping now live in the backend layer.
+- Made `--backend` accept any configured provider id, not only the built-in CLI names.
+
+### Tests
+
+264 passing, 14 conditional skips:
+
+- Added registry tests for custom adapter registration and built-in adapter resolution.
+- Added provider config migration tests covering registry-style and legacy backend config.
+- Added Ollama fake-HTTP tests for one-call local harness behavior and normalized telemetry.
+
 ## [0.2.1] — 2026-05-20
 
 ### Codex-first orchestration
