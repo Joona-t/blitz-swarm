@@ -9,18 +9,19 @@ Usage:
 import asyncio
 import json
 import re
-import subprocess
 import sys
 import time
 import uuid
 from datetime import datetime
 from pathlib import Path
+from typing import Literal
 
 from agents import (
-    AGENT_OUTPUT_SCHEMA_JSON,
+    AGENT_OUTPUT_SCHEMA,
     BlitzAgent,
     plan_agents,
 )
+from backends import AgentBackend, AgentCall, make_backend, parse_json_loose
 from config import load_config
 from consensus import (
     check_consensus,
@@ -28,6 +29,15 @@ from consensus import (
     format_convergence_report,
     format_dissent_section,
     should_override_holdout,
+)
+from mechanisms.cascade_guard import CascadeGuard
+from mechanisms.cascade_guard import GuardConfig as CascadeGuardConfig
+from mechanisms.judge_ensemble import JudgeConfig, JudgeEnsemble, JudgeVote
+from mechanisms.selector_synth import (
+    PairwiseVerdict,
+    SelectorConfig as MechanismSelectorConfig,
+    SelectorSynth,
+    Span,
 )
 from metrics import MetricsCollector
 
@@ -45,27 +55,158 @@ if not OUTPUT_DIR.is_absolute():
 MAX_CONTEXT_TOKENS = _config.memory.max_context_tokens
 MAX_CONTEXT_CHARS = MAX_CONTEXT_TOKENS * 4
 
+JUDGE_VOTE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "rubric_scores": {"type": "object"},
+        "aggregate_score": {"type": "number", "minimum": 0, "maximum": 10},
+        "rationale": {"type": "string"},
+    },
+    "required": ["aggregate_score", "rationale"],
+}
+
+PAIRWISE_VERDICT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "winner": {"type": "string", "enum": ["a", "b", "tie"]},
+        "rationale": {"type": "string"},
+    },
+    "required": ["winner", "rationale"],
+}
+
+# ---------------------------------------------------------------------------
+# Backend/runtime helpers
+# ---------------------------------------------------------------------------
+
+
+FeatureOverride = Literal[True, False, None]
+
+
+def _backend_settings(
+    *,
+    cfg=None,
+    backend_id: str | None = None,
+    sandbox: str | None = None,
+):
+    """Resolve backend/provider settings without mutating loaded config."""
+    cfg = cfg or load_config()
+    selected = backend_id or cfg.backend.default or "codex"
+    provider = getattr(cfg.backend, selected, None)
+    if provider is None:
+        raise ValueError(f"Unknown backend '{selected}'")
+    resolved_sandbox = sandbox or provider.sandbox or "read-only"
+    return cfg, selected, provider, resolved_sandbox
+
+
+def _model_for_agent(agent: BlitzAgent, backend_id: str, provider, cfg) -> str:
+    """Map legacy role models to backend-native models."""
+    if backend_id == "claude":
+        return agent.model or provider.model or cfg.swarm.default_model
+    return provider.model or cfg.swarm.default_model or agent.model
+
+
+def _make_runtime_backend(
+    *,
+    cfg=None,
+    backend_id: str | None = None,
+    sandbox: str | None = None,
+) -> AgentBackend:
+    cfg, selected, provider, resolved_sandbox = _backend_settings(
+        cfg=cfg,
+        backend_id=backend_id,
+        sandbox=sandbox,
+    )
+    return make_backend(
+        selected,
+        model=provider.model or cfg.swarm.default_model,
+        reasoning_effort=provider.reasoning_effort,
+        sandbox=resolved_sandbox,
+        approval_policy=provider.approval_policy,
+        ephemeral=provider.ephemeral,
+    )
+
+
+def _feature_enabled(
+    *,
+    profile: str,
+    configured: bool,
+    override: FeatureOverride,
+    enabled_in_max: bool = True,
+) -> bool:
+    if override is not None:
+        return override
+    profile = (profile or "balanced").lower()
+    if profile == "max" and enabled_in_max:
+        return True
+    if profile == "cheap":
+        return False
+    return bool(configured)
+
+
+def _apply_guard(
+    guard: CascadeGuard | None,
+    outputs: list[dict],
+    round_n: int,
+) -> list[dict]:
+    if guard is None:
+        for output in outputs:
+            output.setdefault("_round", round_n)
+        return outputs
+    guarded = [guard.on_agent_output(output, round_n) for output in outputs]
+    summary = guard.round_summary(round_n)
+    if summary.blocked_outputs or summary.tainted_descendants:
+        print(
+            f"  Cascade guard: blocked={summary.blocked_outputs} "
+            f"tainted_descendants={summary.tainted_descendants}"
+        )
+    return guarded
+
+
+def _filter_guarded(guard: CascadeGuard | None, outputs: list[dict]) -> list[dict]:
+    return guard.filter_context(outputs) if guard is not None else list(outputs)
+
+
 # ---------------------------------------------------------------------------
 # Agent invocation
 # ---------------------------------------------------------------------------
 
 
-def invoke_agent(agent: BlitzAgent, context: str, task: str,
-                  max_retries: int = 1) -> dict:
-    """Invoke a single agent as a subprocess via the Claude CLI.
+def invoke_agent(
+    agent: BlitzAgent,
+    context: str,
+    task: str,
+    max_retries: int = 1,
+    *,
+    backend: AgentBackend | None = None,
+    backend_id: str | None = None,
+    sandbox: str | None = None,
+    cfg=None,
+) -> dict:
+    """Invoke a single agent through the configured backend layer.
 
-    Retries once on parse failure. Extracts cost data from the CLI envelope.
-    Attempts partial output recovery on timeout.
+    Retries once on parse/schema failure and normalizes telemetry across
+    Codex, Claude, and Gemini adapters.
     """
     agent_label = f"{agent.role}({agent.id})"
     trace_id = str(uuid.uuid4())
-    _envelope_cost = {}  # cost data extracted from CLI envelope
+    cfg, selected_backend, provider, resolved_sandbox = _backend_settings(
+        cfg=cfg,
+        backend_id=backend_id,
+        sandbox=sandbox,
+    )
+    active_backend = backend or _make_runtime_backend(
+        cfg=cfg,
+        backend_id=selected_backend,
+        sandbox=resolved_sandbox,
+    )
+    model = _model_for_agent(agent, selected_backend, provider, cfg)
+    _telemetry = {}
 
     def _tag(output: dict) -> dict:
-        """Inject trace metadata and cost data into every output."""
+        """Inject trace metadata and backend telemetry into every output."""
         output["_trace_id"] = trace_id
         output["_wall_clock_s"] = round(time.monotonic() - _invoke_start, 1)
-        output.update(_envelope_cost)
+        output.update(_telemetry)
         return output
 
     _invoke_start = time.monotonic()
@@ -73,82 +214,79 @@ def invoke_agent(agent: BlitzAgent, context: str, task: str,
     for attempt in range(1 + max_retries):
         user_prompt = _build_user_prompt(agent, context, task)
 
-        cmd = [
-            "claude",
-            "-p", user_prompt,
-            "--system-prompt", agent.system_prompt,
-            "--output-format", "json",
-            "--model", agent.model,
-            "--max-turns", "3",
-            "--dangerously-skip-permissions",
-        ]
-
-        start = time.monotonic()
-
         try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=AGENT_TIMEOUT_SECONDS,
-            )
-            elapsed = time.monotonic() - start
+            result = active_backend.call(AgentCall(
+                role=agent.role,
+                prompt=user_prompt,
+                system_prompt=agent.system_prompt,
+                schema=AGENT_OUTPUT_SCHEMA,
+                model=model,
+                timeout_s=AGENT_TIMEOUT_SECONDS,
+                cwd=Path(__file__).parent,
+                sandbox=resolved_sandbox,
+                approval_policy=provider.approval_policy,
+                reasoning_effort=provider.reasoning_effort,
+                ephemeral=provider.ephemeral,
+            ))
+            _telemetry = {
+                "_backend_id": result.backend_id,
+                "_model": result.model or model,
+                "_elapsed_s": round(result.elapsed_s, 1),
+                "_cost_usd": result.cost_usd,
+                "_input_tokens": result.input_tokens,
+                "_output_tokens": result.output_tokens,
+                "_validation_errors": result.validation_errors,
+                "backend_id": result.backend_id,
+                "model": result.model or model,
+                "elapsed_s": round(result.elapsed_s, 1),
+                "errored": result.errored,
+                "raw_stdout": result.raw_stdout[-4000:],
+                "parsed": result.parsed,
+                "cost_usd": result.cost_usd,
+                "input_tokens": result.input_tokens,
+                "output_tokens": result.output_tokens,
+            }
 
-            # Extract cost data from CLI envelope before parsing
-            try:
-                _env = json.loads(result.stdout)
-                if isinstance(_env, dict):
-                    _envelope_cost["_cost_usd"] = _env.get("total_cost_usd", 0)
-                    _usage = _env.get("usage", {})
-                    _envelope_cost["_input_tokens"] = _usage.get("input_tokens", 0)
-                    _envelope_cost["_output_tokens"] = _usage.get("output_tokens", 0)
-            except (json.JSONDecodeError, TypeError):
-                pass
+            if result.errored and result.parsed is None:
+                print(f"  {agent_label} ERROR: {result.error or 'backend failure'}")
+                return _tag(_error_output(agent, result.error or "backend failure"))
 
-            if result.returncode != 0:
-                stderr = (result.stderr or "")[:300]
-                stdout_preview = (result.stdout or "")[:300]
-                print(f"  {agent_label} ERROR: exit {result.returncode}")
-                if stderr:
-                    print(f"    stderr: {stderr}")
-                if stdout_preview:
-                    print(f"    stdout: {stdout_preview}")
-                return _tag(_error_output(agent, f"Exit code {result.returncode}"))
-
-            output = _parse_agent_output(agent, result.stdout)
+            if result.parsed:
+                output = dict(result.parsed)
+                output["agent_id"] = agent.id
+                output["role"] = agent.role
+            else:
+                output = _parse_agent_output(agent, result.text or result.raw_stdout)
 
             # Retry on malformed output (raw text, not structured JSON)
-            if output.get("_raw") and attempt < max_retries:
-                print(f"  {agent_label} malformed output, retrying [{elapsed:.1f}s]")
+            if (output.get("_raw") or result.validation_errors) and attempt < max_retries:
+                print(
+                    f"  {agent_label} malformed output, retrying "
+                    f"[{result.elapsed_s:.1f}s]"
+                )
                 task = (
                     f"{task}\n\n"
-                    f"IMPORTANT: Your previous response was not valid JSON. "
-                    f"Respond with ONLY a JSON object, no other text."
+                    "IMPORTANT: Your previous response did not satisfy the "
+                    "required JSON schema. Respond with ONLY a JSON object, "
+                    "no other text."
                 )
                 continue
 
+            if result.validation_errors:
+                output["_raw"] = True
+                output["gaps_identified"] = output.get("gaps_identified", []) + [
+                    "Backend result failed schema validation"
+                ]
+                output["quality_vote"] = output.get("quality_vote") or "needs_work"
+                output["quality_notes"] = (
+                    output.get("quality_notes", "")
+                    or "; ".join(result.validation_errors[:3])
+                )
+
             if not output.get("_error"):
                 retry_note = f" (retry {attempt})" if attempt > 0 else ""
-                print(f"  {agent_label} done [{elapsed:.1f}s]{retry_note}")
+                print(f"  {agent_label} done [{result.elapsed_s:.1f}s]{retry_note}")
             return _tag(output)
-
-        except subprocess.TimeoutExpired as e:
-            elapsed = time.monotonic() - start
-            # Try to recover partial output from the timed-out process
-            partial_stdout = ""
-            if e.stdout:
-                partial_stdout = (
-                    e.stdout if isinstance(e.stdout, str)
-                    else e.stdout.decode("utf-8", errors="replace")
-                )
-            if partial_stdout.strip():
-                output = _parse_agent_output(agent, partial_stdout)
-                if not output.get("_raw") and not output.get("_error"):
-                    output["_partial"] = True
-                    print(f"  {agent_label} TIMEOUT [{elapsed:.1f}s] (recovered partial output)")
-                    return _tag(output)
-            print(f"  {agent_label} TIMEOUT [{elapsed:.1f}s]")
-            return _tag(_error_output(agent, f"Timed out after {AGENT_TIMEOUT_SECONDS}s"))
 
         except Exception as e:
             print(f"  {agent_label} EXCEPTION: {e}")
@@ -300,6 +438,7 @@ def _error_output(agent: BlitzAgent, error_msg: str) -> dict:
         "quality_notes": f"Agent error: {error_msg}",
         "dissent": "",
         "_error": True,
+        "_error_msg": error_msg,
     }
 
 
@@ -308,10 +447,28 @@ def _error_output(agent: BlitzAgent, error_msg: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
-async def blast_agents(agents: list[BlitzAgent], context: str, task: str) -> list[dict]:
+async def blast_agents(
+    agents: list[BlitzAgent],
+    context: str,
+    task: str,
+    *,
+    backend: AgentBackend | None = None,
+    backend_id: str | None = None,
+    sandbox: str | None = None,
+    cfg=None,
+) -> list[dict]:
     """Invoke all agents in parallel and collect their outputs."""
     coros = [
-        asyncio.to_thread(invoke_agent, agent, context, task)
+        asyncio.to_thread(
+            invoke_agent,
+            agent,
+            context,
+            task,
+            backend=backend,
+            backend_id=backend_id,
+            sandbox=sandbox,
+            cfg=cfg,
+        )
         for agent in agents
     ]
     return list(await asyncio.gather(*coros))
@@ -548,6 +705,332 @@ def _persist_to_memory(
 
 
 # ---------------------------------------------------------------------------
+# Max-quality mechanisms
+# ---------------------------------------------------------------------------
+
+
+def _make_judge_fn(
+    *,
+    backend: AgentBackend,
+    cfg,
+    backend_id: str,
+    provider,
+    sandbox: str,
+):
+    """Build JudgeEnsemble's pluggable LLM hook on top of AgentBackend."""
+
+    def _judge(
+        candidate: str,
+        history: str,
+        judge_id: str,
+        model_alias: str,
+        seed: int,
+        rubric_dims: tuple[str, ...],
+    ) -> JudgeVote:
+        model = provider.model if backend_id != "claude" else model_alias
+        prompt = (
+            f"You are {judge_id}, an independent quality judge.\n\n"
+            f"Evaluate this candidate research output for the task.\n"
+            f"Rubric dimensions: {', '.join(rubric_dims)}.\n"
+            f"Score each dimension and provide an aggregate_score from 0 to 10.\n\n"
+            f"Prior debate history:\n{history or '[none]'}\n\n"
+            f"Candidate:\n{candidate}\n\n"
+            "Return JSON with aggregate_score, rationale, and optional "
+            "rubric_scores object."
+        )
+        result = backend.call(AgentCall(
+            role="judge_ensemble",
+            prompt=prompt,
+            system_prompt="Return JSON only. Be strict, independent, and concise.",
+            schema=JUDGE_VOTE_SCHEMA,
+            model=model or cfg.swarm.default_model,
+            timeout_s=min(AGENT_TIMEOUT_SECONDS, 90),
+            cwd=Path(__file__).parent,
+            sandbox=sandbox,
+            approval_policy=provider.approval_policy,
+            reasoning_effort=provider.reasoning_effort,
+            ephemeral=provider.ephemeral,
+        ))
+        parsed = result.parsed or parse_json_loose(result.text) or {}
+        if result.errored and not parsed:
+            return JudgeVote(
+                judge_id=judge_id,
+                round_n=0,
+                rubric_scores={dim: 0.0 for dim in rubric_dims},
+                aggregate_score=0.0,
+                score_bucket=0,
+                rationale=result.error or "judge backend error",
+                model=model or "",
+                seed=seed,
+                errored=True,
+            )
+
+        raw_rubric = parsed.get("rubric_scores", {})
+        rubric: dict[str, float] = {}
+        for dim in rubric_dims:
+            value = 0.0
+            if isinstance(raw_rubric, dict) and raw_rubric.get(dim) is not None:
+                value = raw_rubric.get(dim, 0.0)
+            elif parsed.get(f"{dim}_score") is not None:
+                value = parsed.get(f"{dim}_score", 0.0)
+            elif parsed.get("aggregate_score") is not None:
+                value = parsed.get("aggregate_score", 0.0)
+            try:
+                rubric[dim] = max(0.0, min(10.0, float(value)))
+            except (TypeError, ValueError):
+                rubric[dim] = 0.0
+
+        aggregate = parsed.get("aggregate_score")
+        try:
+            aggregate_score = max(0.0, min(10.0, float(aggregate)))
+        except (TypeError, ValueError):
+            aggregate_score = sum(rubric.values()) / max(len(rubric), 1)
+
+        return JudgeVote(
+            judge_id=judge_id,
+            round_n=0,
+            rubric_scores=rubric,
+            aggregate_score=aggregate_score,
+            score_bucket=int(round(aggregate_score)),
+            rationale=str(parsed.get("rationale", "")),
+            model=model or "",
+            seed=seed,
+            errored=bool(result.validation_errors),
+        )
+
+    return _judge
+
+
+def _run_judge_ensemble(
+    *,
+    topic: str,
+    candidate_outputs: list[dict],
+    history_outputs: list[dict],
+    backend: AgentBackend,
+    cfg,
+    backend_id: str,
+    provider,
+    sandbox: str,
+) -> dict:
+    candidate = build_context(candidate_outputs, for_role="quality_judge")
+    history = build_context(history_outputs, for_role="quality_judge")
+    model = provider.model or cfg.swarm.default_model
+    judge_cfg = JudgeConfig(
+        n_judges=cfg.judge_ensemble.n_judges,
+        ks_threshold=cfg.judge_ensemble.ks_threshold,
+        ks_consecutive=cfg.judge_ensemble.ks_consecutive,
+        min_rounds=cfg.judge_ensemble.min_rounds,
+        judge_models=tuple(model for _ in range(cfg.judge_ensemble.n_judges)),
+    )
+    ensemble = JudgeEnsemble(
+        judge_cfg,
+        judge_fn=_make_judge_fn(
+            backend=backend,
+            cfg=cfg,
+            backend_id=backend_id,
+            provider=provider,
+            sandbox=sandbox,
+        ),
+    )
+
+    state = None
+    while not ensemble.is_stable():
+        state = ensemble.round(candidate, history)
+        if state.halted:
+            break
+
+    score = ensemble.final_score()
+    if score is None and state is not None:
+        score = state.mean_score
+    score = score or 0.0
+    breakdown = ensemble.aggregate_breakdown()
+    halt_reason = state.halt_reason if state is not None else "not_started"
+    notes = f"Judge ensemble score {score:.1f}/10; halt_reason={halt_reason}"
+    return {
+        "agent_id": "judge_ensemble",
+        "role": "quality_judge",
+        "findings": (
+            f"## Judge Ensemble Assessment\n\n{notes}\n\n"
+            f"Topic: {topic}"
+        ),
+        "key_points": [
+            notes,
+            f"majority_bucket={ensemble.majority_vote()}",
+        ],
+        "confidence": max(0.0, min(1.0, score / 10.0)),
+        "gaps_identified": [] if score >= 7.0 else ["Quality score below readiness threshold"],
+        "quality_vote": "ready" if score >= 7.0 else "needs_work",
+        "quality_notes": notes,
+        "dissent": "" if score >= 7.0 else "Judge ensemble requested another iteration.",
+        "coverage_score": breakdown.get("coverage", 0.0),
+        "accuracy_score": breakdown.get("accuracy", 0.0),
+        "clarity_score": breakdown.get("clarity", 0.0),
+        "depth_score": breakdown.get("depth", 0.0),
+        "_judge_ensemble": True,
+        "_judge_state_log": [
+            {
+                "round_n": s.round_n,
+                "mean_score": s.mean_score,
+                "ks_stat": s.ks_stat,
+                "halted": s.halted,
+                "halt_reason": s.halt_reason,
+            }
+            for s in ensemble.state_log
+        ],
+    }
+
+
+def _make_pairwise_judge_fn(
+    *,
+    backend: AgentBackend,
+    cfg,
+    backend_id: str,
+    provider,
+    sandbox: str,
+):
+    """Build SelectorSynth's pairwise judge hook on top of AgentBackend."""
+
+    def _pairwise(span_a: Span, span_b: Span, topic: str, judge_id: str, seed: int) -> PairwiseVerdict:
+        model = provider.model if backend_id != "claude" else cfg.swarm.default_model
+        prompt = (
+            f"You are {judge_id}, judging two candidate research spans for: {topic}\n\n"
+            "Choose the span that is more accurate, specific, complete, and clear. "
+            "Return winner='a', winner='b', or winner='tie'.\n\n"
+            f"Span A:\n{span_a.text}\n\n"
+            f"Span B:\n{span_b.text}\n"
+        )
+        result = backend.call(AgentCall(
+            role="selector",
+            prompt=prompt,
+            system_prompt="Return JSON only with winner and rationale.",
+            schema=PAIRWISE_VERDICT_SCHEMA,
+            model=model or provider.model or cfg.swarm.default_model,
+            timeout_s=min(AGENT_TIMEOUT_SECONDS, 90),
+            cwd=Path(__file__).parent,
+            sandbox=sandbox,
+            approval_policy=provider.approval_policy,
+            reasoning_effort=provider.reasoning_effort,
+            ephemeral=provider.ephemeral,
+        ))
+        parsed = result.parsed or parse_json_loose(result.text) or {}
+        winner = parsed.get("winner", "tie")
+        if winner not in ("a", "b", "tie"):
+            winner = "tie"
+        return PairwiseVerdict(
+            judge_id=judge_id,
+            span_a_id=span_a.id,
+            span_b_id=span_b.id,
+            winner=winner,
+            rationale=str(parsed.get("rationale", result.error or "")),
+        )
+
+    return _pairwise
+
+
+def _run_selector_synthesis(
+    *,
+    topic: str,
+    researcher_outputs: list[dict],
+    guard: CascadeGuard | None,
+    backend: AgentBackend,
+    cfg,
+    backend_id: str,
+    provider,
+    sandbox: str,
+) -> dict:
+    selector_cfg = MechanismSelectorConfig(
+        granularity=cfg.selector.granularity,
+        n_judges=cfg.selector.n_judges,
+        judge_models=tuple(
+            (provider.model or cfg.swarm.default_model)
+            for _ in range(cfg.selector.n_judges)
+        ),
+    )
+    selector = SelectorSynth(
+        selector_cfg,
+        pairwise_judge_fn=_make_pairwise_judge_fn(
+            backend=backend,
+            cfg=cfg,
+            backend_id=backend_id,
+            provider=provider,
+            sandbox=sandbox,
+        ),
+    )
+    result = selector.synthesize(
+        researcher_outputs,
+        topic=topic,
+        guard_filter=(lambda outs: _filter_guarded(guard, outs)) if guard else None,
+    )
+    ready = not result.final_text.startswith("[no ")
+    return {
+        "agent_id": "selector_synth",
+        "role": "synthesizer",
+        "findings": result.final_text,
+        "key_points": [
+            f"selected_spans={len(result.selected_span_ids)}",
+            f"judge_calls={result.diagnostics.get('judge_calls', 0)}",
+        ],
+        "confidence": 0.85 if ready else 0.0,
+        "gaps_identified": [] if ready else ["Selector synthesis had no usable inputs"],
+        "quality_vote": "ready" if ready else "needs_work",
+        "quality_notes": "Selection-bottleneck synthesis completed." if ready else result.final_text,
+        "dissent": "",
+        "_selector_synth": True,
+        "_selector_diagnostics": result.diagnostics,
+    }
+
+
+def _contribution_scores(outputs: list[dict]) -> dict[str, float]:
+    scores: dict[str, float] = {}
+    counts: dict[str, int] = {}
+    for output in outputs:
+        aid = output.get("agent_id")
+        if not aid:
+            continue
+        score = 0.0
+        if not output.get("_error") and not output.get("_raw") and not output.get("_blocked"):
+            score += 0.4
+        score += max(0.0, min(0.3, float(output.get("confidence", 0.0) or 0.0) * 0.3))
+        score += min(0.2, len(output.get("findings", "") or "") / 4000)
+        score += min(0.1, len(output.get("key_points", []) or []) / 50)
+        scores[aid] = scores.get(aid, 0.0) + score
+        counts[aid] = counts.get(aid, 0) + 1
+    return {aid: scores[aid] / max(counts.get(aid, 1), 1) for aid in scores}
+
+
+def _prune_low_contribution_agents(
+    agents: list[BlitzAgent],
+    outputs: list[dict],
+    *,
+    selector_enabled: bool,
+) -> list[BlitzAgent]:
+    """AgentDropout-style conservative pruning with role floors."""
+    if not outputs or len(agents) <= 3:
+        return agents
+    scores = _contribution_scores(outputs)
+    floors = {
+        "researcher": 2 if selector_enabled else 1,
+        "critic": 1,
+        "fact_checker": 1,
+        "quality_judge": 1,
+    }
+    by_role: dict[str, list[BlitzAgent]] = {}
+    for agent in agents:
+        by_role.setdefault(agent.role, []).append(agent)
+
+    removable = [
+        agent for agent in agents
+        if len(by_role.get(agent.role, [])) > floors.get(agent.role, 0)
+        and scores.get(agent.id, 1.0) < 0.2
+    ]
+    if not removable:
+        return agents
+    remove = min(removable, key=lambda a: scores.get(a.id, 0.0))
+    print(f"  AgentDropout: pruning {remove.id} (score={scores.get(remove.id, 0.0):.2f})")
+    return [agent for agent in agents if agent.id != remove.id]
+
+
+# ---------------------------------------------------------------------------
 # Main swarm loop — full iterative consensus
 # ---------------------------------------------------------------------------
 
@@ -556,6 +1039,14 @@ async def run_swarm(
     topic: str,
     max_rounds: int = DEFAULT_MAX_ROUNDS,
     use_redis: bool = True,
+    *,
+    backend_id: str | None = None,
+    quality_profile: str | None = None,
+    sandbox: str | None = None,
+    use_selector: FeatureOverride = None,
+    use_judge_ensemble: FeatureOverride = None,
+    use_cascade_guard: FeatureOverride = None,
+    use_llm_plan: bool = True,
 ) -> Path:
     """Run the Blitz-Swarm pipeline on a topic.
 
@@ -567,19 +1058,71 @@ async def run_swarm(
     after consensus or max rounds.
     """
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    runtime_cfg = load_config()
+    profile = quality_profile or runtime_cfg.swarm.quality_profile
+    _, selected_backend, provider, resolved_sandbox = _backend_settings(
+        cfg=runtime_cfg,
+        backend_id=backend_id,
+        sandbox=sandbox,
+    )
+    backend = _make_runtime_backend(
+        cfg=runtime_cfg,
+        backend_id=selected_backend,
+        sandbox=resolved_sandbox,
+    )
+    guard_enabled = _feature_enabled(
+        profile=profile,
+        configured=runtime_cfg.guard.enabled,
+        override=use_cascade_guard,
+    )
+    judge_ensemble_enabled = _feature_enabled(
+        profile=profile,
+        configured=runtime_cfg.judge_ensemble.enabled,
+        override=use_judge_ensemble,
+    )
+    selector_enabled = _feature_enabled(
+        profile=profile,
+        configured=runtime_cfg.selector.enabled,
+        override=use_selector,
+    )
+    guard = (
+        CascadeGuard(CascadeGuardConfig(mode=runtime_cfg.guard.mode))
+        if guard_enabled else None
+    )
 
     print(f"\n{'='*60}")
     print(f"BLITZ-SWARM — {topic}")
     print(f"{'='*60}\n")
+    print(
+        f"Backend: {selected_backend} | model={provider.model or runtime_cfg.swarm.default_model} "
+        f"| profile={profile} | sandbox={resolved_sandbox}"
+    )
+    print(
+        "Mechanisms: "
+        f"cascade_guard={'on' if guard_enabled else 'off'}, "
+        f"judge_ensemble={'on' if judge_ensemble_enabled else 'off'}, "
+        f"selector={'on' if selector_enabled else 'off'}"
+    )
+    print()
 
     # --- METRICS: Initialize ---
     mc = MetricsCollector()
     mc.start_run(run_id, topic)
 
     # --- SPAWN ---
-    agents = plan_agents(topic)
+    agents = plan_agents(
+        topic,
+        use_llm=use_llm_plan,
+        domain=runtime_cfg.swarm.domain,
+        persona_critics=runtime_cfg.swarm.persona_critics,
+        backend_id=selected_backend,
+        sandbox=resolved_sandbox,
+    )
     researchers = [a for a in agents if a.role == "researcher"]
-    evaluators = [a for a in agents if a.role in ("critic", "fact_checker", "quality_judge")]
+    if judge_ensemble_enabled:
+        evaluators = [a for a in agents if a.role in ("critic", "fact_checker")]
+    else:
+        evaluators = [a for a in agents if a.role in ("critic", "fact_checker", "quality_judge")]
     synthesizer_agents = [a for a in agents if a.role == "synthesizer"]
     blast_agents_list = researchers + evaluators  # everyone except synthesizer
 
@@ -639,12 +1182,21 @@ async def run_swarm(
             initial_context = memory_context if memory_context else ""
             print(f"  Phase A: {len(researchers)} researchers...")
             start = time.monotonic()
-            r_outputs = await blast_agents(researchers, initial_context, task_prompt)
+            r_outputs = await blast_agents(
+                researchers,
+                initial_context,
+                task_prompt,
+                backend=backend,
+                backend_id=selected_backend,
+                sandbox=resolved_sandbox,
+                cfg=runtime_cfg,
+            )
+            r_outputs = _apply_guard(guard, r_outputs, round_n)
             elapsed = time.monotonic() - start
             print(f"  Researchers done [{elapsed:.1f}s]")
 
             # Now blast evaluators with researcher context
-            r_context = build_context(r_outputs, for_role="critic")
+            r_context = build_context(_filter_guarded(guard, r_outputs), for_role="critic")
             eval_task = (
                 f"Evaluate the research findings on: {topic}\n\n"
                 "Review the researcher outputs. Identify gaps, contradictions, "
@@ -652,9 +1204,32 @@ async def run_swarm(
             )
             print(f"  Phase B: {len(evaluators)} evaluators...")
             start = time.monotonic()
-            e_outputs = await blast_agents(evaluators, r_context, eval_task)
+            e_outputs = await blast_agents(
+                evaluators,
+                r_context,
+                eval_task,
+                backend=backend,
+                backend_id=selected_backend,
+                sandbox=resolved_sandbox,
+                cfg=runtime_cfg,
+            )
+            e_outputs = _apply_guard(guard, e_outputs, round_n)
             elapsed = time.monotonic() - start
             print(f"  Evaluators done [{elapsed:.1f}s]")
+
+            if judge_ensemble_enabled:
+                print("  Phase C: judge ensemble...")
+                judge_output = _run_judge_ensemble(
+                    topic=topic,
+                    candidate_outputs=_filter_guarded(guard, r_outputs + e_outputs),
+                    history_outputs=_filter_guarded(guard, accumulated_outputs),
+                    backend=backend,
+                    cfg=runtime_cfg,
+                    backend_id=selected_backend,
+                    provider=provider,
+                    sandbox=resolved_sandbox,
+                )
+                e_outputs.extend(_apply_guard(guard, [judge_output], round_n))
 
             round_outputs = r_outputs + e_outputs
         else:
@@ -664,7 +1239,10 @@ async def run_swarm(
             coros = []
 
             for agent in blast_agents_list:
-                ctx = build_context(accumulated_outputs, for_role=agent.role)
+                ctx = build_context(
+                    _filter_guarded(guard, accumulated_outputs),
+                    for_role=agent.role,
+                )
                 if agent.role == "researcher":
                     task = (
                         f"Continue researching: {topic}\n\n"
@@ -677,10 +1255,32 @@ async def run_swarm(
                         "Review updated findings. Have prior issues been addressed? "
                         "Vote 'ready' if quality is sufficient, 'needs_work' if not."
                     )
-                coros.append(asyncio.to_thread(invoke_agent, agent, ctx, task))
+                coros.append(asyncio.to_thread(
+                    invoke_agent,
+                    agent,
+                    ctx,
+                    task,
+                    backend=backend,
+                    backend_id=selected_backend,
+                    sandbox=resolved_sandbox,
+                    cfg=runtime_cfg,
+                ))
 
             start = time.monotonic()
             round_outputs = list(await asyncio.gather(*coros))
+            round_outputs = _apply_guard(guard, round_outputs, round_n)
+            if judge_ensemble_enabled:
+                judge_output = _run_judge_ensemble(
+                    topic=topic,
+                    candidate_outputs=_filter_guarded(guard, round_outputs),
+                    history_outputs=_filter_guarded(guard, accumulated_outputs),
+                    backend=backend,
+                    cfg=runtime_cfg,
+                    backend_id=selected_backend,
+                    provider=provider,
+                    sandbox=resolved_sandbox,
+                )
+                round_outputs.extend(_apply_guard(guard, [judge_output], round_n))
             elapsed = time.monotonic() - start
             print(f"  All agents done [{elapsed:.1f}s]")
 
@@ -693,7 +1293,8 @@ async def run_swarm(
         mc.end_round(round_label, round_outputs)
 
         # --- CHECK ---
-        eval_votes = [o for o in round_outputs
+        guarded_round_outputs = _filter_guarded(guard, round_outputs)
+        eval_votes = [o for o in guarded_round_outputs
                       if o.get("role") in ("critic", "fact_checker", "quality_judge")]
         consensus_reached = check_consensus(eval_votes)
 
@@ -740,10 +1341,23 @@ async def run_swarm(
         else:
             print(f"  Max rounds ({max_rounds}) reached. Force-finalizing.\n")
 
+        if round_n < max_rounds and not consensus_reached:
+            blast_agents_list = _prune_low_contribution_agents(
+                blast_agents_list,
+                _filter_guarded(guard, accumulated_outputs),
+                selector_enabled=selector_enabled,
+            )
+            researchers = [a for a in blast_agents_list if a.role == "researcher"]
+            evaluators = [
+                a for a in blast_agents_list
+                if a.role in ("critic", "fact_checker", "quality_judge")
+            ]
+
     # --- FINALIZE: Synthesizer ---
     mc.start_round("synthesis")
 
-    synth_context = build_context(accumulated_outputs, for_role="synthesizer")
+    guarded_accumulated = _filter_guarded(guard, accumulated_outputs)
+    synth_context = build_context(guarded_accumulated, for_role="synthesizer")
     synth_task = (
         f"Synthesize all findings on: {topic}\n\n"
         "Integrate all researcher findings, critic feedback, and fact-checker "
@@ -759,7 +1373,32 @@ async def run_swarm(
 
     print(f"--- Final: Synthesizer ---")
     start = time.monotonic()
-    synth_outputs = await blast_agents(synthesizer_agents, synth_context, synth_task)
+    if selector_enabled:
+        researcher_outputs = [
+            o for o in guarded_accumulated if o.get("role") == "researcher"
+        ]
+        synth_output = _run_selector_synthesis(
+            topic=topic,
+            researcher_outputs=researcher_outputs,
+            guard=guard,
+            backend=backend,
+            cfg=runtime_cfg,
+            backend_id=selected_backend,
+            provider=provider,
+            sandbox=resolved_sandbox,
+        )
+        synth_outputs = _apply_guard(guard, [synth_output], final_round_n + 1)
+    else:
+        synth_outputs = await blast_agents(
+            synthesizer_agents,
+            synth_context,
+            synth_task,
+            backend=backend,
+            backend_id=selected_backend,
+            sandbox=resolved_sandbox,
+            cfg=runtime_cfg,
+        )
+        synth_outputs = _apply_guard(guard, synth_outputs, final_round_n + 1)
     elapsed = time.monotonic() - start
     print(f"  Synthesis complete [{elapsed:.1f}s]\n")
     all_round_outputs.append(synth_outputs)
@@ -814,15 +1453,40 @@ async def run_swarm(
 # ---------------------------------------------------------------------------
 
 
-def _dry_run(topic: str, use_llm: bool):
+def _dry_run(
+    topic: str,
+    use_llm: bool,
+    *,
+    backend_id: str | None = None,
+    quality_profile: str | None = None,
+    sandbox: str | None = None,
+):
     """Show the agent plan without executing."""
     from agents import plan_agents
+
+    cfg, selected_backend, provider, resolved_sandbox = _backend_settings(
+        backend_id=backend_id,
+        sandbox=sandbox,
+    )
+    profile = quality_profile or cfg.swarm.quality_profile
 
     print(f"\n{'='*60}")
     print(f"BLITZ-SWARM DRY RUN — {topic}")
     print(f"{'='*60}\n")
+    print(
+        f"Backend: {selected_backend} | model={provider.model or cfg.swarm.default_model} "
+        f"| profile={profile} | sandbox={resolved_sandbox}"
+    )
+    print()
 
-    agents = plan_agents(topic, use_llm=use_llm)
+    agents = plan_agents(
+        topic,
+        use_llm=use_llm,
+        domain=cfg.swarm.domain,
+        persona_critics=cfg.swarm.persona_critics,
+        backend_id=selected_backend,
+        sandbox=resolved_sandbox,
+    )
     researchers = [a for a in agents if a.role == "researcher"]
     evaluators = [a for a in agents if a.role in ("critic", "fact_checker", "quality_judge")]
     synthesizer = [a for a in agents if a.role == "synthesizer"]
@@ -870,6 +1534,30 @@ def main():
         help="Use heuristic agent planning instead of LLM — consensus mode only",
     )
     parser.add_argument(
+        "--backend", choices=["codex", "claude", "gemini"], default=None,
+        help="Local invocation backend (default: blitz.toml [backend].default)",
+    )
+    parser.add_argument(
+        "--quality-profile", choices=["max", "balanced", "cheap"], default=None,
+        help="Mechanism profile controlling quality/cost tradeoffs",
+    )
+    parser.add_argument(
+        "--sandbox", choices=["read-only", "workspace-write"], default=None,
+        help="Sandbox passed to local backend invocations",
+    )
+    parser.add_argument(
+        "--no-selector", action="store_true",
+        help="Disable selector synthesis even when max-quality enables it",
+    )
+    parser.add_argument(
+        "--no-judge-ensemble", action="store_true",
+        help="Disable judge ensemble even when max-quality enables it",
+    )
+    parser.add_argument(
+        "--no-cascade-guard", action="store_true",
+        help="Disable cascade guard context filtering",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true",
         help="Show the agent plan without executing",
     )
@@ -894,7 +1582,13 @@ def main():
         return
 
     if args.dry_run:
-        _dry_run(args.topic, use_llm=not args.no_llm_plan)
+        _dry_run(
+            args.topic,
+            use_llm=not args.no_llm_plan,
+            backend_id=args.backend,
+            quality_profile=args.quality_profile,
+            sandbox=args.sandbox,
+        )
         return
 
     filepath = asyncio.run(
@@ -902,6 +1596,13 @@ def main():
             args.topic,
             max_rounds=args.max_rounds,
             use_redis=not args.no_redis,
+            backend_id=args.backend,
+            quality_profile=args.quality_profile,
+            sandbox=args.sandbox,
+            use_selector=False if args.no_selector else None,
+            use_judge_ensemble=False if args.no_judge_ensemble else None,
+            use_cascade_guard=False if args.no_cascade_guard else None,
+            use_llm_plan=not args.no_llm_plan,
         )
     )
     print(f"Done. Output at: {filepath}")
@@ -909,7 +1610,14 @@ def main():
 
 def _run_mythos_mode(args) -> None:
     """Dispatch to the mythos package."""
+    import os
+
     from mythos import load_mythos_config, run_mythos
+
+    if args.backend:
+        os.environ["BLITZ_BACKEND"] = args.backend
+    if args.sandbox:
+        os.environ["BLITZ_SANDBOX"] = args.sandbox
 
     cfg = load_mythos_config()
     if args.max_replans is not None:
@@ -931,6 +1639,8 @@ def _run_mythos_mode(args) -> None:
         print(f"  max_executors     = {cfg.max_executors}")
         print(f"  cost_ceiling_usd  = {cfg.cost_ceiling_usd}")
         print(f"  output_dir        = {cfg.output_dir}")
+        print(f"  backend           = {os.environ.get('BLITZ_BACKEND') or load_config().backend.default}")
+        print(f"  sandbox           = {os.environ.get('BLITZ_SANDBOX') or load_config().backend.codex.sandbox}")
         print(f"\nNo CLI calls will be made. Use without --dry-run to execute.")
         return
 

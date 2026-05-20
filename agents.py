@@ -21,7 +21,7 @@ from prompts.loader import (
 )
 
 # ---------------------------------------------------------------------------
-# Agent output schema — passed to claude --json-schema for structured output
+# Agent output schema — passed to local backends for structured output
 # ---------------------------------------------------------------------------
 
 AGENT_OUTPUT_SCHEMA = {
@@ -237,15 +237,19 @@ def _split_subtopics_heuristic(topic: str, count: int) -> list[str]:
     return subtopics
 
 
-def _split_subtopics_llm(topic: str, count: int) -> list[str]:
+def _split_subtopics_llm(
+    topic: str,
+    count: int,
+    *,
+    backend_id: str | None = None,
+    sandbox: str | None = None,
+) -> list[str]:
     """Split a topic into subtopics using an LLM call.
 
-    Invokes claude -p to analyze the topic and generate targeted subtopics.
+    Invokes the configured local backend to generate targeted subtopics.
     Falls back to heuristic if the LLM call fails.
     """
-    import subprocess
-
-    schema = json.dumps({
+    schema = {
         "type": "object",
         "properties": {
             "subtopics": {
@@ -255,7 +259,7 @@ def _split_subtopics_llm(topic: str, count: int) -> list[str]:
             },
         },
         "required": ["subtopics"],
-    })
+    }
 
     prompt = (
         f"Analyze this research topic and split it into exactly {count} specific, "
@@ -265,25 +269,19 @@ def _split_subtopics_llm(topic: str, count: int) -> list[str]:
         f"can deeply investigate. Make them specific to this topic, not generic."
     )
 
-    try:
-        result = subprocess.run(
-            [
-                "claude", "-p", prompt,
-                "--system-prompt", "You are a research planning assistant. Return JSON only.",
-                "--output-format", "json",
-                "--model", "haiku",
-                "--dangerously-skip-permissions",
-            ],
-            capture_output=True, text=True, timeout=30,
-        )
-
-        if result.returncode == 0:
-            data = json.loads(result.stdout.strip())
-            subtopics = data.get("subtopics", [])
-            if len(subtopics) >= count:
-                return [f"{topic} — focusing on {st}" for st in subtopics[:count]]
-    except Exception:
-        pass
+    data = _planning_backend_json(
+        prompt,
+        "You are a research planning assistant. Return JSON only.",
+        schema,
+        model_hint="cheap",
+        timeout_s=30,
+        backend_id=backend_id,
+        sandbox=sandbox,
+    )
+    if data:
+        subtopics = data.get("subtopics", [])
+        if len(subtopics) >= count:
+            return [f"{topic} — focusing on {st}" for st in subtopics[:count]]
 
     return _split_subtopics_heuristic(topic, count)
 
@@ -350,6 +348,8 @@ def plan_agents(
     *,
     domain: str | None = None,
     persona_critics: bool | None = None,
+    backend_id: str | None = None,
+    sandbox: str | None = None,
 ) -> list[BlitzAgent]:
     """Plan which agents to spawn for a given topic.
 
@@ -379,7 +379,7 @@ def plan_agents(
     plan = None
 
     if use_llm:
-        plan = _llm_plan(topic)
+        plan = _llm_plan(topic, backend_id=backend_id, sandbox=sandbox)
 
     if plan is None:
         plan = {
@@ -496,10 +496,13 @@ def plan_agents(
     return agents
 
 
-def _llm_plan(topic: str) -> dict | None:
+def _llm_plan(
+    topic: str,
+    *,
+    backend_id: str | None = None,
+    sandbox: str | None = None,
+) -> dict | None:
     """Use an LLM to determine optimal swarm composition for a topic."""
-    import subprocess
-
     prompt = (
         f"Analyze this research topic and determine the optimal agent swarm composition.\n\n"
         f"Topic: {topic}\n\n"
@@ -510,27 +513,67 @@ def _llm_plan(topic: str) -> dict | None:
         f"- What specific subtopics should each researcher focus on?"
     )
 
-    try:
-        result = subprocess.run(
-            [
-                "claude", "-p", prompt,
-                "--system-prompt", "You are a research planning assistant. Return JSON only.",
-                "--output-format", "json",
-                "--model", "haiku",
-                "--dangerously-skip-permissions",
-            ],
-            capture_output=True, text=True, timeout=30,
-        )
-
-        if result.returncode == 0:
-            data = json.loads(result.stdout.strip())
-            # Validate required fields
-            if all(k in data for k in ("researcher_count", "critic_count", "needs_fact_checker")):
-                data["researcher_count"] = max(2, min(6, int(data["researcher_count"])))
-                data["critic_count"] = max(1, min(3, int(data["critic_count"])))
-                return data
-
-    except Exception:
-        pass
+    data = _planning_backend_json(
+        prompt,
+        "You are a research planning assistant. Return JSON only.",
+        json.loads(PLANNING_SCHEMA),
+        model_hint="cheap",
+        timeout_s=30,
+        backend_id=backend_id,
+        sandbox=sandbox,
+    )
+    if data and all(k in data for k in ("researcher_count", "critic_count", "needs_fact_checker")):
+        data["researcher_count"] = max(2, min(6, int(data["researcher_count"])))
+        data["critic_count"] = max(1, min(3, int(data["critic_count"])))
+        return data
 
     return None
+
+
+def _planning_backend_json(
+    prompt: str,
+    system_prompt: str,
+    schema: dict,
+    *,
+    model_hint: str = "cheap",
+    timeout_s: int = 30,
+    backend_id: str | None = None,
+    sandbox: str | None = None,
+) -> dict | None:
+    """Run a small planning call through the configured backend."""
+    try:
+        from backends import AgentCall, make_backend
+        from config import load_config
+
+        cfg = load_config()
+        backend_id = backend_id or cfg.backend.default or "codex"
+        provider = getattr(cfg.backend, backend_id, cfg.backend.codex)
+        model = provider.model or cfg.swarm.default_model
+        if model_hint == "cheap" and backend_id == "claude":
+            model = "haiku"
+        resolved_sandbox = sandbox or provider.sandbox
+        backend = make_backend(
+            backend_id,
+            model=model,
+            reasoning_effort=provider.reasoning_effort,
+            sandbox=resolved_sandbox,
+            approval_policy=provider.approval_policy,
+            ephemeral=provider.ephemeral,
+        )
+        result = backend.call(AgentCall(
+            role="planner",
+            prompt=prompt,
+            system_prompt=system_prompt,
+            schema=schema,
+            model=model,
+            timeout_s=timeout_s,
+            sandbox=resolved_sandbox,
+            approval_policy=provider.approval_policy,
+            reasoning_effort=provider.reasoning_effort,
+            ephemeral=provider.ephemeral,
+        ))
+        if result.errored:
+            return None
+        return result.parsed
+    except Exception:
+        return None

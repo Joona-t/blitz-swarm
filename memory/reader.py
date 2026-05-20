@@ -1,4 +1,4 @@
-"""MemoryReader — retrieval pipeline for G-Memory hierarchical memory.
+"""MemoryReader — compatibility reader for G-Memory hierarchical memory.
 
 Implements the four-step retrieval from G-Memory (NeurIPS 2025):
 1. Embedding similarity search (top-k=2)
@@ -6,7 +6,9 @@ Implements the four-step retrieval from G-Memory (NeurIPS 2025):
 3. Upward traversal to insights
 4. Downward traversal to interactions
 
-LLM relevance scoring (R_LLM) and sparsification (S_LLM) added in Phase 4.
+`gmemory/` is the canonical Tier 2/3 implementation. This module keeps
+the legacy orchestrator-facing API and routes any LLM helper calls
+through the configured backend layer.
 """
 
 import json
@@ -14,6 +16,43 @@ import sqlite3
 from pathlib import Path
 
 from embedder import Embedder, get_embedder
+
+
+def _memory_backend_json(prompt: str, system_prompt: str, schema: dict, timeout_s: int) -> dict | None:
+    """Run compact memory LLM calls through the configured backend."""
+    try:
+        from backends import AgentCall, make_backend
+        from config import load_config
+
+        cfg = load_config()
+        backend_id = cfg.backend.default or "codex"
+        provider = getattr(cfg.backend, backend_id, cfg.backend.codex)
+        model = "haiku" if backend_id == "claude" else (provider.model or cfg.swarm.default_model)
+        backend = make_backend(
+            backend_id,
+            model=model,
+            reasoning_effort=provider.reasoning_effort,
+            sandbox=provider.sandbox,
+            approval_policy=provider.approval_policy,
+            ephemeral=provider.ephemeral,
+        )
+        result = backend.call(AgentCall(
+            role="memory_reader",
+            prompt=prompt,
+            system_prompt=system_prompt,
+            schema=schema,
+            model=model,
+            timeout_s=timeout_s,
+            sandbox=provider.sandbox,
+            approval_policy=provider.approval_policy,
+            reasoning_effort=provider.reasoning_effort,
+            ephemeral=provider.ephemeral,
+        ))
+        if result.errored:
+            return None
+        return result.parsed
+    except Exception:
+        return None
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -286,8 +325,6 @@ class MemoryReader:
         Returns 0.0-1.0 relevance score. Only used when memory has >10 queries.
         Falls back to 0.5 on failure.
         """
-        import subprocess
-
         prompt = (
             f"Rate how relevant this historical task is to the new query.\n\n"
             f"New query: {new_query}\n"
@@ -295,23 +332,23 @@ class MemoryReader:
             f"Return a JSON object with a single 'relevance' field (0.0-1.0)."
         )
 
-        try:
-            result = subprocess.run(
-                [
-                    "claude", "-p", prompt,
-                    "--system-prompt", "Return JSON only. Score relevance 0.0-1.0.",
-                    "--output-format", "json",
-                    "--model", "haiku",
-                    "--dangerously-skip-permissions",
-                ],
-                capture_output=True, text=True, timeout=15,
-            )
-            if result.returncode == 0:
-                import json
-                data = json.loads(result.stdout.strip())
-                return float(data.get("relevance", 0.5))
-        except Exception:
-            pass
+        data = _memory_backend_json(
+            prompt,
+            "Return JSON only. Score relevance 0.0-1.0.",
+            {
+                "type": "object",
+                "properties": {
+                    "relevance": {"type": "number", "minimum": 0, "maximum": 1},
+                },
+                "required": ["relevance"],
+            },
+            timeout_s=15,
+        )
+        if data is not None:
+            try:
+                return max(0.0, min(1.0, float(data.get("relevance", 0.5))))
+            except (TypeError, ValueError):
+                pass
 
         return 0.5
 
@@ -324,9 +361,6 @@ class MemoryReader:
         """
         if len(utterances) <= 5:
             return utterances
-
-        import subprocess
-        import json
 
         trace = "\n".join(
             f"[{u['agent_id']}]: {u['content'][:200]}"
@@ -342,23 +376,24 @@ class MemoryReader:
             f"the most relevant utterances (max 5)."
         )
 
-        try:
-            result = subprocess.run(
-                [
-                    "claude", "-p", prompt,
-                    "--system-prompt", "Return JSON only.",
-                    "--output-format", "json",
-                    "--model", "haiku",
-                    "--dangerously-skip-permissions",
-                ],
-                capture_output=True, text=True, timeout=15,
-            )
-            if result.returncode == 0:
-                data = json.loads(result.stdout.strip())
-                indices = data.get("relevant_indices", [])
-                return [utterances[i] for i in indices if 0 <= i < len(utterances)]
-        except Exception:
-            pass
+        data = _memory_backend_json(
+            prompt,
+            "Return JSON only.",
+            {
+                "type": "object",
+                "properties": {
+                    "relevant_indices": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                    },
+                },
+                "required": ["relevant_indices"],
+            },
+            timeout_s=15,
+        )
+        if data is not None:
+            indices = data.get("relevant_indices", [])
+            return [utterances[i] for i in indices if isinstance(i, int) and 0 <= i < len(utterances)]
 
         return utterances[:5]
 
