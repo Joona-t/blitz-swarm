@@ -1,8 +1,12 @@
-"""MemoryWriter — single-writer daemon for all memory mutations.
+"""MemoryWriter — compatibility writer for local G-Memory storage.
 
 All memory writes funnel through this single process, eliminating SQLite
 write contention at any agent count. Consumes from Redis Stream
 `memory:writes` and persists to SQLite (G-Memory tiers) + LanceDB (vectors).
+
+`gmemory/` is the canonical Tier 2/3 implementation. This module keeps
+the legacy orchestrator-facing API and routes any LLM helper calls
+through the configured backend layer.
 """
 
 import asyncio
@@ -14,6 +18,43 @@ from pathlib import Path
 
 from embedder import cosine_similarity, get_embedder
 from memory.models import TaskStatus
+
+
+def _memory_backend_json(prompt: str, system_prompt: str, schema: dict, timeout_s: int) -> dict | None:
+    """Run compact memory LLM calls through the configured backend."""
+    try:
+        from backends import AgentCall, make_backend
+        from config import load_config
+
+        cfg = load_config()
+        backend_id = cfg.backend.default or "codex"
+        provider = getattr(cfg.backend, backend_id, cfg.backend.codex)
+        model = "haiku" if backend_id == "claude" else (provider.model or cfg.swarm.default_model)
+        backend = make_backend(
+            backend_id,
+            model=model,
+            reasoning_effort=provider.reasoning_effort,
+            sandbox=provider.sandbox,
+            approval_policy=provider.approval_policy,
+            ephemeral=provider.ephemeral,
+        )
+        result = backend.call(AgentCall(
+            role="memory_writer",
+            prompt=prompt,
+            system_prompt=system_prompt,
+            schema=schema,
+            model=model,
+            timeout_s=timeout_s,
+            sandbox=provider.sandbox,
+            approval_policy=provider.approval_policy,
+            reasoning_effort=provider.reasoning_effort,
+            ephemeral=provider.ephemeral,
+        ))
+        if result.errored:
+            return None
+        return result.parsed
+    except Exception:
+        return None
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -324,8 +365,6 @@ class MemoryWriter:
         This is the G-Memory J(interaction_graph, status) function.
         Returns a one-sentence generalizable lesson, or empty string on failure.
         """
-        import subprocess
-
         # Build a compact trace
         trace_lines = []
         for u in utterances[:15]:
@@ -344,23 +383,18 @@ class MemoryWriter:
             f"topics. Focus on what worked, what didn't, or a key finding."
         )
 
-        try:
-            result = subprocess.run(
-                [
-                    "claude", "-p", prompt,
-                    "--system-prompt",
-                    "Return JSON with a single 'insight' field containing one sentence.",
-                    "--output-format", "json",
-                    "--model", "haiku",
-                    "--dangerously-skip-permissions",
-                ],
-                capture_output=True, text=True, timeout=20,
-            )
-            if result.returncode == 0:
-                data = json.loads(result.stdout.strip())
-                return data.get("insight", "")
-        except Exception:
-            pass
+        data = _memory_backend_json(
+            prompt,
+            "Return JSON with a single 'insight' field containing one sentence.",
+            {
+                "type": "object",
+                "properties": {"insight": {"type": "string"}},
+                "required": ["insight"],
+            },
+            timeout_s=20,
+        )
+        if data is not None:
+            return data.get("insight", "")
 
         return ""
 
