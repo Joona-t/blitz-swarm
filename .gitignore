@@ -5,6 +5,7 @@ __pycache__/
 output/
 *.db
 memory_vectors/
+jobs/state/
 .venv/
 *.egg-info/
 dist/

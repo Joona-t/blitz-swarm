@@ -19,3 +19,6 @@ dev = ["pytest", "pytest-asyncio"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+markers = [
+    "spawns_subprocess: test legitimately spawns a child process (opts out of the no-subprocess dry-run guard)",
+]

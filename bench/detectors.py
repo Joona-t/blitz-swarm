@@ -18,7 +18,7 @@ covered by the regression-suite pytest cases that monkey-patch agents.
 from __future__ import annotations
 
 import re
-from typing import Iterable
+from typing import Iterable, Sequence
 
 
 # ----------------------------------------------------------------------
@@ -39,6 +39,237 @@ def _jaccard(a: str, b: str, *, n: int = 5) -> float:
     inter = a_grams & b_grams
     union = a_grams | b_grams
     return len(inter) / len(union)
+
+
+def _tokens(text: str) -> set[str]:
+    """Lowercased word tokens (alphanumerics) of a string as a set."""
+    return set(re.findall(r"[a-z0-9]+", (text or "").lower()))
+
+
+def _jaccard_tokens(a: str, b: str) -> float:
+    """Jaccard similarity over the bag-of-word-tokens of two strings."""
+    ta, tb = _tokens(a), _tokens(b)
+    if not ta and not tb:
+        return 0.0
+    union = ta | tb
+    if not union:
+        return 0.0
+    return len(ta & tb) / len(union)
+
+
+def _stem(word: str) -> str:
+    """Crude deterministic stemmer: strip a few common English suffixes.
+
+    Not linguistically correct — just enough so that "scaling" matches
+    "scale" and "agents" matches "agent" for coverage checks. Purely
+    mechanical, no data, no dependencies.
+    """
+    w = word.lower()
+    for suf in ("ization", "izations", "isation", "isations", "ies", "ing",
+                "ers", "er", "ed", "es", "s"):
+        if len(w) > len(suf) + 2 and w.endswith(suf):
+            if suf == "ies":
+                return w[: -len(suf)] + "y"
+            return w[: -len(suf)]
+    return w
+
+
+def _shingles(text: str, *, n: int = 3) -> set[tuple[str, ...]]:
+    """Word n-gram shingles of a string as a set of tuples."""
+    toks = re.findall(r"[a-z0-9]+", (text or "").lower())
+    if len(toks) < n:
+        return {tuple(toks)} if toks else set()
+    return {tuple(toks[i : i + n]) for i in range(len(toks) - n + 1)}
+
+
+# ----------------------------------------------------------------------
+# Research-quality detectors (pure-python, deterministic, no LLM)
+# ----------------------------------------------------------------------
+#
+# These are additive instruments used by the bench runner to score the
+# *content* of a produced research artifact, distinct from the MAST
+# failure-mode detectors above (which score process failures). All are
+# deterministic: same input -> same float, no network, no model calls.
+
+# An arXiv identifier looks like YYMM.NNNNN (4-digit year+month, 4-5 digit
+# sequence), optionally with a version suffix (vN). We split "claimed" from
+# "well-formed": a candidate is anything that announces itself as an arXiv id
+# (an `arXiv:` prefix, or a bare DDDD.DDDD+ run). Well-formed additionally
+# requires a plausible month (01-12) and the canonical 4-5 digit sequence.
+_ARXIV_CANDIDATE = re.compile(r"(?:arxiv:\s*)?(\d{4}\.\d{2,7})(?:v\d+)?", re.IGNORECASE)
+_ARXIV_WELLFORMED = re.compile(r"^\d{4}\.\d{4,5}$")
+
+_URL_RE = re.compile(r"https?://[^\s<>()\[\]{}\"']+", re.IGNORECASE)
+
+
+def arxiv_id_validity(text: str) -> float:
+    """Fraction of claimed arXiv IDs in `text` that are well-formed.
+
+    A "claimed" id is any ``arXiv:NNNN.NNN…`` reference or bare
+    ``DDDD.DDDD+`` token. "Well-formed" requires the canonical
+    ``YYMM.NNNNN`` shape (4-5 digit sequence) AND a plausible month
+    (01-12). Returns 1.0 when nothing arXiv-shaped is claimed (vacuously
+    valid — the artifact made no arXiv claims to get wrong).
+    """
+    candidates = _ARXIV_CANDIDATE.findall(text or "")
+    if not candidates:
+        return 1.0
+    good = 0
+    for raw in candidates:
+        stripped = raw.strip().rstrip(".")
+        if not _ARXIV_WELLFORMED.match(stripped):
+            continue
+        month = int(stripped[2:4])
+        if 1 <= month <= 12:
+            good += 1
+    return good / len(candidates)
+
+
+def citation_grounding(text: str, sources: list[str]) -> float:
+    """Fraction of URLs cited in `text` that appear in `sources`.
+
+    Each URL found in the text counts as grounded if it occurs as a
+    substring of any provided source string (after stripping a trailing
+    slash and lowercasing both sides). Returns 1.0 when the text cites no
+    URLs (nothing ungrounded can exist).
+    """
+    cited = _URL_RE.findall(text or "")
+    if not cited:
+        return 1.0
+    norm_sources = [(s or "").strip().rstrip("/").lower() for s in (sources or [])]
+    grounded = 0
+    for url in cited:
+        u = url.strip().rstrip("/").lower()
+        if any(u in s or s in u for s in norm_sources if s):
+            grounded += 1
+    return grounded / len(cited)
+
+
+def coverage_hits(text: str, expected_subtopics: list[str]) -> float:
+    """Fraction of `expected_subtopics` mentioned in `text`.
+
+    A subtopic is hit if it appears as a case-insensitive substring, OR if
+    every stemmed token of the subtopic appears among the stemmed tokens of
+    the text (so "scaling laws" matches text containing "scale" and "law").
+    Returns 1.0 when no subtopics are expected (vacuously covered).
+    """
+    subtopics = [s for s in (expected_subtopics or []) if (s or "").strip()]
+    if not subtopics:
+        return 1.0
+    haystack = (text or "").lower()
+    text_stems = {_stem(t) for t in re.findall(r"[a-z0-9]+", haystack)}
+    hits = 0
+    for sub in subtopics:
+        s = sub.lower().strip()
+        if s in haystack:
+            hits += 1
+            continue
+        sub_stems = {_stem(t) for t in re.findall(r"[a-z0-9]+", s)}
+        if sub_stems and sub_stems <= text_stems:
+            hits += 1
+    return hits / len(subtopics)
+
+
+def dedup_overlap(items: list[str]) -> float:
+    """Shingle-overlap ratio across `items` (0 = all unique, 1 = identical).
+
+    Mean pairwise Jaccard similarity over word-trigram shingles. With 0 or 1
+    item there are no pairs, so redundancy is 0.0 by definition.
+    """
+    items = [i for i in (items or []) if (i or "").strip()]
+    if len(items) < 2:
+        return 0.0
+    shingle_sets = [_shingles(i) for i in items]
+    total = 0.0
+    pairs = 0
+    for a in range(len(shingle_sets)):
+        for b in range(a + 1, len(shingle_sets)):
+            sa, sb = shingle_sets[a], shingle_sets[b]
+            union = sa | sb
+            if union:
+                total += len(sa & sb) / len(union)
+            pairs += 1
+    return total / pairs if pairs else 0.0
+
+
+def novelty_vs_prior(text: str, prior_texts: list[str]) -> float:
+    """Novelty of `text` against prior artifacts: 1 - max token-Jaccard.
+
+    Returns 1.0 when there is no prior (everything is novel). A value near
+    0 means `text` is near-duplicate of some prior artifact.
+    """
+    priors = [p for p in (prior_texts or []) if (p or "").strip()]
+    if not priors:
+        return 1.0
+    max_sim = max(_jaccard_tokens(text, p) for p in priors)
+    return 1.0 - max_sim
+
+
+# Composite weights — sum to 1.0. Rationale:
+#   coverage 0.40            answering the question fully is the primary goal
+#   citation_grounding 0.25  claims must trace to provided sources
+#   arxiv_validity 0.15      malformed paper IDs erode trust / reproducibility
+#   novelty 0.15             a fresh artifact, not a rehash of prior runs
+#   low-dedup (1 - dedup) 0.05  light penalty for internal redundancy
+_RQ_WEIGHTS = {
+    "coverage": 0.40,
+    "citation_grounding": 0.25,
+    "arxiv_validity": 0.15,
+    "novelty": 0.15,
+    "low_dedup": 0.05,
+}
+
+
+def research_quality_composite(
+    output_md: str,
+    slate_entry: dict,
+    prior: Sequence[str] = (),
+) -> dict:
+    """Deterministic research-quality scorecard for one produced artifact.
+
+    `slate_entry` supplies the ground-truth expectations for the prompt:
+      - ``sources`` / ``expected_sources``: list[str] of allowed citation URLs
+      - ``expected_subtopics`` / ``subtopics``: list[str] coverage targets
+      - ``sections`` / ``items``: list[str] to score for internal redundancy
+        (falls back to the markdown's own section blocks when absent)
+
+    Returns a dict with each sub-score plus a weighted ``composite`` in
+    [0, 1]. Weights are documented in ``_RQ_WEIGHTS``: the composite uses
+    ``low_dedup = 1 - dedup_overlap`` so that less redundancy scores higher.
+    """
+    entry = slate_entry or {}
+    sources = entry.get("sources") or entry.get("expected_sources") or []
+    subtopics = entry.get("expected_subtopics") or entry.get("subtopics") or []
+    items = entry.get("sections") or entry.get("items")
+    if not items:
+        # Fall back to splitting the markdown into section-ish blocks so
+        # dedup still has something to chew on for a single artifact.
+        items = [b for b in re.split(r"\n#{1,6}\s|\n\n", output_md or "") if b.strip()]
+
+    arxiv = arxiv_id_validity(output_md)
+    grounding = citation_grounding(output_md, list(sources))
+    coverage = coverage_hits(output_md, list(subtopics))
+    dedup = dedup_overlap(list(items))
+    novelty = novelty_vs_prior(output_md, list(prior))
+
+    composite = (
+        _RQ_WEIGHTS["coverage"] * coverage
+        + _RQ_WEIGHTS["citation_grounding"] * grounding
+        + _RQ_WEIGHTS["arxiv_validity"] * arxiv
+        + _RQ_WEIGHTS["novelty"] * novelty
+        + _RQ_WEIGHTS["low_dedup"] * (1.0 - dedup)
+    )
+    # Clamp against floating-point drift so callers always get [0, 1].
+    composite = max(0.0, min(1.0, composite))
+
+    return {
+        "arxiv_validity": arxiv,
+        "citation_grounding": grounding,
+        "coverage": coverage,
+        "dedup_overlap": dedup,
+        "novelty": novelty,
+        "composite": composite,
+    }
 
 
 # ----------------------------------------------------------------------

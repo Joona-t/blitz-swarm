@@ -33,7 +33,7 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Iterable
+from typing import Any, Awaitable, Callable, Iterable, Sequence
 
 # Make the blitz-swarm package root importable when running as a module.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -41,7 +41,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from bench import BenchPrompt, BenchSlate, load_slate
-from bench.detectors import detect_all
+from bench.detectors import detect_all, research_quality_composite
 from bench.stats import bootstrap_ci, paired_t_test, cohens_d
 
 
@@ -96,7 +96,8 @@ class PromptResult:
     output_tokens: int
     consensus_reached: bool
     rounds_to_consensus: int
-    quality: dict          # {coverage, accuracy, clarity, depth, avg}
+    quality: dict          # {coverage, accuracy, clarity, depth, avg} — LLM-judge (SECONDARY)
+    functional_composite: dict  # research_quality_composite() output (PRIMARY signal)
     coverage_hits: int
     coverage_total: int
     timeout: bool
@@ -218,6 +219,70 @@ def _build_quality_dict(record: dict | None) -> dict:
     }
 
 
+def _slate_entry_for(prompt: BenchPrompt) -> dict:
+    """Build the `slate_entry` dict that `research_quality_composite` reads.
+
+    `BenchPrompt` (bench/__init__.py) is a frozen dataclass that only carries
+    `expected_coverage`; the upgrade slate's richer `expected_subtopics` field
+    is not loaded into the dataclass. We therefore feed the keyword list under
+    both `expected_subtopics` (coverage scoring) and leave sources empty unless
+    a future loader supplies them. This keeps the functional coverage sub-score
+    consistent with the existing keyword-based `_coverage_count`.
+    """
+    expected = list(prompt.expected_coverage)
+    return {
+        "expected_subtopics": expected,
+        "sources": [],
+    }
+
+
+# A composite scorecard for prompts that never produced an artifact
+# (timeout / error). All sub-scores zeroed so a failed prompt drags the
+# functional mean down rather than being silently treated as perfect.
+_ZERO_COMPOSITE: dict = {
+    "arxiv_validity": 0.0,
+    "citation_grounding": 0.0,
+    "coverage": 0.0,
+    "dedup_overlap": 0.0,
+    "novelty": 0.0,
+    "composite": 0.0,
+}
+
+
+def _load_round_outputs(out_path: Any) -> list[list[dict]]:
+    """Best-effort load of per-agent round outputs for the MAST detectors (G6).
+
+    The detectors in ``bench/detectors.detect_all`` need the full per-round,
+    per-agent structured outputs as a ``list[list[dict]]``. metrics.jsonl does
+    not carry these. If a run writes a sibling ``rounds.json`` next to the
+    output markdown (``<output>.md`` -> ``<output>.rounds.json``, or a
+    ``rounds.json`` in the same directory), shaped as ``[[{...}, ...], ...]``,
+    we load and return it. Otherwise we return ``[]`` so the caller keeps
+    ``flags=[]`` rather than fabricating failure modes.
+    """
+    if not isinstance(out_path, Path):
+        return []
+    candidates = [
+        out_path.with_suffix(".rounds.json"),
+        out_path.parent / "rounds.json",
+    ]
+    for cand in candidates:
+        try:
+            if not cand.exists():
+                continue
+            data = json.loads(cand.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        # Validate shape: list of rounds, each a list of agent-output dicts.
+        if (
+            isinstance(data, list)
+            and all(isinstance(rnd, list) for rnd in data)
+            and all(isinstance(o, dict) for rnd in data for o in rnd)
+        ):
+            return data
+    return []
+
+
 # ---------------------------------------------------------------------------
 # Per-prompt execution
 # ---------------------------------------------------------------------------
@@ -230,8 +295,14 @@ async def run_one_prompt(
     *,
     swarm_fn: SwarmFn,
     metrics_path: Path = METRICS_PATH,
+    prior: Sequence[str] = (),
 ) -> PromptResult:
-    """Run a single prompt through the swarm and collect its result."""
+    """Run a single prompt through the swarm and collect its result.
+
+    `prior` is the list of earlier prompt outputs (markdown) in the run, used
+    by the functional research-quality scorer to penalise near-duplicate
+    artifacts (novelty sub-score). Empty `prior` means everything is novel.
+    """
     started = time.monotonic()
     started_utc_iso = _utc()
     pre_run_timestamp = time.time()
@@ -263,14 +334,29 @@ async def run_one_prompt(
         except OSError:
             md = ""
 
-    rounds_record = record.get("rounds", {}) if record else {}
-    rounds_list: list[list[dict]] = []  # we don't have full per-agent outputs in metrics
-    flags: list[str] = []  # rule-based detectors need agent-level outputs; deferred
-    # If we have a rounds dict from metrics, we can at least populate FM-3.3 / FM-3.1 hooks
-    # from aggregate signals. Full detector coverage requires hooking inside run_swarm.
+    # ---- G6: MAST failure-mode detectors (rule-based, no LLM) ------------
+    # detect_all() needs per-agent round outputs (the list[list[dict]] of every
+    # agent's structured output per round). metrics.jsonl only carries aggregate
+    # signals, so the detectors cannot fire from it. If a future run writes the
+    # full per-agent transcript into the run dir (rounds.json next to the output
+    # markdown), load it and run detect_all; otherwise leave flags=[] — we do NOT
+    # fabricate failure modes from aggregates.
+    rounds_list = _load_round_outputs(out_path)
+    if rounds_list:
+        flags = detect_all(rounds_list, output_md_chars=len(md))
+    else:
+        # TODO(G6): wire per-agent round outputs through run_swarm so detect_all
+        # can run on real runs. Until metrics.jsonl (or a sibling rounds.json) is
+        # extended with the per-round, per-agent structured outputs, flags stay
+        # empty on real runs — the regression suite (bench/mast_regression.py)
+        # exercises the detectors directly with injected transcripts.
+        flags = []
 
     quality = _build_quality_dict(record)
     coverage_hits = _coverage_count(md, prompt.expected_coverage)
+
+    # ---- G1: PRIMARY functional research-quality composite ----------------
+    functional = research_quality_composite(md, _slate_entry_for(prompt), prior=list(prior))
 
     return PromptResult(
         prompt_id=prompt.id,
@@ -286,6 +372,7 @@ async def run_one_prompt(
         consensus_reached=bool(record.get("consensus_reached", False)) if record else False,
         rounds_to_consensus=int(record.get("rounds_to_consensus", 0) or 0) if record else 0,
         quality=quality,
+        functional_composite=functional,
         coverage_hits=coverage_hits,
         coverage_total=len(prompt.expected_coverage),
         timeout=False,
@@ -309,6 +396,7 @@ def _timeout_result(prompt: BenchPrompt, run_dir: Path, started: float, started_
         consensus_reached=False,
         rounds_to_consensus=0,
         quality={"coverage": 0, "accuracy": 0, "clarity": 0, "depth": 0, "avg": 0.0},
+        functional_composite=dict(_ZERO_COMPOSITE),
         coverage_hits=0,
         coverage_total=len(prompt.expected_coverage),
         timeout=True,
@@ -334,6 +422,7 @@ def _error_result(
         consensus_reached=False,
         rounds_to_consensus=0,
         quality={"coverage": 0, "accuracy": 0, "clarity": 0, "depth": 0, "avg": 0.0},
+        functional_composite=dict(_ZERO_COMPOSITE),
         coverage_hits=0,
         coverage_total=len(prompt.expected_coverage),
         timeout=False,
@@ -403,6 +492,20 @@ def aggregate(run_dir: Path, slate: BenchSlate, cfg: BenchConfig) -> dict:
         for fm in r.get("mast_flags", []) or []:
             flag_counts[fm] = flag_counts.get(fm, 0) + 1
 
+    # PRIMARY signal — functional research-quality composite (deterministic).
+    # CONTRACT (read by the driver's _bench_avg_quality):
+    #   summary["functional_composite"] = {"mean": <float 0..1>,
+    #                                       "per_prompt": {prompt_id: composite}}
+    fc_per_prompt: dict[str, float] = {}
+    for r in rows:
+        fc = r.get("functional_composite") or {}
+        comp = fc.get("composite")
+        if comp is None:
+            continue
+        fc_per_prompt[r["prompt_id"]] = round(float(comp), 4)
+    fc_mean = round(statistics.mean(fc_per_prompt.values()), 4) if fc_per_prompt else 0.0
+    functional_composite = {"mean": fc_mean, "per_prompt": fc_per_prompt}
+
     summary = {
         "schema_version": 1,
         "run_id": run_dir.name,
@@ -430,6 +533,10 @@ def aggregate(run_dir: Path, slate: BenchSlate, cfg: BenchConfig) -> dict:
             "prompts_timed_out": len([r for r in rows if r.get("timeout")]),
             "prompts_errored": len([r for r in rows if r.get("error") and not r.get("timeout")]),
         },
+        # PRIMARY: deterministic functional research-quality composite.
+        "functional_composite": functional_composite,
+        # SECONDARY: LLM-judge aggregate (kept for comparison, no longer the
+        # gating signal — the driver reads functional_composite.mean first).
         "aggregate_quality": by_dim,
         "by_tier": by_tier,
         "consensus": {
@@ -465,11 +572,26 @@ def write_stats_md(run_dir: Path, summary: dict) -> Path:
         f"timed out {summary['slate']['prompts_timed_out']}, "
         f"errored {summary['slate']['prompts_errored']}",
         "",
-        "## Aggregate quality (0-10)",
-        "",
-        "| Dim | Mean | SD | CI95 |",
-        "|---|---|---|---|",
     ]
+
+    # PRIMARY: functional research-quality composite (0-1, deterministic).
+    fc = summary.get("functional_composite") or {}
+    lines.append("## Functional research-quality composite (0-1) — PRIMARY")
+    lines.append("")
+    lines.append(f"Mean composite: **{fc.get('mean', 0.0)}**")
+    lines.append("")
+    per_prompt = fc.get("per_prompt") or {}
+    if per_prompt:
+        lines.append("| Prompt | Composite |")
+        lines.append("|---|---|")
+        for pid in sorted(per_prompt):
+            lines.append(f"| {pid} | {per_prompt[pid]} |")
+        lines.append("")
+
+    lines.append("## Aggregate quality (0-10) — SECONDARY (LLM-judge)")
+    lines.append("")
+    lines.append("| Dim | Mean | SD | CI95 |")
+    lines.append("|---|---|---|---|")
     for dim, stats_dict in summary["aggregate_quality"].items():
         ci = stats_dict["ci95"]
         lines.append(f"| {dim} | {stats_dict['mean']} | {stats_dict['stddev']} | "
@@ -544,6 +666,22 @@ async def run_bench(
     budget_lock = asyncio.Lock()
     results_path = run_dir / "results.jsonl"
 
+    # Prior artifacts for the functional novelty sub-score. Seeded from any
+    # already-completed (resumed) outputs, then grown as prompts finish. A
+    # prompt scores novelty against whatever artifacts completed before it;
+    # under concurrency this is scheduling-dependent (best-effort) but the
+    # novelty weight is small (0.15) and distinct slate prompts score ~1.0
+    # regardless.
+    prior_lock = asyncio.Lock()
+    prior_outputs: list[str] = []
+    for _row in _read_results(run_dir):
+        _mp = _row.get("output_md_path") or ""
+        if _mp and Path(_mp).exists():
+            try:
+                prior_outputs.append(Path(_mp).read_text(encoding="utf-8"))
+            except OSError:
+                pass
+
     async def _bounded(p: BenchPrompt) -> PromptResult:
         async with sem:
             async with budget_lock:
@@ -553,14 +691,26 @@ async def run_bench(
                         "budget_exhausted",
                     )
                 budget_remaining[0] -= p.budget_usd
+            async with prior_lock:
+                prior_snapshot = list(prior_outputs)
             result = await run_one_prompt(
                 p, cfg, run_dir,
                 swarm_fn=swarm_fn,
                 metrics_path=metrics_path,
+                prior=prior_snapshot,
             )
             async with budget_lock:
                 # Refund unused budget
                 budget_remaining[0] += max(p.budget_usd - result.cost_usd, 0)
+            # Record this artifact so later prompts can score novelty against it.
+            if result.output_md_path and Path(result.output_md_path).exists():
+                async with prior_lock:
+                    try:
+                        prior_outputs.append(
+                            Path(result.output_md_path).read_text(encoding="utf-8")
+                        )
+                    except OSError:
+                        pass
             return result
 
     if pending:
