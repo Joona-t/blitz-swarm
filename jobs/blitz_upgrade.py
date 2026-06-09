@@ -646,6 +646,7 @@ def _invoke_live(kind: str, *, tracker: BudgetTracker, **kw: Any) -> dict[str, A
             max_rounds=int(kw.get("max_rounds", 4)),
             use_redis=bool(kw.get("use_redis", False)),
             seed=int(seed),
+            backend_id=kw.get("backend_id"),  # claude-only honored in verify too
         )
         run_dir = asyncio.run(run_bench(cfg))
         summary = _read_bench_summary(run_dir)
@@ -992,30 +993,40 @@ def phase_baseline(state: JobState, tracker: BudgetTracker, args: argparse.Names
     for ti, topic in enumerate(topics):
         for seed in seeds:
             cells.append((f"baseline:t{ti}:s{seed}",
-                          {"topic": topic, "seed": seed, "max_rounds": args.max_rounds}))
+                          {"topic": topic, "seed": seed, "max_rounds": args.max_rounds,
+                           "backend_id": args.backend}))
     # LIVE: K-sample self-consistency floor on the first topic.
     if topics:
         for k in range(args.seeds):
             cells.append((f"selfconsistency:t0:k{k}",
-                          {"topic": topics[0], "seed": 1000 + k, "max_rounds": args.max_rounds}))
+                          {"topic": topics[0], "seed": 1000 + k, "max_rounds": args.max_rounds,
+                           "backend_id": args.backend}))
 
-    # Collect the K self-consistency quality samples as the cells complete so we
-    # can aggregate them into a floor at the end of the phase.
-    sc_samples: list[float] = []
-
-    def _collect_sc(cell_id: str, res: dict[str, Any]) -> None:
-        if cell_id.startswith("selfconsistency:"):
-            q = float(res.get("result", {}).get("avg_quality", 0) or 0)
-            sc_samples.append(q)
-
+    # B6-class fix: defer DONE until the floor artifact (baseline's terminal side
+    # effect) is written, and rebuild the K samples from PERSISTED cell results so a
+    # --resume (which skips already-done cells) can still compute and write the floor
+    # instead of marking baseline done with a degenerate/absent floor. Without this,
+    # a mid-baseline pause on a multi-window run would leave the gate with no floor
+    # (falling back to keep-all). Mirrors the phase_verify fix.
     _run_cells(state, tracker, "baseline", cells, dry_run=args.dry_run,
-               invoke_kind="consensus", on_result=_collect_sc)
+               invoke_kind="consensus", defer_done=True)
 
-    # G3: aggregate the self-consistency floor and persist it for the gate.
+    # G3: aggregate the self-consistency floor from PERSISTED results and persist it.
+    sc_samples: list[float] = []
+    base_results = state.cell_results("baseline")
+    for cell_id, _payload in cells:
+        if not cell_id.startswith("selfconsistency:"):
+            continue
+        res = base_results.get(cell_id)
+        if res:
+            sc_samples.append(float(res.get("result", {}).get("avg_quality", 0) or 0))
+
     floor = _aggregate_baseline_floor(sc_samples)
     floor_path = state.path.parent / f"baseline_floor_{_safe(state.data['branch'])}.json"
     floor_path.write_text(json.dumps(floor, indent=2), encoding="utf-8")
     state.add_artifact("baseline", str(floor_path))
+    # Terminal side effect landed — now safe to mark baseline done (B6-class).
+    state.set_status("baseline", STATUS_DONE)
 
 
 def _aggregate_baseline_floor(samples: list[float]) -> dict[str, Any]:
@@ -1098,7 +1109,8 @@ def phase_verify(state: JobState, tracker: BudgetTracker, args: argparse.Namespa
                 cells.append((
                     f"verify:{technique}:{arm}:s{seed}",
                     {"technique": technique, "arm": arm, "seed": seed,
-                     "slate": args.slate, "max_rounds": args.max_rounds},
+                     "slate": args.slate, "max_rounds": args.max_rounds,
+                     "backend_id": args.backend},
                 ))
 
     # B6: defer the phase DONE until AFTER the significance artifact is written.
@@ -1628,6 +1640,13 @@ def run_job(args: argparse.Namespace, *, started_at: float | str | None = None,
         if "metrics_floor_at_start" not in state.data:
             state.data["metrics_floor_at_start"] = int(tracker.metrics_floor())
             state.save()
+        # Job-relative budget: --max-tokens is THIS job's own budget. The ceiling
+        # check is floor-inclusive (spent = charged + floor), so in real mode lift
+        # the ceiling by the pre-job historical floor → the job's own charges are
+        # capped at exactly --max-tokens regardless of unrelated prior spend already
+        # in metrics.jsonl (other sessions). Dry-run floor is 0, so this is a no-op.
+        if not args.dry_run:
+            tracker.hard_ceiling = int(args.max_tokens) + int(tracker.metrics_floor())
 
     phases = _phases_to_run(args.phase)
 
@@ -1761,6 +1780,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Seeds/repeats per cell for statistical power.")
     ap.add_argument("--max-rounds", type=int, default=4,
                     help="Consensus/bench max rounds per run (default 4).")
+    ap.add_argument("--backend", default="claude",
+                    help="LLM backend for swarm runs: claude (default, honors the "
+                         "claude-only job choice) / codex / gemini / ollama. Threaded "
+                         "into run_swarm backend_id. NOTE: the swarm's 'sonnet' agents "
+                         "require the claude backend; the codex default fails on them.")
     ap.add_argument("--slate", default="bench/slate_upgrade.toml",
                     help="Bench slate TOML for baseline + verify phases.")
     ap.add_argument("--state-file", default=str(DEFAULT_STATE_FILE),

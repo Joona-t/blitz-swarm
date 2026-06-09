@@ -734,6 +734,37 @@ def test_B6_verify_done_only_after_significance_write(state_file: Path, monkeypa
     assert sig_arts and Path(sig_arts[0]).exists()
 
 
+def test_baseline_floor_rewritten_on_resume(state_file: Path, monkeypatch):
+    """B6-class: if baseline crashes AFTER its cells but BEFORE the self-consistency
+    floor write, the phase must NOT be DONE, and a --resume must rebuild + write the
+    floor from the persisted cell results (the gate consumes this floor)."""
+    boom = {"hit": False}
+    real_agg = bu._aggregate_baseline_floor
+
+    def _exploding(samples):
+        boom["hit"] = True
+        raise RuntimeError("simulated crash before baseline floor write")
+
+    monkeypatch.setattr(bu, "_aggregate_baseline_floor", _exploding)
+    with pytest.raises(RuntimeError):
+        bu.run_job(_args(state_file, phase="baseline"), started_at=9000.0)
+    assert boom["hit"]
+    crashed = json.loads(state_file.read_text())
+    # baseline is NOT done (cells ran, but the terminal floor artifact never landed)
+    assert crashed["phases"]["baseline"]["status"] != bu.STATUS_DONE
+    assert crashed["phases"]["baseline"]["cells_done"]
+
+    # resume: the floor is rebuilt from persisted cell results and written; done.
+    monkeypatch.setattr(bu, "_aggregate_baseline_floor", real_agg)
+    assert bu.run_job(_args(state_file, phase="baseline", resume=True),
+                      started_at=9000.0) == 0
+    fixed = json.loads(state_file.read_text())
+    assert fixed["phases"]["baseline"]["status"] == bu.STATUS_DONE
+    floor_arts = [a for a in fixed["phases"]["baseline"]["artifacts"]
+                  if "baseline_floor_" in a]
+    assert floor_arts and Path(floor_arts[0]).exists()
+
+
 def test_B6_gate_done_only_after_commit(tmp_path: Path, monkeypatch):
     """In real mode, the gate is marked DONE only AFTER the commit succeeds; a
     failed commit leaves the gate not-done so resume retries it."""

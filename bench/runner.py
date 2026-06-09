@@ -69,6 +69,7 @@ class BenchConfig:
     max_rounds: int = 4
     use_redis: bool = False
     seed: int = 42
+    backend_id: str | None = None  # swarm backend (e.g. "claude"); None = blitz default
     started_utc: str = ""
     git_sha: str = ""
 
@@ -313,6 +314,9 @@ async def run_one_prompt(
                 prompt.text,
                 max_rounds=cfg.max_rounds,
                 use_redis=cfg.use_redis,
+                # Only pass backend_id when set, so injected test swarm_fns that
+                # don't accept the kwarg keep working (default = blitz backend).
+                **({"backend_id": cfg.backend_id} if cfg.backend_id else {}),
             ),
             timeout=cfg.per_prompt_timeout_s,
         )
