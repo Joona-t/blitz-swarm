@@ -1,5 +1,39 @@
 # Bugs & Iterations
 
+## 2026-06-10: ITER-AUDIT-1 — Fable audit wave on the upgrade harness (10 findings fixed)
+
+**What hurt:** a model-upgrade audit of the Opus-built 10M-token upgrade harness
+found the prior adversarial passes had verified each phase in isolation (dry-run)
+while the seams between phases were hollow: research output was never parsed
+(mythos got the literal string `'technique_01'`), ablation arms ran byte-identical
+configs (the `arm` label toggled nothing), the default parameterization projected
+~25–40M tokens against a 10M ceiling, errored cells were marked done forever and
+poisoned samples with 0.0 (a codex smoke wrote floor=0.0, which everything
+"clears"), and the gate compared verify's 0–1 composite against a 0–10 floor —
+vacuously false for any technique.
+
+**Root cause (meta):** unit tests + per-phase red-teams can't see cross-phase
+data-flow breaks, live cost arithmetic, or metric incentive inversions. Those
+require tracing data across boundaries and doing arithmetic against measured cost
+(31,150 tokens / ~9.5 min per 1-round swarm run).
+
+**Fix (commit `cdc89e0`):** candidates.json contract research→implement→verify
+(new `jobs/candidates.py`); real arm toggling via `BLITZ_FEATURE_OVERRIDES` →
+`orchestrator._feature_enabled` (live-proven flip); pre-flight cost calibrator
+that prints the projection math and refuses infeasible jobs (rc=2); retry→
+exclude failure semantics + usage-limit pause/resume-same-cell; timeouts fit to
+measured reality (AgentCall 600s, bench 3600s, timeouts = missing not 0.0); true
+K-single-agent floor on the unified 0–1 composite scale (`--floor-k`); per-
+(seed,prompt) significance pairing (n=8 vs 3) with keep-ALL fallback removed +
+evidence grading; composite no longer rewards citing nothing; normalized metrics
+matching. Defaults re-parameterized feasible (rounds 2, techniques 3, seeds 2,
+4-prompt verify mini-slate). Full suite 444 passed (+86 new tests).
+
+**Prevention rule:** every multi-phase harness gets (1) a cross-phase contract
+test (does phase N's consumer actually read phase N-1's producer?), (2) a cost
+calibration gate before any live run, and (3) scale assertions wherever two
+scores are compared.
+
 ## 2026-05-09: BUG-001 — LanceDB distance type implicitly L2 with normalized vectors
 
 **Problem:** `memory/writer.py:_find_related_queries` reads `_distance` from LanceDB and computes `1 - distance` as cosine similarity. With normalized 384-dim MiniLM embeddings, LanceDB defaults to L2, which is NOT `1 - cosine_sim`; similarities are systematically off, shifting τ_link's effective cutoff.
