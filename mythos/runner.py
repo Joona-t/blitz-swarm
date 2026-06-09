@@ -272,11 +272,41 @@ def _finalize_aborted(
 
 
 def _build_metrics(history, budget, t_start) -> dict:
+    # Token totals (C6): jobs/blitz_upgrade._read_mythos_tokens reads
+    # "total_input_tokens"/"total_output_tokens" from this metrics.json.
+    # We sum per-round usage from the history entries — accepting either
+    # top-level "input_tokens"/"output_tokens" or the same keys nested
+    # under "usage". NOTE: today run_mythos's round records carry only
+    # cost fields (ExecutorOutput/Verification drop the per-call
+    # input_tokens/output_tokens that mythos._invoke.InvokeResult
+    # captures), so these sums are honestly 0 until usage is threaded
+    # into the round records — we sum what exists, never fabricate.
+    def _tok(entry: dict, key: str) -> int:
+        val = entry.get(key)
+        if val is None:
+            usage = entry.get("usage")
+            if isinstance(usage, dict):
+                val = usage.get(key)
+        try:
+            return int(val or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    total_input_tokens = 0
+    total_output_tokens = 0
+    for entry in history or []:
+        if not isinstance(entry, dict):
+            continue
+        total_input_tokens += _tok(entry, "input_tokens")
+        total_output_tokens += _tok(entry, "output_tokens")
+
     return {
         "rounds": history,
         "total_cost_usd": round(budget.spent_usd, 4),
         "cost_ceiling_usd": budget.ceiling_usd,
         "wall_clock_s": round(time.monotonic() - t_start, 1),
+        "total_input_tokens": total_input_tokens,
+        "total_output_tokens": total_output_tokens,
     }
 
 

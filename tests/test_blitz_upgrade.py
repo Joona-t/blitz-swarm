@@ -844,17 +844,25 @@ def test_G1_bench_avg_quality_reads_functional_composite():
 
 
 def test_G3_baseline_floor_persisted_and_consumed(state_file: Path):
-    """phase_baseline aggregates the K self-consistency cells into a floor,
-    persists baseline_floor_<branch>.json, and the gate consumes it."""
+    """phase_baseline aggregates the K SINGLE-AGENT floor cells (H1: a true
+    Wang-style self-consistency floor, not K more swarm runs) into a floor on
+    the 0-1 composite scale, persists baseline_floor_<branch>.json, and the
+    gate consumes it."""
     assert bu.run_job(_args(state_file, phase="baseline"), started_at=8200.0) == 0
     data = json.loads(state_file.read_text())
     floor_arts = [a for a in data["phases"]["baseline"]["artifacts"]
                   if "baseline_floor_" in a]
     assert floor_arts, "baseline wrote no floor artifact"
     floor = json.loads(Path(floor_arts[0]).read_text())
-    assert floor["n"] == 2  # seeds=2 self-consistency samples
+    assert floor["n"] == 5  # --floor-k default (M5: separate knob from --seeds)
     assert "floor" in floor and "mean" in floor and "median" in floor
     assert floor["floor"] == round(min(floor["mean"], floor["median"]), 4)
+    # H1 scale unification: the floor lives on the SAME 0-1 composite scale the
+    # verify samples use (the old 0-10 judge scale made every gate comparison
+    # vacuously false).
+    assert all(0.0 <= s <= 1.0 for s in floor["samples"])
+    # The floor cells are single_agent cells, distinct from the swarm cells.
+    assert any(c.startswith("floor:k") for c in data["phases"]["baseline"]["cells_done"])
 
     # The gate reads it back as a float bar.
     state = bu.JobState.load_or_init(state_file, started_at=8200.0, branch=TEST_BRANCH)
@@ -1191,3 +1199,168 @@ def test_G2_regression_command_targets_pytest(tmp_path: Path, monkeypatch):
     if (bu.REPO_ROOT / "bench" / "mast_regression.py").exists():
         assert any("mast_regression.py" in tok
                    for a in captured for tok in a)
+
+
+# ===========================================================================
+# Audit remediation — C4 failure semantics, C3 calibrator, H2 pairing, C2 toggle
+# ===========================================================================
+
+
+def test_C4_errored_cell_retried_then_succeeds(state_file: Path, monkeypatch):
+    """A transiently-errored cell is retried (not marked done/failed on the
+    first error) and succeeds on the second attempt."""
+    real_invoke = bu._invoke
+    flaky = {"failures_left": 1, "calls": 0}
+
+    def _flaky_invoke(kind, **kw):
+        res = real_invoke(kind, **kw)
+        if kind == "single_agent" and kw.get("seed") == 0:
+            flaky["calls"] += 1
+            if flaky["failures_left"] > 0:
+                flaky["failures_left"] -= 1
+                bad = dict(res)
+                bad["ok"] = False
+                bad["error"] = "transient backend hiccup"
+                return bad
+        return res
+
+    monkeypatch.setattr(bu, "_invoke", _flaky_invoke)
+    assert bu.run_job(_args(state_file, phase="baseline"), started_at=9100.0) == 0
+    data = json.loads(state_file.read_text())
+    assert "floor:k0" in data["phases"]["baseline"]["cells_done"]
+    assert "floor:k0" not in data["phases"]["baseline"].get("cells_failed", [])
+    assert flaky["calls"] == 2  # first attempt errored, retry succeeded
+
+
+def test_C4_persistent_failure_excluded_from_samples(state_file: Path, monkeypatch):
+    """A cell that fails every attempt is recorded in cells_failed and its
+    data is MISSING from the floor (n drops) — never a poisoning 0.0."""
+    real_invoke = bu._invoke
+
+    def _always_fail_k0(kind, **kw):
+        res = real_invoke(kind, **kw)
+        if kind == "single_agent" and kw.get("seed") == 0:
+            bad = dict(res)
+            bad["ok"] = False
+            bad["error"] = "permanent failure"
+            return bad
+        return res
+
+    monkeypatch.setattr(bu, "_invoke", _always_fail_k0)
+    assert bu.run_job(_args(state_file, phase="baseline"), started_at=9200.0) == 0
+    data = json.loads(state_file.read_text())
+    assert "floor:k0" in data["phases"]["baseline"].get("cells_failed", [])
+    floor_arts = [a for a in data["phases"]["baseline"]["artifacts"]
+                  if "baseline_floor_" in a]
+    floor = json.loads(Path(floor_arts[0]).read_text())
+    assert floor["n"] == 4          # 5 floor cells - 1 failed = 4 samples
+    assert 0.0 not in floor["samples"]  # missing, not zero-poisoned
+
+
+def test_C4_usage_limit_pauses_and_resume_retries(state_file: Path, monkeypatch):
+    """A usage-window exhaustion PAUSES the phase (clean exit 0); the same cell
+    is retried after resume — never burned as failed."""
+    real_invoke = bu._invoke
+    limited = {"on": True}
+
+    def _limited_invoke(kind, **kw):
+        res = real_invoke(kind, **kw)
+        if limited["on"] and kind == "single_agent" and kw.get("seed") == 1:
+            bad = dict(res)
+            bad["ok"] = False
+            bad["error"] = "claude exit 1: usage limit reached for this window"
+            return bad
+        return res
+
+    monkeypatch.setattr(bu, "_invoke", _limited_invoke)
+    assert bu.run_job(_args(state_file, phase="baseline"), started_at=9300.0) == 0
+    data = json.loads(state_file.read_text())
+    assert data["phases"]["baseline"]["status"] == bu.STATUS_PAUSED
+    assert "floor:k1" not in data["phases"]["baseline"]["cells_done"]
+    assert "floor:k1" not in data["phases"]["baseline"].get("cells_failed", [])
+
+    # Window reset: resume retries the SAME cell and the phase completes.
+    limited["on"] = False
+    assert bu.run_job(_args(state_file, phase="baseline", resume=True),
+                      started_at=9300.0) == 0
+    fixed = json.loads(state_file.read_text())
+    assert fixed["phases"]["baseline"]["status"] == bu.STATUS_DONE
+    assert "floor:k1" in fixed["phases"]["baseline"]["cells_done"]
+
+
+def test_C3_calibrator_refuses_infeasible_job(tmp_path: Path, monkeypatch):
+    """The pre-flight calibrator projects the whole job from one measured cell
+    and refuses (rc=2) when the projection exceeds the budget; the override
+    flag lets it proceed."""
+    def _fat_invoke(kind, **kw):
+        return {"ok": True, "kind": kind, "tokens": 50_000, "artifact": None,
+                "result": {"topic": kw.get("topic", ""), "seed": 0,
+                           "avg_quality": 5.0}}
+
+    monkeypatch.setattr(bu, "_invoke", _fat_invoke)
+    monkeypatch.setattr(bu, "_resolve_branch", lambda *a, **k: TEST_BRANCH)
+
+    sf = tmp_path / "cal" / "upgrade_state.json"
+    args = _args(sf, phase="baseline", dry_run=False, max_tokens=200_000)
+    rc = bu.run_job(args, started_at=9400.0)
+    assert rc == 2  # refused: 50K/swarm-run projects far past 200K
+    data = json.loads(sf.read_text())
+    assert data["calibration"]["feasible"] is False
+    assert data["calibration"]["per_swarm_tokens"] == 50_000
+
+    # Override proceeds past the refusal (fresh state dir).
+    sf2 = tmp_path / "cal2" / "upgrade_state.json"
+    args2 = _args(sf2, phase="baseline", dry_run=False, max_tokens=200_000)
+    args2.ignore_calibration = True
+    rc2 = bu.run_job(args2, started_at=9400.0)
+    assert rc2 in (0,)  # proceeds (and may pause later on budget, both fine)
+
+
+def test_H2_per_prompt_pairing_width(state_file: Path):
+    """Verify pairs per-(seed, prompt): with seeds=2 and the 4-prompt
+    mini-slate default, each technique gets n_on = n_off = 8 paired samples —
+    not the old n=seeds=2."""
+    for ph in ("baseline", "research", "implement", "verify"):
+        assert bu.run_job(_args(state_file, phase=ph), started_at=9500.0) == 0
+    data = json.loads(state_file.read_text())
+    sig_arts = [a for a in data["phases"]["verify"]["artifacts"]
+                if "verify_significance_" in a]
+    assert sig_arts
+    sig = json.loads(Path(sig_arts[0]).read_text())
+    assert sig, "no techniques in significance artifact"
+    for tech, rec in sig.items():
+        assert rec["n_on"] == 8, (tech, rec["n_on"])   # 2 seeds x 4 prompts
+        assert rec["n_off"] == 8
+        assert "p_value" in rec and "cohens_d" in rec and "bootstrap_ci" in rec
+
+
+def test_C2_bench_arm_sets_feature_override_env(monkeypatch, tmp_path: Path):
+    """The live bench branch toggles BLITZ_FEATURE_OVERRIDES per arm and
+    restores the env afterwards (C2 — arms must actually differ)."""
+    import asyncio as _asyncio
+    seen: dict[str, str | None] = {}
+
+    async def _fake_run_bench(cfg):
+        seen["env"] = os.environ.get("BLITZ_FEATURE_OVERRIDES")
+        seen["filter_ids"] = tuple(cfg.slate_filter_ids)
+        d = tmp_path / "fake_run"
+        d.mkdir(exist_ok=True)
+        return d
+
+    import bench.runner as _br
+    monkeypatch.setattr(_br, "run_bench", _fake_run_bench)
+    monkeypatch.setattr(bu, "_read_bench_summary", lambda run_dir: {
+        "functional_composite": {"mean": 0.7, "per_prompt": {"p1": 0.7}},
+    })
+    import os
+    os.environ.pop("BLITZ_FEATURE_OVERRIDES", None)
+
+    tracker = bu.BudgetTracker(hard_ceiling=10_000, dry_run=True)
+    res = bu._invoke_live("bench_ablation", tracker=tracker,
+                          technique="my-mech", arm="on", seed=1,
+                          slate="bench/slate_upgrade.toml",
+                          prompt_ids=["p1", "p2"], max_rounds=1)
+    assert json.loads(seen["env"]) == {"my-mech": True}
+    assert seen["filter_ids"] == ("p1", "p2")
+    assert os.environ.get("BLITZ_FEATURE_OVERRIDES") is None  # restored
+    assert res["result"]["per_prompt"] == {"p1": 0.7}

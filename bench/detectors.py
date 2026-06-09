@@ -205,18 +205,60 @@ def novelty_vs_prior(text: str, prior_texts: list[str]) -> float:
     return 1.0 - max_sim
 
 
-# Composite weights — sum to 1.0. Rationale:
-#   coverage 0.40            answering the question fully is the primary goal
-#   citation_grounding 0.25  claims must trace to provided sources
-#   arxiv_validity 0.15      malformed paper IDs erode trust / reproducibility
-#   novelty 0.15             a fresh artifact, not a rehash of prior runs
-#   low-dedup (1 - dedup) 0.05  light penalty for internal redundancy
+def citations_score(text: str, sources: list[str]) -> float:
+    """Earned citation credit for the composite (audit fix H3).
+
+    The individual detectors (``arxiv_id_validity``, ``citation_grounding``)
+    return a *vacuous* 1.0 when the artifact makes no claims of their kind —
+    correct for "fraction malformed/ungrounded", but wrong as composite
+    credit: an output that cites NOTHING must score 0 on citations, not full
+    marks.
+
+      * 0.0 when the text cites nothing (no URLs AND no arXiv ids).
+      * Otherwise ``wellformed_fraction * min(1.0, distinct_citations / 3)``
+        where ``distinct_citations`` = distinct cited URLs + distinct claimed
+        arXiv ids (3+ distinct citations earn full richness), and
+        ``wellformed_fraction`` combines the existing detectors weighted by
+        how many claims of each kind appear:
+          - arXiv claims are scored by ``arxiv_id_validity``;
+          - URL claims are scored by ``citation_grounding`` when ``sources``
+            are provided; with no sources to ground against, URLs are taken
+            at face value (1.0) rather than auto-penalised.
+
+    Deterministic, pure-python, no LLM.
+    """
+    urls = _URL_RE.findall(text or "")
+    arxiv_claims = [c.strip().rstrip(".") for c in _ARXIV_CANDIDATE.findall(text or "")]
+    n_urls, n_arxiv = len(urls), len(arxiv_claims)
+    if n_urls == 0 and n_arxiv == 0:
+        return 0.0
+
+    weighted = 0.0
+    if n_arxiv:
+        weighted += n_arxiv * arxiv_id_validity(text)
+    if n_urls:
+        url_quality = citation_grounding(text, list(sources)) if sources else 1.0
+        weighted += n_urls * url_quality
+    wellformed_fraction = weighted / (n_urls + n_arxiv)
+
+    distinct = {u.strip().rstrip("/").lower() for u in urls} | set(arxiv_claims)
+    richness = min(1.0, len(distinct) / 3.0)
+    return wellformed_fraction * richness
+
+
+# Composite weights — sum to 1.0. Rationale (audit fix H3):
+#   coverage 0.45   answering the question fully is the primary goal
+#   citations 0.30  citation credit must be EARNED (count + well-formedness +
+#                   grounding) — replaces the old citation_grounding (0.25) +
+#                   arxiv_validity (0.15) pair, whose vacuous 1.0s handed an
+#                   uncited artifact 0.40 free composite credit
+#   novelty 0.15    a fresh artifact, not a rehash of prior runs
+#   low-dedup 0.10  (1 - dedup_overlap): penalty for internal redundancy
 _RQ_WEIGHTS = {
-    "coverage": 0.40,
-    "citation_grounding": 0.25,
-    "arxiv_validity": 0.15,
+    "coverage": 0.45,
+    "citations": 0.30,
     "novelty": 0.15,
-    "low_dedup": 0.05,
+    "low_dedup": 0.10,
 }
 
 
@@ -233,9 +275,28 @@ def research_quality_composite(
       - ``sections`` / ``items``: list[str] to score for internal redundancy
         (falls back to the markdown's own section blocks when absent)
 
-    Returns a dict with each sub-score plus a weighted ``composite`` in
-    [0, 1]. Weights are documented in ``_RQ_WEIGHTS``: the composite uses
-    ``low_dedup = 1 - dedup_overlap`` so that less redundancy scores higher.
+    Composite (audit fix H3)::
+
+        0.45*coverage + 0.30*citations + 0.15*novelty + 0.10*(1 - dedup)
+
+    The ``citations`` component REPLACES the old ``citation_grounding`` +
+    ``arxiv_validity`` pair in the composite. Rationale: both old detectors
+    return a vacuous 1.0 when the artifact cites nothing, so under the old
+    weights an uncited synthesis banked 0.40 of free credit — a research
+    synthesis that cites NOTHING could outscore one that cites well. That is
+    backwards: citing well is a core research-quality requirement, so credit
+    is now earned via ``citations_score`` (0.0 for zero citations; otherwise
+    well-formedness/grounding scaled by distinct-citation richness, capped
+    at 3 distinct citations).
+
+    The individual detector functions keep their original semantics and
+    their raw values stay in the returned dict (``arxiv_validity``,
+    ``citation_grounding``) for compatibility, alongside the new
+    ``citations`` key. Only the composite weighting changed.
+
+    Returns a dict with each sub-score plus the weighted ``composite`` in
+    [0, 1]. The composite uses ``low_dedup = 1 - dedup_overlap`` so that
+    less redundancy scores higher.
     """
     entry = slate_entry or {}
     sources = entry.get("sources") or entry.get("expected_sources") or []
@@ -248,14 +309,14 @@ def research_quality_composite(
 
     arxiv = arxiv_id_validity(output_md)
     grounding = citation_grounding(output_md, list(sources))
+    citations = citations_score(output_md, list(sources))
     coverage = coverage_hits(output_md, list(subtopics))
     dedup = dedup_overlap(list(items))
     novelty = novelty_vs_prior(output_md, list(prior))
 
     composite = (
         _RQ_WEIGHTS["coverage"] * coverage
-        + _RQ_WEIGHTS["citation_grounding"] * grounding
-        + _RQ_WEIGHTS["arxiv_validity"] * arxiv
+        + _RQ_WEIGHTS["citations"] * citations
         + _RQ_WEIGHTS["novelty"] * novelty
         + _RQ_WEIGHTS["low_dedup"] * (1.0 - dedup)
     )
@@ -265,6 +326,7 @@ def research_quality_composite(
     return {
         "arxiv_validity": arxiv,
         "citation_grounding": grounding,
+        "citations": citations,
         "coverage": coverage,
         "dedup_overlap": dedup,
         "novelty": novelty,

@@ -5,6 +5,12 @@ These are pure-python, no-LLM instruments: every fixture below maps a known
 input to a known output. Edge cases covered: empty text, no arXiv IDs claimed,
 full vs partial coverage, total duplication vs all-unique, no-prior novelty,
 and ungrounded citations.
+
+Audit fix H3: the composite now weights coverage 0.45 / citations 0.30 /
+novelty 0.15 / low-dedup 0.10. The ``citations`` component replaces the old
+``citation_grounding`` + ``arxiv_validity`` pair, whose vacuous 1.0s let an
+uncited synthesis bank 0.40 free credit. The individual detector functions
+keep their original (vacuous-1.0) semantics — only the composite changed.
 """
 
 from __future__ import annotations
@@ -15,6 +21,7 @@ from bench.detectors import (
     _RQ_WEIGHTS,
     arxiv_id_validity,
     citation_grounding,
+    citations_score,
     coverage_hits,
     dedup_overlap,
     novelty_vs_prior,
@@ -218,6 +225,54 @@ def test_novelty_partial():
 
 
 # ----------------------------------------------------------------------
+# citations_score (H3 — earned citation credit)
+# ----------------------------------------------------------------------
+
+
+def test_citations_zero_when_nothing_cited():
+    """An output with no URLs AND no arXiv ids earns ZERO citation credit —
+    no more vacuous full marks."""
+    assert citations_score("plain prose, no links, no papers", []) == 0.0
+    assert citations_score("", ["https://a.example/x"]) == 0.0
+
+
+def test_citations_richness_scales_with_distinct_count():
+    # 1 distinct well-formed arXiv id -> wellformed 1.0 * (1/3)
+    assert _close(citations_score("see arXiv:2503.13657", []), 1 / 3)
+    # 1 arXiv id + 1 URL (no sources -> face value) -> 2 distinct -> 2/3
+    two = citations_score("see arXiv:2503.13657 and https://example.com/a", [])
+    assert _close(two, 2 / 3)
+
+
+def test_citations_three_distinct_wellformed_is_full_credit():
+    text = "refs arXiv:2503.13657, arXiv:2310.06825, arXiv:2401.12345"
+    assert _close(citations_score(text, []), 1.0)
+
+
+def test_citations_richness_caps_at_three():
+    text = ("refs arXiv:2503.13657, arXiv:2310.06825, arXiv:2401.12345, "
+            "arXiv:2406.04321 and https://example.com/a")
+    assert _close(citations_score(text, []), 1.0)  # capped, never >1
+
+
+def test_citations_malformed_arxiv_reduces_score():
+    # one good + one malformed id -> wellformed 0.5; 2 distinct -> 2/3 richness
+    text = "ids arXiv:2503.13657 and arXiv:2503.13"
+    assert _close(citations_score(text, []), 0.5 * (2 / 3))
+
+
+def test_citations_ungrounded_urls_with_sources_score_zero():
+    # sources provided -> grounding applies; the lone cited URL is fabricated
+    assert citations_score("x https://fake.example/a", ["https://real.example/b"]) == 0.0
+
+
+def test_citations_urls_face_value_without_sources():
+    # No sources to ground against -> URLs taken at face value, not penalised
+    text = "a https://a.example/1 b https://b.example/2 c https://c.example/3"
+    assert _close(citations_score(text, []), 1.0)
+
+
+# ----------------------------------------------------------------------
 # research_quality_composite
 # ----------------------------------------------------------------------
 
@@ -226,16 +281,26 @@ def test_weights_sum_to_one():
     assert _close(sum(_RQ_WEIGHTS.values()), 1.0)
 
 
+def test_weights_are_the_h3_reweighting():
+    assert _RQ_WEIGHTS == {
+        "coverage": 0.45,
+        "citations": 0.30,
+        "novelty": 0.15,
+        "low_dedup": 0.10,
+    }
+
+
 def test_composite_keys_present():
+    """New 'citations' key present; old keys retained for compatibility."""
     out = research_quality_composite("text", {}, prior=())
-    for key in ("arxiv_validity", "citation_grounding", "coverage",
+    for key in ("arxiv_validity", "citation_grounding", "citations", "coverage",
                 "dedup_overlap", "novelty", "composite"):
         assert key in out
 
 
 def test_composite_perfect_score():
-    # Full coverage, all citations grounded, valid arXiv id, no prior (novel),
-    # distinct sections (low dedup) -> composite must be exactly 1.0.
+    # Full coverage, 3 distinct citations (2 grounded URLs + 1 valid arXiv id),
+    # no prior (novel), distinct sections (low dedup) -> composite exactly 1.0.
     md = (
         "# Scaling\nWe cover scaling laws here, citing https://example.com/a\n"
         "# Methods\nReinforcement learning details from arXiv:2503.13657\n"
@@ -253,21 +318,28 @@ def test_composite_perfect_score():
     assert out["coverage"] == 1.0
     assert out["citation_grounding"] == 1.0
     assert out["arxiv_validity"] == 1.0
+    assert _close(out["citations"], 1.0)  # 3 distinct, all well-formed/grounded
     assert out["novelty"] == 1.0
     assert out["dedup_overlap"] == 0.0
     assert _close(out["composite"], 1.0)
 
 
-def test_composite_worst_score():
-    # Empty markdown: no coverage of expected topics, no arxiv (vacuous 1.0),
-    # no urls (grounding vacuous 1.0), identical prior (novelty 0).
+def test_composite_worst_score_uncited_gets_no_citation_credit():
+    # Empty markdown: no coverage of expected topics, NOTHING cited. The old
+    # composite banked 0.40 vacuous credit here (grounding 0.25 + arxiv 0.15);
+    # under H3 the citations component is 0.0 instead.
     slate = {"expected_subtopics": ["alpha", "beta"], "sources": []}
     out = research_quality_composite("", slate, prior=[""])
     # empty prior text is filtered out -> treated as "no prior" -> novelty 1.0
     assert out["coverage"] == 0.0
     assert out["novelty"] == 1.0
-    # composite = 0.4*0 + 0.25*1 + 0.15*1 + 0.15*1 + 0.05*1
-    assert _close(out["composite"], 0.25 + 0.15 + 0.15 + 0.05)
+    assert out["citations"] == 0.0
+    # Individual detectors keep their vacuous-1.0 semantics (unchanged)...
+    assert out["arxiv_validity"] == 1.0
+    assert out["citation_grounding"] == 1.0
+    # ...but the composite no longer pays for them:
+    # composite = 0.45*0 + 0.30*0 + 0.15*1 + 0.10*1
+    assert _close(out["composite"], 0.15 + 0.10)
 
 
 def test_composite_matches_manual_weighting():
@@ -280,16 +352,38 @@ def test_composite_matches_manual_weighting():
     out = research_quality_composite(md, slate, prior=prior)
     assert _close(out["coverage"], 0.5)
     assert out["citation_grounding"] == 0.0
-    assert out["arxiv_validity"] == 1.0  # no arxiv claimed
+    assert out["arxiv_validity"] == 1.0  # no arxiv claimed (vacuous, unchanged)
+    assert out["citations"] == 0.0  # the one cited URL is ungrounded
     assert _close(out["novelty"], 0.0)
     expected = (
         _RQ_WEIGHTS["coverage"] * out["coverage"]
-        + _RQ_WEIGHTS["citation_grounding"] * out["citation_grounding"]
-        + _RQ_WEIGHTS["arxiv_validity"] * out["arxiv_validity"]
+        + _RQ_WEIGHTS["citations"] * out["citations"]
         + _RQ_WEIGHTS["novelty"] * out["novelty"]
         + _RQ_WEIGHTS["low_dedup"] * (1.0 - out["dedup_overlap"])
     )
     assert _close(out["composite"], expected)
+
+
+def test_cited_output_outscores_uncited_at_equal_coverage():
+    """The H3 headline property: with identical coverage, an output citing 3
+    well-formed arXiv ids beats one citing nothing — by exactly the citations
+    weight. A research synthesis that cites nothing must not outscore (or tie)
+    one that cites well."""
+    expected = ["scaling laws", "reinforcement learning"]
+    base = "We synthesize scaling laws and reinforcement learning results in depth."
+    cited = base + " Key papers: arXiv:2503.13657, arXiv:2310.06825, arXiv:2401.12345."
+    slate = {"expected_subtopics": expected, "sources": []}
+
+    out_uncited = research_quality_composite(base, slate, prior=())
+    out_cited = research_quality_composite(cited, slate, prior=())
+
+    assert out_uncited["coverage"] == out_cited["coverage"] == 1.0  # equal coverage
+    assert out_uncited["citations"] == 0.0
+    assert _close(out_cited["citations"], 1.0)  # 3 distinct well-formed ids
+    assert out_cited["composite"] > out_uncited["composite"]
+    assert _close(
+        out_cited["composite"] - out_uncited["composite"], _RQ_WEIGHTS["citations"]
+    )
 
 
 def test_composite_in_unit_interval():

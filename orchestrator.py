@@ -8,6 +8,7 @@ Usage:
 
 import asyncio
 import json
+import os
 import re
 import sys
 import time
@@ -134,7 +135,22 @@ def _feature_enabled(
     configured: bool,
     override: FeatureOverride,
     enabled_in_max: bool = True,
+    name: str | None = None,
 ) -> bool:
+    # Highest precedence: BLITZ_FEATURE_OVERRIDES env var — a JSON object
+    # mapping feature name -> bool, e.g. '{"judge_ensemble": false}'.
+    # Lets jobs/CI force-toggle a mechanism without touching profile or
+    # config. Malformed JSON or a non-dict payload is ignored (fall through
+    # to the normal precedence chain) so a bad env var can never break a run.
+    if name:
+        raw = os.environ.get("BLITZ_FEATURE_OVERRIDES")
+        if raw:
+            try:
+                env_overrides = json.loads(raw)
+            except (json.JSONDecodeError, ValueError):
+                env_overrides = None
+            if isinstance(env_overrides, dict) and name in env_overrides:
+                return bool(env_overrides[name])
     if override is not None:
         return override
     profile = (profile or "balanced").lower()
@@ -1076,16 +1092,19 @@ async def run_swarm(
         profile=profile,
         configured=runtime_cfg.guard.enabled,
         override=use_cascade_guard,
+        name="cascade_guard",
     )
     judge_ensemble_enabled = _feature_enabled(
         profile=profile,
         configured=runtime_cfg.judge_ensemble.enabled,
         override=use_judge_ensemble,
+        name="judge_ensemble",
     )
     selector_enabled = _feature_enabled(
         profile=profile,
         configured=runtime_cfg.selector.enabled,
         override=use_selector,
+        name="selector",
     )
     guard = (
         CascadeGuard(CascadeGuardConfig(mode=runtime_cfg.guard.mode))

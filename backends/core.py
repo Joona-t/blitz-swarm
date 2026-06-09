@@ -48,7 +48,8 @@ class AgentCall:
     system_prompt: str = ""
     schema: dict | None = None
     model: str | None = None
-    timeout_s: int = 120
+    # Measured live claude calls run 150-240s; 120 starved them (C5b).
+    timeout_s: int = 600
     cwd: Path | None = None
     sandbox: str = DEFAULT_SANDBOX
     approval_policy: str = DEFAULT_APPROVAL

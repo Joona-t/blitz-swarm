@@ -8,10 +8,17 @@ and a matching metrics.jsonl record. We assert that:
     detectors.research_quality_composite()
   * aggregate() surfaces summary["functional_composite"] with the exact
     SHARED CONTRACT shape the driver reads:
-        {"mean": <float 0..1>, "per_prompt": {prompt_id: composite}}
+        {"mean": <float 0..1> | None,
+         "per_prompt": {prompt_id: composite},
+         "missing": [prompt_id, ...]}
   * the LLM-judge scores remain under summary["aggregate_quality"] (SECONDARY)
-  * timeout / error prompts get a zeroed composite (failed work drags the
-    functional mean down, never silently counts as perfect)
+  * C5a: timeout / error prompts get a MISSING (None) composite — they are
+    EXCLUDED from the functional mean (never averaged in as 0.0) and surfaced
+    in summary["functional_composite"]["missing"] + summary["timeouts"];
+    when ALL prompts are missing the mean is None, not 0.0
+  * H4: metrics-record matching normalizes topics (whitespace/case/120-char
+    drift) and logs one loud MATCHED/MISS line per prompt; a miss never
+    crashes — cost/tokens stay 0
   * the G6 detect_all hook fires only when per-agent round outputs exist
     (sibling rounds.json) and stays empty otherwise — no fabrication.
 
@@ -36,6 +43,7 @@ from bench.runner import (
     BenchConfig,
     PromptResult,
     _append_jsonl,
+    _find_metrics_record_for_topic,
     _load_round_outputs,
     _slate_entry_for,
     aggregate,
@@ -126,6 +134,11 @@ def _fake_swarm_writing(md: str, metrics_path: Path, out_path: Path):
 # ---------------------------------------------------------------------------
 
 
+def test_default_per_prompt_timeout_is_3600():
+    """C5a: hard research prompts exceed 20 min; the default budget is 1 h."""
+    assert BenchConfig(slate_path=Path("x")).per_prompt_timeout_s == 3600
+
+
 def test_slate_entry_maps_coverage_to_subtopics():
     """_slate_entry_for exposes expected_coverage under expected_subtopics
     so the composite's coverage sub-score has ground-truth targets."""
@@ -179,8 +192,8 @@ async def test_run_one_prompt_populates_functional_composite(tmp_path):
 
     assert isinstance(result, PromptResult)
     fc = result.functional_composite
-    # Sub-scores all present.
-    for key in ("arxiv_validity", "citation_grounding", "coverage",
+    # Sub-scores all present (incl. the H3 'citations' component).
+    for key in ("arxiv_validity", "citation_grounding", "citations", "coverage",
                 "dedup_overlap", "novelty", "composite"):
         assert key in fc
     assert isinstance(fc["composite"], float)
@@ -252,9 +265,10 @@ def _write_row(run_dir: Path, prompt_id: str, composite_dict: dict,
 
 
 def test_aggregate_surfaces_functional_composite_contract(tmp_path):
-    """summary['functional_composite'] == {'mean': float 0..1,
-    'per_prompt': {id: composite}} — the exact driver contract — and the
-    LLM-judge scores stay under summary['aggregate_quality'].
+    """summary['functional_composite'] == {'mean': float 0..1 | None,
+    'per_prompt': {id: composite}, 'missing': [ids]} — the exact driver
+    contract — and the LLM-judge scores stay under
+    summary['aggregate_quality'].
 
     Uses real slate ids (s001/s002) because aggregate()'s by_tier pass looks
     every prompt_id up in the slate.
@@ -270,35 +284,76 @@ def test_aggregate_surfaces_functional_composite_contract(tmp_path):
 
     assert "functional_composite" in summary
     fc = summary["functional_composite"]
-    assert set(fc.keys()) == {"mean", "per_prompt"}
+    assert set(fc.keys()) == {"mean", "per_prompt", "missing"}
     assert isinstance(fc["mean"], float)
     assert 0.0 <= fc["mean"] <= 1.0
     assert fc["mean"] == round((0.8 + 0.6) / 2, 4)
     assert fc["per_prompt"] == {"s001": 0.8, "s002": 0.6}
+    assert fc["missing"] == []  # nothing timed out / errored
+    assert summary["timeouts"] == []
 
     # SECONDARY signal retained.
     assert "aggregate_quality" in summary
     assert summary["aggregate_quality"]["avg"]["mean"] > 0
 
 
-def test_aggregate_mean_drops_when_prompt_fails(tmp_path):
-    """A timed-out / errored prompt contributes a 0.0 composite, pulling the
-    functional mean down rather than being silently ignored."""
+def test_aggregate_excludes_missing_composite_from_mean(tmp_path):
+    """C5a: a timed-out prompt's composite is MISSING (None) — excluded from
+    the functional mean, never averaged in as 0.0. mean([0.9, None, 0.9])
+    must be 0.9, with the missing id surfaced in fc['missing'] and the
+    timeout surfaced in summary['timeouts']."""
     run_dir = tmp_path / "run"
     run_dir.mkdir()
-    _write_row(run_dir, "s001", {**_zero(), "composite": 1.0})
-    _write_row(run_dir, "s002", _zero(), timeout=True, error="timeout")
+    _write_row(run_dir, "s001", {**_zero(), "composite": 0.9})
+    _write_row(run_dir, "s002", _missing(), timeout=True, error="timeout")
+    _write_row(run_dir, "s003", {**_zero(), "composite": 0.9})
 
     slate = load_slate("bench/slate_v1.toml")
     summary = aggregate(run_dir, slate, _make_cfg())
     fc = summary["functional_composite"]
-    assert fc["per_prompt"]["s002"] == 0.0
-    assert fc["mean"] == 0.5  # (1.0 + 0.0) / 2
+    assert fc["mean"] == 0.9  # NOT (0.9 + 0.0 + 0.9) / 3
+    assert "s002" not in fc["per_prompt"]
+    assert fc["per_prompt"] == {"s001": 0.9, "s003": 0.9}
+    assert fc["missing"] == ["s002"]  # loud, machine-readable
+    assert summary["timeouts"] == ["s002"]
+
+
+def test_aggregate_errored_prompt_is_missing_not_zero(tmp_path):
+    """C5a applies to errored (not just timed-out) prompts: excluded from the
+    mean, listed in missing, but NOT in summary['timeouts']."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _write_row(run_dir, "s001", {**_zero(), "composite": 0.8})
+    _write_row(run_dir, "s002", _missing(), error="RuntimeError('boom')")
+
+    slate = load_slate("bench/slate_v1.toml")
+    summary = aggregate(run_dir, slate, _make_cfg())
+    fc = summary["functional_composite"]
+    assert fc["mean"] == 0.8
+    assert fc["missing"] == ["s002"]
+    assert summary["timeouts"] == []  # errored, not timed out
+
+
+def test_aggregate_all_missing_mean_is_none(tmp_path):
+    """C5a: if EVERY prompt is missing, the mean is None — 'no signal', not
+    'measured zero quality'. The driver then falls back to the judge avg."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _write_row(run_dir, "s001", _missing(), timeout=True, error="timeout")
+    _write_row(run_dir, "s002", _missing(), timeout=True, error="timeout")
+
+    slate = load_slate("bench/slate_v1.toml")
+    summary = aggregate(run_dir, slate, _make_cfg())
+    fc = summary["functional_composite"]
+    assert fc["mean"] is None  # NOT 0.0
+    assert fc["per_prompt"] == {}
+    assert fc["missing"] == ["s001", "s002"]
+    assert summary["timeouts"] == ["s001", "s002"]
 
 
 def test_aggregate_handles_legacy_rows_without_composite(tmp_path):
-    """Rows predating the wiring (no functional_composite key) are skipped,
-    not crashed on — keeps aggregate backward-compatible."""
+    """Rows predating the wiring (no functional_composite key) are treated as
+    missing, not crashed on — keeps aggregate backward-compatible."""
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     # A row missing functional_composite entirely.
@@ -315,8 +370,11 @@ def test_aggregate_handles_legacy_rows_without_composite(tmp_path):
 
     slate = load_slate("bench/slate_v1.toml")
     summary = aggregate(run_dir, slate, _make_cfg())
-    # No composite rows -> empty per_prompt, mean 0.0, no exception.
-    assert summary["functional_composite"] == {"mean": 0.0, "per_prompt": {}}
+    # No scoreable rows -> empty per_prompt, mean None (not 0.0), row listed
+    # as missing, no exception.
+    assert summary["functional_composite"] == {
+        "mean": None, "per_prompt": {}, "missing": ["s001"],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -345,6 +403,164 @@ def test_stats_md_shows_functional_composite(tmp_path):
     assert "PRIMARY" in text
     assert "0.77" in text
     assert "SECONDARY" in text  # judge section labelled secondary
+
+
+def test_stats_md_handles_all_missing_mean_none(tmp_path):
+    """C5a: a None mean renders as n/a (never crashes / never prints 0.0) and
+    the missing + timed-out prompt ids are surfaced on the page."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    summary = {
+        "run_id": "abc", "started_utc": "x", "ended_utc": "y",
+        "slate": {"slate_id": "v1", "sha256": "a" * 64,
+                  "prompts_run": 0, "prompt_count": 2,
+                  "prompts_timed_out": 2, "prompts_errored": 0},
+        "functional_composite": {"mean": None, "per_prompt": {},
+                                 "missing": ["s001", "s002"]},
+        "timeouts": ["s001", "s002"],
+        "aggregate_quality": {"avg": {"mean": 0.0, "stddev": 0.0, "ci95": [0.0, 0.0]}},
+        "by_tier": {"easy": {"n": 0, "avg_quality": 0, "avg_cost": 0},
+                    "medium": {"n": 0, "avg_quality": 0, "avg_cost": 0},
+                    "hard": {"n": 0, "avg_quality": 0, "avg_cost": 0}},
+        "mast_flags_summary": {},
+        "cost": {"total_usd": 0.0, "input_tokens_total": 0, "output_tokens_total": 0},
+    }
+    text = write_stats_md(run_dir, summary).read_text()
+    assert "n/a" in text
+    assert "Missing (timeout/error" in text
+    assert "Timed out: s001, s002" in text
+    assert "**0.0**" not in text  # all-missing must never masquerade as zero
+
+
+# ---------------------------------------------------------------------------
+# H4 — robust metrics-record matching + loud MATCHED/MISS logging
+# ---------------------------------------------------------------------------
+
+
+def test_find_metrics_record_matches_despite_topic_drift(tmp_path):
+    """Normalized matching: trailing newline, doubled spaces, leading space,
+    and case drift in the logged topic must still match the prompt text."""
+    metrics_path = tmp_path / "metrics.jsonl"
+    logged = {
+        "topic": "  explain SQLite  WAL mode  Internals.\n",
+        "timestamp": 100.0,
+        "total_cost_usd": 0.10,
+    }
+    metrics_path.write_text(json.dumps(logged) + "\n", encoding="utf-8")
+
+    rec = _find_metrics_record_for_topic(
+        "Explain SQLite WAL mode internals.", metrics_path=metrics_path,
+    )
+    assert rec is not None
+    assert rec["total_cost_usd"] == 0.10
+
+
+def test_find_metrics_record_matches_on_first_120_chars(tmp_path):
+    """Long topics: only the first 120 normalized chars are compared, so a
+    truncated/embellished tail in metrics.jsonl still matches."""
+    head = "word " * 30  # 150 chars collapsed -> first 120 compared
+    metrics_path = tmp_path / "metrics.jsonl"
+    metrics_path.write_text(
+        json.dumps({"topic": head + "logged-tail", "timestamp": 1.0}) + "\n",
+        encoding="utf-8",
+    )
+    rec = _find_metrics_record_for_topic(head + "asked-tail", metrics_path=metrics_path)
+    assert rec is not None
+
+
+def test_find_metrics_record_different_topics_still_miss(tmp_path):
+    """Normalization must not over-match: genuinely different topics miss."""
+    metrics_path = tmp_path / "metrics.jsonl"
+    metrics_path.write_text(
+        json.dumps({"topic": "completely different subject", "timestamp": 1.0}) + "\n",
+        encoding="utf-8",
+    )
+    assert _find_metrics_record_for_topic("SQLite WAL", metrics_path=metrics_path) is None
+
+
+@pytest.mark.asyncio
+async def test_run_one_prompt_matches_metrics_despite_drift_and_logs(tmp_path, capsys):
+    """End-to-end H4: the swarm logs the topic with whitespace drift; the
+    runner still finds the record (cost/tokens populated) and prints the loud
+    MATCHED line for the prompt id."""
+    metrics_path = tmp_path / "metrics.jsonl"
+    metrics_path.touch()
+    out_path = tmp_path / "out.md"
+
+    async def drifting_swarm(topic: str, *, max_rounds: int = 4, use_redis: bool = False) -> Path:
+        out_path.write_text(_GOOD_MD, encoding="utf-8")
+        record = {
+            "run_id": "drift_run",
+            "topic": topic.upper() + " \n",  # case + trailing-whitespace drift
+            "timestamp": time.time(),
+            "total_cost_usd": 0.10,
+            "total_input_tokens": 1500,
+            "total_output_tokens": 300,
+            "consensus_reached": True,
+            "rounds_to_consensus": 1,
+            "avg_quality": 7.5,
+        }
+        with metrics_path.open("a") as f:
+            f.write(json.dumps(record) + "\n")
+        return out_path
+
+    result = await run_one_prompt(
+        _make_prompt(), _make_cfg(), tmp_path, swarm_fn=drifting_swarm,
+        metrics_path=metrics_path, prior=[],
+    )
+    assert result.cost_usd == 0.10  # record found despite drift
+    assert result.input_tokens == 1500
+    assert "metrics record MATCHED for f001" in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+async def test_run_one_prompt_metrics_miss_is_loud_not_fatal(tmp_path, capsys):
+    """A metrics miss must not crash: cost/tokens stay 0, the prompt still
+    gets its functional composite, and the loud MISS line names the prompt."""
+    metrics_path = tmp_path / "metrics.jsonl"
+    metrics_path.touch()
+    out_path = tmp_path / "out.md"
+
+    async def silent_swarm(topic: str, *, max_rounds: int = 4, use_redis: bool = False) -> Path:
+        out_path.write_text(_GOOD_MD, encoding="utf-8")
+        return out_path  # writes NO metrics record
+
+    result = await run_one_prompt(
+        _make_prompt(), _make_cfg(), tmp_path, swarm_fn=silent_swarm,
+        metrics_path=metrics_path, prior=[],
+    )
+    assert result.error is None  # no crash
+    assert result.cost_usd == 0.0
+    assert result.input_tokens == 0 and result.output_tokens == 0
+    assert result.functional_composite["composite"] is not None  # still scored
+    assert "metrics record MISS for f001" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# C5a — timeout produces a MISSING composite on the row itself
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_one_prompt_timeout_composite_is_missing(tmp_path):
+    """A timed-out prompt's functional_composite is all-None (MISSING), so
+    aggregate() can exclude it from the mean instead of averaging 0.0."""
+    metrics_path = tmp_path / "metrics.jsonl"
+    metrics_path.touch()
+
+    async def hang_swarm(topic: str, *, max_rounds: int = 4, use_redis: bool = False) -> Path:
+        await asyncio.sleep(30)
+        raise AssertionError("unreachable")
+
+    cfg = _make_cfg()
+    cfg.per_prompt_timeout_s = 0.05
+    result = await run_one_prompt(
+        _make_prompt(), cfg, tmp_path, swarm_fn=hang_swarm,
+        metrics_path=metrics_path, prior=[],
+    )
+    assert result.timeout is True
+    assert result.functional_composite["composite"] is None
+    assert all(v is None for v in result.functional_composite.values())
 
 
 # ---------------------------------------------------------------------------
@@ -438,8 +654,14 @@ def _zero() -> dict:
     return {
         "arxiv_validity": 0.0,
         "citation_grounding": 0.0,
+        "citations": 0.0,
         "coverage": 0.0,
         "dedup_overlap": 0.0,
         "novelty": 0.0,
         "composite": 0.0,
     }
+
+
+def _missing() -> dict:
+    """Mirror of runner._MISSING_COMPOSITE: what timeout/error rows carry."""
+    return {key: None for key in _zero()}

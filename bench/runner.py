@@ -64,7 +64,9 @@ class BenchConfig:
     slate_filter_tiers: tuple[str, ...] = ()
     slate_filter_domains: tuple[str, ...] = ()
     parallel_prompts: int = 2
-    per_prompt_timeout_s: int = 1200
+    # Audit fix C5a: hard research prompts routinely exceed 20 min; the old
+    # 1200s default produced spurious timeouts that poisoned the bench mean.
+    per_prompt_timeout_s: int = 3600
     total_budget_usd: float = 8.00
     max_rounds: int = 4
     use_redis: bool = False
@@ -98,7 +100,8 @@ class PromptResult:
     consensus_reached: bool
     rounds_to_consensus: int
     quality: dict          # {coverage, accuracy, clarity, depth, avg} — LLM-judge (SECONDARY)
-    functional_composite: dict  # research_quality_composite() output (PRIMARY signal)
+    functional_composite: dict  # research_quality_composite() output (PRIMARY signal);
+                                # all-None (MISSING) on timeout/error — excluded from mean (C5a)
     coverage_hits: int
     coverage_total: int
     timeout: bool
@@ -174,6 +177,19 @@ def _coverage_count(md: str, expected: list[str]) -> int:
     return hits
 
 
+def _normalize_topic(topic: str) -> str:
+    """Normalize a topic string for robust metrics-record matching (H4).
+
+    Collapses every whitespace run to a single space, strips, casefolds, and
+    truncates to the first 120 characters. This tolerates the drift we have
+    observed between the prompt text the runner sends and the topic the swarm
+    writes to metrics.jsonl (trailing newlines, double spaces, case changes,
+    long-topic truncation) — drift that used to silently zero cost/tokens.
+    """
+    collapsed = " ".join((topic or "").split())
+    return collapsed.casefold()[:120]
+
+
 def _find_metrics_record_for_topic(
     topic: str,
     *,
@@ -182,11 +198,15 @@ def _find_metrics_record_for_topic(
 ) -> dict | None:
     """Find the most recent metrics.jsonl record matching the topic.
 
-    If after_timestamp is given, only rows with timestamp > after_timestamp
-    are considered (used to avoid picking up an old run with the same topic).
+    Audit fix H4: topics are compared via ``_normalize_topic`` (collapse
+    whitespace, strip, casefold, first 120 chars) instead of exact string
+    equality, PLUS the existing after-timestamp window so an old run with the
+    same topic is never picked up. A miss returns None — the caller logs it
+    loudly and records cost/tokens as 0 rather than crashing.
     """
     if not metrics_path.exists():
         return None
+    want = _normalize_topic(topic)
     matches: list[dict] = []
     with metrics_path.open() as f:
         for line in f:
@@ -197,7 +217,7 @@ def _find_metrics_record_for_topic(
                 row = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if row.get("topic") != topic:
+            if _normalize_topic(str(row.get("topic") or "")) != want:
                 continue
             if after_timestamp is not None and float(row.get("timestamp", 0)) <= after_timestamp:
                 continue
@@ -238,15 +258,20 @@ def _slate_entry_for(prompt: BenchPrompt) -> dict:
 
 
 # A composite scorecard for prompts that never produced an artifact
-# (timeout / error). All sub-scores zeroed so a failed prompt drags the
-# functional mean down rather than being silently treated as perfect.
-_ZERO_COMPOSITE: dict = {
-    "arxiv_validity": 0.0,
-    "citation_grounding": 0.0,
-    "coverage": 0.0,
-    "dedup_overlap": 0.0,
-    "novelty": 0.0,
-    "composite": 0.0,
+# (timeout / error). Audit fix C5a: the composite is MISSING (None), not 0.0.
+# A prompt that never finished tells us nothing about artifact quality, so it
+# must be EXCLUDED from the functional mean — scoring it 0.0 punished slow
+# backends twice (timeout flag AND a quality crater) and poisoned A/B
+# comparisons. Missing prompts are surfaced loudly instead, via
+# summary["functional_composite"]["missing"] and summary["timeouts"].
+_MISSING_COMPOSITE: dict = {
+    "arxiv_validity": None,
+    "citation_grounding": None,
+    "citations": None,
+    "coverage": None,
+    "dedup_overlap": None,
+    "novelty": None,
+    "composite": None,
 }
 
 
@@ -330,6 +355,17 @@ async def run_one_prompt(
     record = _find_metrics_record_for_topic(
         prompt.text, metrics_path=metrics_path, after_timestamp=pre_run_timestamp,
     )
+    # H4: one loud line per prompt so a metrics miss is never silent. A miss
+    # must not crash the run — cost/tokens stay 0 — but it must be visible.
+    if record is not None:
+        print(f"[bench] metrics record MATCHED for {prompt.id}", flush=True)
+    else:
+        print(
+            f"[bench] metrics record MISS for {prompt.id} — no metrics.jsonl row "
+            f"matched the normalized topic in the post-start window; "
+            f"cost/tokens recorded as 0",
+            flush=True,
+        )
 
     md = ""
     if isinstance(out_path, Path) and out_path.exists():
@@ -400,7 +436,7 @@ def _timeout_result(prompt: BenchPrompt, run_dir: Path, started: float, started_
         consensus_reached=False,
         rounds_to_consensus=0,
         quality={"coverage": 0, "accuracy": 0, "clarity": 0, "depth": 0, "avg": 0.0},
-        functional_composite=dict(_ZERO_COMPOSITE),
+        functional_composite=dict(_MISSING_COMPOSITE),
         coverage_hits=0,
         coverage_total=len(prompt.expected_coverage),
         timeout=True,
@@ -426,7 +462,7 @@ def _error_result(
         consensus_reached=False,
         rounds_to_consensus=0,
         quality={"coverage": 0, "accuracy": 0, "clarity": 0, "depth": 0, "avg": 0.0},
-        functional_composite=dict(_ZERO_COMPOSITE),
+        functional_composite=dict(_MISSING_COMPOSITE),
         coverage_hits=0,
         coverage_total=len(prompt.expected_coverage),
         timeout=False,
@@ -498,17 +534,39 @@ def aggregate(run_dir: Path, slate: BenchSlate, cfg: BenchConfig) -> dict:
 
     # PRIMARY signal — functional research-quality composite (deterministic).
     # CONTRACT (read by the driver's _bench_avg_quality):
-    #   summary["functional_composite"] = {"mean": <float 0..1>,
-    #                                       "per_prompt": {prompt_id: composite}}
+    #   summary["functional_composite"] = {
+    #       "mean": <float 0..1> | None,        # None when NO prompt was scoreable
+    #       "per_prompt": {prompt_id: composite},  # scored prompts only
+    #       "missing": [prompt_id, ...],        # timeout/error rows, EXCLUDED from mean
+    #   }
+    # Audit fix C5a: a timed-out or errored prompt has no artifact to score.
+    # Its composite is MISSING (None) and must not contribute 0.0 to the mean
+    # — that punished slow backends twice and poisoned A/B comparisons. If
+    # every prompt is missing, mean is None (not 0.0): "no signal", never
+    # "measured zero quality". The driver falls back to the judge avg then.
     fc_per_prompt: dict[str, float] = {}
+    fc_missing: list[str] = []
     for r in rows:
+        pid = r.get("prompt_id")
+        if not pid:
+            continue
         fc = r.get("functional_composite") or {}
         comp = fc.get("composite")
         if comp is None:
+            fc_missing.append(pid)
             continue
-        fc_per_prompt[r["prompt_id"]] = round(float(comp), 4)
-    fc_mean = round(statistics.mean(fc_per_prompt.values()), 4) if fc_per_prompt else 0.0
-    functional_composite = {"mean": fc_mean, "per_prompt": fc_per_prompt}
+        fc_per_prompt[pid] = round(float(comp), 4)
+    fc_mean = (
+        round(statistics.mean(fc_per_prompt.values()), 4) if fc_per_prompt else None
+    )
+    functional_composite = {
+        "mean": fc_mean,
+        "per_prompt": fc_per_prompt,
+        "missing": sorted(fc_missing),
+    }
+    timeout_ids = sorted({
+        r["prompt_id"] for r in rows if r.get("timeout") and r.get("prompt_id")
+    })
 
     summary = {
         "schema_version": 1,
@@ -539,6 +597,8 @@ def aggregate(run_dir: Path, slate: BenchSlate, cfg: BenchConfig) -> dict:
         },
         # PRIMARY: deterministic functional research-quality composite.
         "functional_composite": functional_composite,
+        # C5a: prompt ids that hit per_prompt_timeout_s — loud, machine-readable.
+        "timeouts": timeout_ids,
         # SECONDARY: LLM-judge aggregate (kept for comparison, no longer the
         # gating signal — the driver reads functional_composite.mean first).
         "aggregate_quality": by_dim,
@@ -582,7 +642,21 @@ def write_stats_md(run_dir: Path, summary: dict) -> Path:
     fc = summary.get("functional_composite") or {}
     lines.append("## Functional research-quality composite (0-1) — PRIMARY")
     lines.append("")
-    lines.append(f"Mean composite: **{fc.get('mean', 0.0)}**")
+    fc_mean = fc.get("mean")
+    if fc_mean is None:
+        lines.append("Mean composite: **n/a — no scoreable prompts (all missing)**")
+    else:
+        lines.append(f"Mean composite: **{fc_mean}**")
+    missing = fc.get("missing") or []
+    if missing:
+        lines.append("")
+        lines.append(
+            f"Missing (timeout/error — excluded from mean): {', '.join(missing)}"
+        )
+    timeouts = summary.get("timeouts") or []
+    if timeouts:
+        lines.append("")
+        lines.append(f"Timed out: {', '.join(timeouts)}")
     lines.append("")
     per_prompt = fc.get("per_prompt") or {}
     if per_prompt:
@@ -748,7 +822,7 @@ def main():
     ap.add_argument("--parallel", type=int, default=2)
     ap.add_argument("--budget", type=float, default=8.0)
     ap.add_argument("--max-rounds", type=int, default=4)
-    ap.add_argument("--per-prompt-timeout", type=int, default=1200)
+    ap.add_argument("--per-prompt-timeout", type=int, default=3600)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--use-redis", action="store_true")
     args = ap.parse_args()

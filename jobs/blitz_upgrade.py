@@ -35,6 +35,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import tomllib
@@ -352,6 +353,30 @@ class JobState:
         phase-terminal computations like verify's significance pass (B6)."""
         return dict(self.phase(name).get("cell_results", {}))
 
+    def cells_failed(self, name: str) -> set[str]:
+        """Cells that exhausted their retries (C4). Excluded from samples —
+        a failed cell is MISSING data, never a 0.0 score."""
+        return set(self.phase(name).get("cells_failed", []))
+
+    def mark_cell_failed(self, name: str, cell_id: str, *, error: str = "",
+                         attempts: int = 0, tokens: int = 0) -> None:
+        """Record a cell as permanently failed for this job run (C4).
+
+        Failed cells are skipped on resume (like done cells) but contribute NO
+        sample data. The error + attempt count are persisted for the report.
+        Tokens consumed by the failed attempts are still accounted by the
+        caller via the tracker; here we only record them for auditability.
+        """
+        entry = self.phase(name)
+        failed = entry.setdefault("cells_failed", [])
+        if cell_id not in failed:
+            failed.append(cell_id)
+        entry.setdefault("cell_errors", {})[cell_id] = {
+            "error": (error or "")[:500], "attempts": int(attempts),
+            "tokens": int(tokens),
+        }
+        self.save()
+
     def set_status(self, name: str, status: str) -> None:
         self.phase(name)["status"] = status
         self.save()
@@ -467,6 +492,30 @@ def _invoke_dry(kind: str, **kw: Any) -> dict[str, Any]:
         # dry-run path never shells out (B5).
         return {"ok": True, "kind": kind, "tokens": 0, "artifact": None,
                 "result": {"regression": True, "dry_run": True}}
+    if kind == "extract":
+        # C1 — candidate extraction from research outputs. Dry-run delegates to
+        # the candidates module's deterministic fake path (stdlib-pure, no
+        # subprocess, stable-hash based — B4/B5 safe).
+        from jobs import candidates as _cand  # noqa: PLC0415
+        md_paths = list(kw.get("md_paths", []))
+        top_n = int(kw.get("top_n", 3))
+        cands = _cand.extract_candidates(md_paths, top_n, dry_run=True)
+        return {"ok": True, "kind": kind,
+                "tokens": _DRY_RUN_TOKENS_PER_CELL + _stable_hash(("extract", top_n)) % 500,
+                "artifact": None,
+                "result": {"candidates": cands, "dry_run": True}}
+    if kind == "single_agent":
+        # H1 — the true self-consistency floor sample: ONE agent, no swarm.
+        # Composite is on the SAME 0-1 scale the verify phase scores on, so the
+        # gate's floor comparison is finally apples-to-apples.
+        topic = str(kw.get("topic", ""))
+        k = int(kw.get("seed", 0))
+        comp = 0.45 + (_stable_hash(("floor", topic, k)) % 35) / 100.0  # 0.45-0.79
+        return {"ok": True, "kind": kind,
+                "tokens": 800 + _stable_hash(("floor-tok", topic, k)) % 200,
+                "artifact": None,
+                "result": {"topic": topic, "seed": k,
+                           "composite": round(comp, 4), "dry_run": True}}
     seed = int(kw.get("seed", 0))
     topic = str(kw.get("topic", kw.get("task", "")))
     technique = str(kw.get("technique", ""))
@@ -476,6 +525,25 @@ def _invoke_dry(kind: str, **kw: Any) -> dict[str, Any]:
     h = _stable_hash((kind, topic, technique, arm, seed)) % 500
     tokens = _DRY_RUN_TOKENS_PER_CELL + h
     fake_path = f"<dry-run:{kind}:{technique or arm or 'x'}:{str(seed)}>"
+    if kind == "bench_ablation":
+        # H2 — verify cells carry PER-PROMPT composites (0-1 scale) so the
+        # significance pass pairs per-(seed, prompt) deltas, not per-seed means.
+        # Base differs per (technique, arm) so some techniques win and some
+        # lose; jitter differs per (seed, prompt) so the stats path has real
+        # variance (G5). All stable-hash derived (B4).
+        pids = list(kw.get("prompt_ids", [])) or [f"p{i}" for i in range(1, 5)]
+        per_prompt: dict[str, float] = {}
+        for pid in pids:
+            base = 0.50 + (_stable_hash((technique, arm)) % 30) / 100.0
+            jit = (_stable_hash(("pp-jitter", technique, arm, seed, pid)) % 10) / 100.0
+            per_prompt[pid] = round(min(base + jit, 1.0), 4)
+        mean = round(sum(per_prompt.values()) / len(per_prompt), 4)
+        return {
+            "ok": True, "kind": kind, "tokens": tokens, "artifact": fake_path,
+            "result": {"technique": technique, "arm": arm, "seed": seed,
+                       "avg_quality": mean, "per_prompt": per_prompt,
+                       "dry_run": True},
+        }
     # A deterministic fake quality score so the gate decision rule exercises
     # both keep / drop branches across techniques. The base is per-(technique,
     # arm); a small seed-dependent jitter makes the K seeds DIFFER so the
@@ -603,6 +671,59 @@ def _invoke_live(kind: str, *, tracker: BudgetTracker, **kw: Any) -> dict[str, A
                        "cost_usd": float(rec.get("total_cost_usd", 0) or 0) if rec else 0.0},
         }
 
+    if kind == "extract":
+        # LIVE (C1): structured candidate extraction from the research phase's
+        # markdown outputs — one schema'd CLI call, parsed/validated by the
+        # candidates module. Returns [] on failure; the phase decides fallback.
+        from jobs import candidates as _cand  # noqa: PLC0415
+
+        md_paths = list(kw.get("md_paths", []))
+        top_n = int(kw.get("top_n", 3))
+        cands = _cand.extract_candidates(md_paths, top_n, dry_run=False,
+                                         timeout_s=int(kw.get("timeout_s", 240)))
+        # Conservative token estimate (errs HIGH): the md context we sent.
+        est = sum(min(Path(p).stat().st_size, 48_000) for p in md_paths
+                  if Path(p).exists()) // 3 + 2_000
+        return {"ok": bool(cands), "kind": kind, "tokens": est,
+                "artifact": None,
+                "result": {"candidates": cands,
+                           "error": None if cands else "extraction produced no candidates"}}
+
+    if kind == "single_agent":
+        # LIVE (H1): ONE direct backend call — the true self-consistency floor
+        # sample (Wang-style cheap baseline the swarm must beat). Scored by the
+        # SAME functional composite (0-1) the verify phase uses, so the gate's
+        # floor comparison is apples-to-apples.
+        from backends.adapters.cli import ClaudeCLIBackend  # noqa: PLC0415
+        from backends.core import AgentCall  # noqa: PLC0415
+        from bench.detectors import research_quality_composite  # noqa: PLC0415
+
+        backend = ClaudeCLIBackend()
+        call = AgentCall(
+            prompt=(f"Research task:\n{topic}\n\nWrite a thorough, well-cited "
+                    f"research synthesis. Cite arXiv IDs where applicable."),
+            system_prompt="You are a careful research analyst. Be concrete and cite sources.",
+            model=str(kw.get("model", "sonnet")),
+            timeout_s=int(kw.get("timeout_s", 600)),
+        )
+        ar = backend.call(call)
+        text = (getattr(ar, "text", "") or "")
+        if not text and isinstance(getattr(ar, "parsed", None), dict):
+            text = str(ar.parsed.get("result", ""))
+        tokens = int(getattr(ar, "input_tokens", 0) or 0) + int(getattr(ar, "output_tokens", 0) or 0)
+        errored = bool(getattr(ar, "errored", False)) or not text.strip()
+        comp = 0.0
+        if not errored:
+            entry = {"expected_subtopics": list(kw.get("expected_subtopics", [])),
+                     "sources": []}
+            scores = research_quality_composite(text, entry)
+            comp = float(scores.get("composite", 0) or 0)
+        return {"ok": not errored, "kind": kind, "tokens": tokens,
+                "artifact": None,
+                "result": {"topic": topic, "seed": seed,
+                           "composite": round(comp, 4),
+                           "error": getattr(ar, "error", None) if errored else None}}
+
     if kind == "mythos":
         # LIVE: mythos hierarchical planner/executor/verifier. Call run_mythos
         # directly (the CLI does not surface the MythosResult). Honour the
@@ -634,13 +755,18 @@ def _invoke_live(kind: str, *, tracker: BudgetTracker, **kw: Any) -> dict[str, A
         }
 
     if kind == "bench_ablation":
-        # LIVE: run the bench harness on the upgrade slate for one ablation arm
-        # (mechanism on vs off) at one seed. run_bench is async and returns the
-        # run dir; the per-prompt quality/cost live in results.jsonl + summary.
+        # LIVE: run the bench harness on a mini-slate for one ablation arm at
+        # one seed. C2 — the arm ACTUALLY toggles the technique's mechanism via
+        # the BLITZ_FEATURE_OVERRIDES env (consumed by orchestrator's
+        # _feature_enabled). Cells run sequentially in _run_cells, so a
+        # process-env toggle is race-free; try/finally guarantees cleanup.
         from bench.runner import BenchConfig, run_bench  # noqa: PLC0415
 
+        technique = str(kw.get("technique", ""))
+        arm = str(kw.get("arm", ""))
         cfg = BenchConfig(
             slate_path=Path(kw["slate"]),
+            slate_filter_ids=tuple(kw.get("prompt_ids", ())),  # C3 mini-slate
             parallel_prompts=int(kw.get("parallel", 2)),
             total_budget_usd=float(kw.get("budget", 8.0)),
             max_rounds=int(kw.get("max_rounds", 4)),
@@ -648,17 +774,31 @@ def _invoke_live(kind: str, *, tracker: BudgetTracker, **kw: Any) -> dict[str, A
             seed=int(seed),
             backend_id=kw.get("backend_id"),  # claude-only honored in verify too
         )
-        run_dir = asyncio.run(run_bench(cfg))
+        prev = os.environ.get("BLITZ_FEATURE_OVERRIDES")
+        os.environ["BLITZ_FEATURE_OVERRIDES"] = json.dumps(
+            {technique: arm == "on"})
+        try:
+            run_dir = asyncio.run(run_bench(cfg))
+        finally:
+            if prev is None:
+                os.environ.pop("BLITZ_FEATURE_OVERRIDES", None)
+            else:
+                os.environ["BLITZ_FEATURE_OVERRIDES"] = prev
         summary = _read_bench_summary(run_dir)
+        fc = summary.get("functional_composite") or {}
+        per_prompt = {k: v for k, v in (fc.get("per_prompt") or {}).items()
+                      if isinstance(v, (int, float))}
         return {
             "ok": True,
             "kind": kind,
             "tokens": _bench_tokens(summary),
             "artifact": str(run_dir),
             "result": {
-                "arm": kw.get("arm", ""),
+                "technique": technique,
+                "arm": arm,
                 "seed": seed,
                 "avg_quality": _bench_avg_quality(summary),
+                "per_prompt": per_prompt,  # H2: per-(seed,prompt) pairing data
                 "summary_path": str(run_dir / "summary.json"),
             },
         }
@@ -842,6 +982,35 @@ def _load_slate_topics(slate_path: Path) -> list[str]:
     return topics or list(_FALLBACK_BASELINE_TOPICS)
 
 
+def _load_slate_entries(slate_path: Path) -> list[dict[str, Any]]:
+    """Slate entries as dicts: {id, text, expected_subtopics}.
+
+    Used by the floor (subtopics drive the functional composite) and by verify
+    (prompt ids drive the C3 mini-slate filter). Falls back to synthetic
+    entries mirroring ``_FALLBACK_BASELINE_TOPICS`` when the slate is absent so
+    dry-run still runs deterministically.
+    """
+    slate_path = Path(slate_path)
+    if slate_path.exists():
+        try:
+            raw = tomllib.loads(slate_path.read_text(encoding="utf-8"))
+            out = []
+            for row in raw.get("prompt", []):
+                if not row.get("text"):
+                    continue
+                out.append({
+                    "id": str(row.get("id", f"p{len(out) + 1}")),
+                    "text": str(row["text"]).strip(),
+                    "expected_subtopics": [str(s) for s in row.get("expected_subtopics", [])],
+                })
+            if out:
+                return out
+        except (tomllib.TOMLDecodeError, OSError):
+            pass
+    return [{"id": f"fb{i + 1}", "text": t, "expected_subtopics": []}
+            for i, t in enumerate(_FALLBACK_BASELINE_TOPICS)]
+
+
 # ---------------------------------------------------------------------------
 # Phase implementations
 #
@@ -866,6 +1035,31 @@ class _Paused(Exception):
 # reserve 0 against the ceiling (B1/B3). The decision + regression gate cells
 # are pure; their real effects run in on_result callbacks.
 _ZERO_COST_KINDS: frozenset[str] = frozenset({"decide", "regression"})
+
+# Max attempts per cell before it is recorded failed (C4). Transient backend
+# hiccups get one retry; persistent failures are excluded from samples rather
+# than poisoning them with 0.0 scores.
+_MAX_CELL_ATTEMPTS = 2
+
+# Substrings (lowercased) that identify a usage-window/quota exhaustion in a
+# backend error. These must PAUSE the job (resumable after the window resets),
+# never burn retries or mark the cell failed (C4).
+_USAGE_LIMIT_MARKERS: tuple[str, ...] = (
+    "usage limit", "quota", "rate limit", "rate_limit", "429",
+    "window exhausted", "hit your limit", "out of credits", "overloaded",
+    "usage_limit",
+)
+
+
+def _is_usage_limit_error(res: dict[str, Any]) -> bool:
+    """True when a cell result's error indicates usage-window exhaustion (C4)."""
+    parts = [str(res.get("error", ""))]
+    inner = res.get("result")
+    if isinstance(inner, dict):
+        parts.append(str(inner.get("error", "")))
+        parts.append(str(inner.get("stderr", "")))
+    blob = " ".join(parts).lower()
+    return any(m in blob for m in _USAGE_LIMIT_MARKERS)
 
 
 def _cell_known_cost(invoke_kind: str, payload: dict[str, Any], *,
@@ -930,10 +1124,11 @@ def _run_cells(
     """
     state.set_status(phase, STATUS_RUNNING)
     done = state.cells_done(phase)
+    failed = state.cells_failed(phase)
 
     for cell_id, payload in cells:
-        if cell_id in done:
-            continue  # resume: skip completed cell, no duplicate work
+        if cell_id in done or cell_id in failed:
+            continue  # resume: skip completed/failed cell, no duplicate work
 
         known_cost = _cell_known_cost(invoke_kind, payload, dry_run=dry_run)
         # Budget gate BEFORE doing the work, using the cell's KNOWN cost. A
@@ -945,28 +1140,64 @@ def _run_cells(
             state.sync_tokens_from(tracker)
             raise _Paused(phase)
 
-        res = _invoke(invoke_kind, dry_run=dry_run, tracker=tracker, **payload)
-        tokens = int(res.get("tokens", 0) or 0)
+        # C4 — attempt loop. An errored result is NOT data: retry once, then
+        # record the cell failed (excluded from samples — missing, never 0.0).
+        # A usage-window exhaustion PAUSES the phase instead (resume retries the
+        # SAME cell after the window resets — this is what makes the
+        # multi-window claude-only story actually true).
+        attempts = 0
+        cell_tokens_total = 0
+        last_error = ""
+        while True:
+            attempts += 1
+            res = _invoke(invoke_kind, dry_run=dry_run, tracker=tracker, **payload)
+            tokens = int(res.get("tokens", 0) or 0)
 
-        # Hard per-cell cap (B1): if the ACTUAL cost would breach the ceiling,
-        # abort the cell without charging or recording it, and pause. This makes
-        # the ceiling truly hard even when the real cost exceeded what we knew
-        # up front (the pre-flight reservation can only estimate).
-        if tokens > 0 and tracker.would_exceed(tokens):
-            _warn(f"[{phase}] cell {cell_id} cost {tokens:,} tokens would "
-                  f"breach the hard ceiling "
-                  f"(spent={tracker.spent():,}/{tracker.hard_ceiling:,}); "
-                  f"aborting cell, not charging past the ceiling")
-            state.set_status(phase, STATUS_PAUSED)
+            # Hard per-cell cap (B1): if the ACTUAL cost would breach the
+            # ceiling, abort without charging and pause — the ceiling is truly
+            # hard even when real cost exceeds the pre-flight estimate.
+            if tokens > 0 and tracker.would_exceed(tokens):
+                _warn(f"[{phase}] cell {cell_id} cost {tokens:,} tokens would "
+                      f"breach the hard ceiling "
+                      f"(spent={tracker.spent():,}/{tracker.hard_ceiling:,}); "
+                      f"aborting cell, not charging past the ceiling")
+                state.set_status(phase, STATUS_PAUSED)
+                state.sync_tokens_from(tracker)
+                raise _Paused(phase)
+
+            # Charge every attempt — failed attempts consumed real tokens too.
+            tracker.charge(tokens)
+            cell_tokens_total += tokens
             state.sync_tokens_from(tracker)
-            raise _Paused(phase)
 
-        tracker.charge(tokens)
-        state.mark_cell_done(phase, cell_id, tokens=tokens,
-                             artifact=res.get("artifact"), result=res)
-        state.sync_tokens_from(tracker)
-        if on_result is not None:
-            on_result(cell_id, res)
+            if res.get("ok", True):
+                state.mark_cell_done(phase, cell_id, tokens=tokens,
+                                     artifact=res.get("artifact"), result=res)
+                if on_result is not None:
+                    on_result(cell_id, res)
+                break
+
+            last_error = str(
+                res.get("error")
+                or (res.get("result", {}) or {}).get("error")
+                or "errored")
+            if _is_usage_limit_error(res):
+                _warn(f"[{phase}] cell {cell_id}: usage window exhausted "
+                      f"({last_error[:120]}); pausing — resume after reset "
+                      f"retries this cell")
+                state.set_status(phase, STATUS_PAUSED)
+                state.sync_tokens_from(tracker)
+                raise _Paused(phase)
+
+            if attempts >= _MAX_CELL_ATTEMPTS:
+                _warn(f"[{phase}] cell {cell_id} FAILED after {attempts} "
+                      f"attempts ({last_error[:160]}); excluding from samples")
+                state.mark_cell_failed(phase, cell_id, error=last_error,
+                                       attempts=attempts,
+                                       tokens=cell_tokens_total)
+                break
+            _warn(f"[{phase}] cell {cell_id} attempt {attempts} errored "
+                  f"({last_error[:120]}); retrying")
 
     if not defer_done:
         state.set_status(phase, STATUS_DONE)
@@ -986,40 +1217,46 @@ def phase_baseline(state: JobState, tracker: BudgetTracker, args: argparse.Names
     even if it beats its own ``off`` arm — a technique that can't even match the
     current swarm's self-consistency baseline is not an upgrade.
     """
-    topics = _load_slate_topics(Path(args.slate))
+    entries = _load_slate_entries(Path(args.slate))
+    topics = [e["text"] for e in entries]
     seeds = list(range(args.seeds))
-    cells: list[tuple[str, dict[str, Any]]] = []
+    swarm_cells: list[tuple[str, dict[str, Any]]] = []
     # LIVE: consensus swarm over slate x seeds.
     for ti, topic in enumerate(topics):
         for seed in seeds:
-            cells.append((f"baseline:t{ti}:s{seed}",
-                          {"topic": topic, "seed": seed, "max_rounds": args.max_rounds,
-                           "backend_id": args.backend}))
-    # LIVE: K-sample self-consistency floor on the first topic.
-    if topics:
-        for k in range(args.seeds):
-            cells.append((f"selfconsistency:t0:k{k}",
-                          {"topic": topics[0], "seed": 1000 + k, "max_rounds": args.max_rounds,
-                           "backend_id": args.backend}))
+            swarm_cells.append((f"baseline:t{ti}:s{seed}",
+                                {"topic": topic, "seed": seed, "max_rounds": args.max_rounds,
+                                 "backend_id": args.backend}))
+    # H1 — the TRUE self-consistency floor: K direct single-agent calls on the
+    # first topic (Wang-style cheap baseline), NOT K more swarm runs. Scored on
+    # the same 0-1 functional-composite scale the verify phase uses, so the
+    # gate's floor comparison is apples-to-apples (the old floor was 0-10 judge
+    # scale vs 0-1 composite — every comparison was vacuously false).
+    floor_cells: list[tuple[str, dict[str, Any]]] = []
+    if entries:
+        first = entries[0]
+        for k in range(int(getattr(args, "floor_k", 5))):
+            floor_cells.append((f"floor:k{k}",
+                                {"topic": first["text"], "seed": k,
+                                 "expected_subtopics": first["expected_subtopics"],
+                                 "backend_id": args.backend}))
 
-    # B6-class fix: defer DONE until the floor artifact (baseline's terminal side
-    # effect) is written, and rebuild the K samples from PERSISTED cell results so a
-    # --resume (which skips already-done cells) can still compute and write the floor
-    # instead of marking baseline done with a degenerate/absent floor. Without this,
-    # a mid-baseline pause on a multi-window run would leave the gate with no floor
-    # (falling back to keep-all). Mirrors the phase_verify fix.
-    _run_cells(state, tracker, "baseline", cells, dry_run=args.dry_run,
+    # B6-class: defer DONE until the floor artifact (baseline's terminal side
+    # effect) is written; rebuild samples from PERSISTED cell results so resume
+    # recomputes the floor instead of skipping it.
+    _run_cells(state, tracker, "baseline", swarm_cells, dry_run=args.dry_run,
                invoke_kind="consensus", defer_done=True)
+    _run_cells(state, tracker, "baseline", floor_cells, dry_run=args.dry_run,
+               invoke_kind="single_agent", defer_done=True)
 
-    # G3: aggregate the self-consistency floor from PERSISTED results and persist it.
+    # G3: aggregate the floor from PERSISTED results (failed cells are simply
+    # absent — missing data, never 0.0; C4).
     sc_samples: list[float] = []
     base_results = state.cell_results("baseline")
-    for cell_id, _payload in cells:
-        if not cell_id.startswith("selfconsistency:"):
-            continue
+    for cell_id, _payload in floor_cells:
         res = base_results.get(cell_id)
         if res:
-            sc_samples.append(float(res.get("result", {}).get("avg_quality", 0) or 0))
+            sc_samples.append(float(res.get("result", {}).get("composite", 0) or 0))
 
     floor = _aggregate_baseline_floor(sc_samples)
     floor_path = state.path.parent / f"baseline_floor_{_safe(state.data['branch'])}.json"
@@ -1054,12 +1291,22 @@ def _aggregate_baseline_floor(samples: list[float]) -> dict[str, Any]:
     }
 
 
-def phase_research(state: JobState, tracker: BudgetTracker, args: argparse.Namespace) -> None:
-    """Discover candidate techniques via the research-swarm.
+def _candidates_path(state: JobState) -> Path:
+    return state.path.parent / "candidates.json"
 
-    Cells: (technique-topic, seed). ``--techniques`` caps how many of the
-    default research topics to pursue; ``--seeds`` controls repeats.
+
+def phase_research(state: JobState, tracker: BudgetTracker, args: argparse.Namespace) -> None:
+    """Discover candidate techniques, then EXTRACT them into candidates.json.
+
+    C1 — the audit's central finding was that research output was never parsed:
+    implement received placeholder names with zero content. Now the phase's
+    terminal side effect is a structured ``candidates.json`` (extracted from the
+    research markdown via one schema'd call), which implement and verify
+    consume. DONE is deferred until the extraction lands (B6-class), and on
+    --resume the extraction is rebuilt from persisted cell artifacts.
     """
+    from jobs import candidates as _cand  # noqa: PLC0415
+
     n = max(1, min(int(args.techniques), len(DEFAULT_RESEARCH_TOPICS)))
     topics = list(DEFAULT_RESEARCH_TOPICS[:n])
     cells: list[tuple[str, dict[str, Any]]] = []
@@ -1068,25 +1315,82 @@ def phase_research(state: JobState, tracker: BudgetTracker, args: argparse.Names
         for seed in range(args.seeds):
             cells.append((f"research:t{ti}:s{seed}", {"topic": topic, "seed": seed}))
     _run_cells(state, tracker, "research", cells, dry_run=args.dry_run,
-               invoke_kind="research")
+               invoke_kind="research", defer_done=True)
+
+    # C1 terminal step: extract candidates from the research outputs — run as a
+    # proper CELL so token accounting stays uniform (tokens_spent == sum of
+    # per-phase tokens) and resume skips a completed extraction for free.
+    # Dry-run artifacts are deterministic placeholder names — passed through
+    # (the extractor's dry path hashes names, never reads files); live mode
+    # sends only real files.
+    md_paths = []
+    for cell_id, _payload in cells:
+        res = state.cell_results("research").get(cell_id)
+        art = (res or {}).get("artifact")
+        if not art:
+            continue
+        if args.dry_run or not str(art).startswith("<dry-run"):
+            md_paths.append(str(art))
+    _run_cells(state, tracker, "research",
+               [("research:extract",
+                 {"md_paths": md_paths, "top_n": int(args.techniques)})],
+               dry_run=args.dry_run, invoke_kind="extract", defer_done=True)
+
+    # Terminal side effect (B6 pattern): persist candidates.json from the
+    # extraction cell's PERSISTED result, then mark the phase done.
+    ext = state.cell_results("research").get("research:extract", {})
+    cands = list((ext.get("result") or {}).get("candidates", []))
+    cpath = _candidates_path(state)
+    _cand.save_candidates(cands, cpath)
+    state.add_artifact("research", str(cpath))
+    if not cands:
+        _warn("[research] extraction produced NO candidates — implement will "
+              "refuse to run on placeholders (C1)")
+    state.set_status("research", STATUS_DONE)
 
 
 def phase_implement(state: JobState, tracker: BudgetTracker, args: argparse.Namespace) -> None:
-    """Implement each candidate technique via mythos (cost-ceilinged).
+    """Implement each REAL candidate via mythos (cost-ceilinged).
 
-    Cells: (technique). One mythos run per candidate technique with a per-run
-    ``--cost-ceiling`` so a single candidate cannot drain the whole budget.
+    C1 — mythos now receives the candidate's full mechanism sketch + the repo
+    cwd + a named pattern file + hard mechanical requirements, instead of a
+    bare placeholder id. No candidates -> hard refusal (running mythos against
+    placeholders produces hallucinated mechanisms; the audit's C1).
     """
-    n = max(1, min(int(args.techniques), len(DEFAULT_RESEARCH_TOPICS)))
+    from jobs import candidates as _cand  # noqa: PLC0415
+
+    cands = _cand.load_candidates(_candidates_path(state))
+    if not cands:
+        raise RuntimeError(
+            "implement: no candidates.json — the research phase produced no "
+            "extractable candidates. Re-run research (or inspect its outputs); "
+            "refusing to send placeholder tasks to mythos (audit C1).")
+
     cells: list[tuple[str, dict[str, Any]]] = []
-    # LIVE: mythos per candidate.
-    for ti in range(n):
-        technique = _technique_id(ti)
-        task = (f"Implement and self-verify the blitz-swarm upgrade candidate "
-                f"'{technique}' as a toggleable mechanism behind the quality "
-                f"profile, with a unit test.")
-        cells.append((f"implement:{technique}",
-                      {"task": task, "technique": technique,
+    for cand in cands[: max(1, int(args.techniques))]:
+        cid = str(cand["id"])
+        task = (
+            f"Implement the blitz-swarm upgrade candidate '{cand.get('title', cid)}' "
+            f"in the repo at {REPO_ROOT}.\n\n"
+            f"Mechanism sketch (from the research phase):\n"
+            f"{cand.get('mechanism_sketch', '')}\n\n"
+            f"Extension point: {cand.get('blitz_extension_point', 'mechanisms/' + cid + '.py')}\n"
+            f"Expected gain: {cand.get('expected_gain', 'unknown')}\n\n"
+            f"HARD REQUIREMENTS:\n"
+            f"1. Write the mechanism as mechanisms/{cid.replace('-', '_')}.py, "
+            f"mirroring the structure of mechanisms/judge_ensemble.py (config "
+            f"dataclass + pluggable hooks).\n"
+            f"2. Gate it behind blitz.toml `[{cid}] enabled = false` AND make its "
+            f"enablement flow through orchestrator._feature_enabled with the "
+            f"feature name '{cid}' so the BLITZ_FEATURE_OVERRIDES env toggle "
+            f"works (the ablation harness depends on this).\n"
+            f"3. Ship a deterministic unit test tests/test_{cid.replace('-', '_')}.py "
+            f"(mocked LLM hooks, no subprocess) and make it pass.\n"
+            f"4. Touch nothing outside mechanisms/, tests/, blitz.toml, and the "
+            f"single orchestrator wiring point."
+        )
+        cells.append((f"implement:{cid}",
+                      {"task": task, "technique": cid,
                        "cost_ceiling": 2.0, "max_replans": 2}))
     _run_cells(state, tracker, "implement", cells, dry_run=args.dry_run,
                invoke_kind="mythos")
@@ -1099,33 +1403,50 @@ def phase_verify(state: JobState, tracker: BudgetTracker, args: argparse.Namespa
     paired significance (stats.paired_t_test + cohens_d) is computed per
     technique from the per-arm quality samples and stashed as an artifact note.
     """
-    n = max(1, min(int(args.techniques), len(DEFAULT_RESEARCH_TOPICS)))
+    from jobs import candidates as _cand  # noqa: PLC0415
+
+    # C1 — ablate the techniques that were actually IMPLEMENTED, not synthetic
+    # ids. A candidate is eligible when its implement cell completed ok.
+    cands = _cand.load_candidates(_candidates_path(state))
+    impl_results = state.cell_results("implement")
+    techniques: list[str] = []
+    for cand in cands:
+        cid = str(cand["id"])
+        res = impl_results.get(f"implement:{cid}")
+        if res and res.get("ok"):
+            techniques.append(cid)
+    if not techniques:
+        raise RuntimeError(
+            "verify: no successfully-implemented techniques to ablate "
+            "(implement produced nothing usable); refusing to measure noise.")
+
+    # C3 — verify runs on a MINI-slate (first --verify-prompts ids), not all 10.
+    entries = _load_slate_entries(Path(args.slate))
+    prompt_ids = [e["id"] for e in entries[: max(1, int(getattr(args, "verify_prompts", 4)))]]
+
     cells: list[tuple[str, dict[str, Any]]] = []
-    # LIVE: bench ablation on/off x seeds per technique.
-    for ti in range(n):
-        technique = _technique_id(ti)
+    for technique in techniques:
         for arm in ("off", "on"):
             for seed in range(args.seeds):
                 cells.append((
                     f"verify:{technique}:{arm}:s{seed}",
                     {"technique": technique, "arm": arm, "seed": seed,
                      "slate": args.slate, "max_rounds": args.max_rounds,
-                     "backend_id": args.backend},
+                     "backend_id": args.backend, "prompt_ids": prompt_ids},
                 ))
 
     # B6: defer the phase DONE until AFTER the significance artifact is written.
-    # The significance file is verify's terminal side effect; if we marked the
-    # phase DONE before writing it, a crash here would lose the artifact yet a
-    # --resume would skip verify entirely.
     _run_cells(state, tracker, "verify", cells, dry_run=args.dry_run,
                invoke_kind="bench_ablation", defer_done=True)
 
-    # Rebuild per-(technique, arm) quality samples from the PERSISTED cell
-    # results rather than an in-memory collector — so a --resume (which skips
-    # the already-done cells) can still recompute and write the significance
-    # artifact, instead of marking verify done with no terminal side effect (B6).
+    # H2 — rebuild PER-(seed, prompt) paired samples from PERSISTED results.
+    # Pairing per prompt multiplies statistical power (seeds x prompts pairs vs
+    # seeds pairs); only keys present in BOTH arms are paired, in sorted order,
+    # so _compute_significance's zip pairs like with like. Failed cells are
+    # simply absent — missing data, never 0.0 (C4).
     samples: dict[str, dict[str, list[float]]] = {}
     cell_results = state.cell_results("verify")
+    by_key: dict[str, dict[str, dict[tuple[int, str], float]]] = {}
     for cell_id, _payload in cells:
         res = cell_results.get(cell_id)
         if not res:
@@ -1135,8 +1456,20 @@ def phase_verify(state: JobState, tracker: BudgetTracker, args: argparse.Namespa
         arm = str(r.get("arm", ""))
         if not tech or arm not in ("on", "off"):
             continue
-        q = float(r.get("avg_quality", 0) or 0)
-        samples.setdefault(tech, {"on": [], "off": []})[arm].append(q)
+        seed = int(r.get("seed", 0) or 0)
+        per_prompt = r.get("per_prompt") or {}
+        slot = by_key.setdefault(tech, {"on": {}, "off": {}})[arm]
+        if per_prompt:
+            for pid, comp in per_prompt.items():
+                slot[(seed, str(pid))] = float(comp)
+        else:  # legacy fallback: one mean sample per seed
+            slot[(seed, "_mean")] = float(r.get("avg_quality", 0) or 0)
+    for tech, arms in by_key.items():
+        common = sorted(set(arms["on"]) & set(arms["off"]))
+        samples[tech] = {
+            "on": [arms["on"][k] for k in common],
+            "off": [arms["off"][k] for k in common],
+        }
 
     # Significance pass (paired on/off). Best-effort: needs >=2 paired samples.
     sig = _compute_significance(samples)
@@ -1211,6 +1544,9 @@ def phase_gate(state: JobState, tracker: BudgetTracker, args: argparse.Namespace
     refuse_reason: str | None = None
     if branch in ("main", "master"):
         refuse_reason = "on main/master"
+    elif decision.get("no_significance_artifact"):
+        # H2: no evidence => no commit. Never default to keep-all.
+        refuse_reason = "no significance artifact — refusing to commit unverified mechanisms"
     elif not kept:
         refuse_reason = "no mechanisms passed the gate"
     elif not regression_ok:
@@ -1457,6 +1793,7 @@ def _apply_decision_rule(state: JobState, *, keep_band: float = 0.5) -> dict[str
     detail: dict[str, Any] = {}
     fallback = False
 
+    min_pairs = None
     if sig_path and sig_path.exists():
         try:
             sig = json.loads(sig_path.read_text(encoding="utf-8"))
@@ -1466,17 +1803,18 @@ def _apply_decision_rule(state: JobState, *, keep_band: float = 0.5) -> dict[str
             decision = _decide_one_technique(rec, baseline_floor=baseline_floor,
                                              keep_band=keep_band)
             detail[tech] = decision
+            n = int(rec.get("n_on", 0) or 0)
+            min_pairs = n if min_pairs is None else min(min_pairs, n)
             if decision["keep"]:
                 kept.append(tech)
             else:
                 dropped.append(tech)
     else:
-        # Fallback: keep every implemented technique.
+        # H2 — an auto-committing gate must NEVER default to keep-all. No
+        # significance artifact means no evidence; refuse instead. (The old
+        # keep-every-implemented-technique fallback would have committed
+        # unverified mechanisms whenever verify's artifact was missing.)
         fallback = True
-        for art in state.phase("implement").get("cells_done", []):
-            # cell ids look like "implement:technique_01"
-            tech = art.split(":", 1)[-1] if ":" in art else art
-            kept.append(tech)
 
     return {
         "keep_band": keep_band,
@@ -1486,7 +1824,11 @@ def _apply_decision_rule(state: JobState, *, keep_band: float = 0.5) -> dict[str
         "kept": sorted(set(kept)),
         "dropped": sorted(set(dropped)),
         "detail": detail,
-        "fallback_kept_all": fallback,
+        # n-aware honesty: with few pairs this is screening-grade evidence.
+        "evidence_grade": ("none" if min_pairs is None
+                           else "screening" if min_pairs < 10 else "confirmatory"),
+        "min_pairs": min_pairs,
+        "no_significance_artifact": fallback,
         "branch": state.data.get("branch", ""),
     }
 
@@ -1654,6 +1996,11 @@ def run_job(args: argparse.Namespace, *, started_at: float | str | None = None,
           f"resume={args.resume} phases={','.join(phases)} "
           f"ceiling={tracker.hard_ceiling:,} spent={tracker.spent():,}")
 
+    # C3 — pre-flight cost calibration: measure one real cell, project the whole
+    # job, refuse to start an infeasible run (the audit's arithmetic finding).
+    if "baseline" in phases and not _preflight_calibration(state, tracker, args):
+        return 2
+
     for phase in phases:
         # Skip already-completed phases (idempotent resume).
         if state.is_done(phase):
@@ -1682,6 +2029,89 @@ def run_job(args: argparse.Namespace, *, started_at: float | str | None = None,
     print(f"blitz-upgrade: complete. total tokens charged={tracker.charged():,} "
           f"(spent incl. history={tracker.spent():,}/{tracker.hard_ceiling:,})")
     return 0
+
+
+def _preflight_calibration(state: JobState, tracker: BudgetTracker,
+                           args: argparse.Namespace) -> bool:
+    """C3 — measure ONE real cell, project the whole job, refuse if infeasible.
+
+    The audit's arithmetic finding: the original defaults projected ~25-40M
+    tokens against a 10M ceiling — the job could not complete as parameterized,
+    and nothing would have said so until the ceiling pause. Now the first
+    baseline cell doubles as a calibration probe: its measured token cost
+    projects every remaining phase, the math is PRINTED, and an infeasible job
+    refuses to start (override: --ignore-calibration). The probe's work is
+    recorded as the real ``baseline:t0:s0`` cell so nothing is wasted.
+
+    Returns True when the job may proceed.
+    """
+    import time as _time  # noqa: PLC0415
+
+    if args.dry_run or getattr(args, "ignore_calibration", False):
+        return True
+    if state.data.get("calibration"):
+        return True  # already calibrated (resume)
+    entries = _load_slate_entries(Path(args.slate))
+    if not entries or state.is_done("baseline"):
+        return True
+    cell_id = "baseline:t0:s0"
+    if cell_id in state.cells_done("baseline"):
+        # First cell already ran (e.g. earlier smoke) — calibrate from it.
+        res = state.cell_results("baseline").get(cell_id, {})
+        per_swarm = max(int(res.get("tokens", 0) or 0), 1)
+        wall_s = 0.0
+    else:
+        print("  [calibrate] running one real swarm cell to measure cost...")
+        t0 = _time.monotonic()
+        res = _invoke("consensus", dry_run=False, tracker=tracker,
+                      topic=entries[0]["text"], seed=0,
+                      max_rounds=args.max_rounds, backend_id=args.backend)
+        wall_s = round(_time.monotonic() - t0, 1)
+        per_swarm = max(int(res.get("tokens", 0) or 0), 1)
+        tracker.charge(per_swarm)
+        if res.get("ok", True):
+            state.mark_cell_done("baseline", cell_id, tokens=per_swarm,
+                                 artifact=res.get("artifact"), result=res)
+        state.sync_tokens_from(tracker)
+
+    n_topics = len(entries)
+    seeds = int(args.seeds)
+    techs = int(args.techniques)
+    vp = int(getattr(args, "verify_prompts", 4))
+    floor_k = int(getattr(args, "floor_k", 5))
+    # Cost multipliers vs one swarm run (measured: single-agent ~0.2x; research
+    # and mythos runs are comparable-to-heavier than one swarm run).
+    plan = {
+        "baseline (swarm)": (n_topics * seeds - 1, 1.0),
+        "baseline (floor)": (floor_k, 0.2),
+        "research": (techs * seeds, 1.5),
+        "implement (mythos)": (techs, 2.0),
+        "verify (bench prompts)": (techs * 2 * seeds * vp, 1.0),
+    }
+    projection = sum(max(count, 0) * mult * per_swarm
+                     for count, mult in plan.values())
+    feasible = projection <= tracker.remaining()
+    state.data["calibration"] = {
+        "per_swarm_tokens": per_swarm, "wall_s": wall_s,
+        "projection_tokens": int(projection), "remaining": tracker.remaining(),
+        "feasible": feasible,
+        "plan": {k: {"cells": c, "multiplier": m} for k, (c, m) in plan.items()},
+    }
+    state.save()
+
+    print(f"  [calibrate] measured {per_swarm:,} tokens/swarm-run "
+          f"({wall_s}s wall)")
+    for name, (count, mult) in plan.items():
+        print(f"  [calibrate]   {name:<24} {max(count, 0):>4} x {mult:.1f} "
+              f"= {int(max(count, 0) * mult * per_swarm):>12,} tokens")
+    print(f"  [calibrate] projection {int(projection):,} vs remaining "
+          f"{tracker.remaining():,} -> "
+          f"{'FEASIBLE' if feasible else 'INFEASIBLE'}")
+    if not feasible:
+        print("  [calibrate] REFUSING to start: projection exceeds the budget. "
+              "Shrink --techniques/--seeds/--verify-prompts/--max-rounds or "
+              "raise --max-tokens, or override with --ignore-calibration.")
+    return feasible
 
 
 def _pause(state: JobState, phase: str, tracker: BudgetTracker) -> None:
@@ -1774,12 +2204,24 @@ def build_parser() -> argparse.ArgumentParser:
                          "calls (deterministic simulation).")
     ap.add_argument("--max-tokens", type=int, default=HARD_CEILING,
                     help=f"Hard token ceiling (default {HARD_CEILING}).")
-    ap.add_argument("--techniques", type=int, default=6,
-                    help="How many candidate techniques to research/implement.")
-    ap.add_argument("--seeds", type=int, default=3,
-                    help="Seeds/repeats per cell for statistical power.")
-    ap.add_argument("--max-rounds", type=int, default=4,
-                    help="Consensus/bench max rounds per run (default 4).")
+    ap.add_argument("--techniques", type=int, default=3,
+                    help="How many candidate techniques to research/implement "
+                         "(default 3 — C3 feasibility; was 6).")
+    ap.add_argument("--seeds", type=int, default=2,
+                    help="Repeats per ablation cell (default 2 — paired "
+                         "per-prompt, so power comes from seeds x prompts; H2).")
+    ap.add_argument("--floor-k", type=int, default=5,
+                    help="K single-agent samples for the self-consistency "
+                         "floor (H1; separate knob from --seeds, M5).")
+    ap.add_argument("--verify-prompts", type=int, default=4,
+                    help="Mini-slate size for verify ablation (first N slate "
+                         "prompt ids; C3 feasibility — was the full slate).")
+    ap.add_argument("--max-rounds", type=int, default=2,
+                    help="Consensus/bench max rounds per run (default 2 — C3 "
+                         "feasibility + C5 timeout fit; was 4).")
+    ap.add_argument("--ignore-calibration", action="store_true",
+                    help="Skip the C3 pre-flight feasibility refusal (the "
+                         "calibration cell still runs and is recorded).")
     ap.add_argument("--backend", default="claude",
                     help="LLM backend for swarm runs: claude (default, honors the "
                          "claude-only job choice) / codex / gemini / ollama. Threaded "
