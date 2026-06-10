@@ -616,15 +616,24 @@ def _invoke_live(kind: str, *, tracker: BudgetTracker, **kw: Any) -> dict[str, A
         )
         rec = _read_metrics_record_for_topic(topic, after_ts=pre_ts)
         tokens = _tokens_of(rec)
+        quality = float(rec.get("avg_quality", 0) or 0) if rec else 0.0
+        # All-agents-errored signature: the swarm "completes" (force-finalizes)
+        # even when every agent call failed, reporting tokens=0 + quality=0.
+        # That is NOT data — flag it errored so C4 retries/excludes instead of
+        # recording a poisoning 0.0 (live run 2026-06-10: 14/20 baseline cells
+        # were silently zeroed this way during a claude outage burst).
+        zero_signature = (rec is None) or (tokens == 0 and quality == 0.0)
         return {
-            "ok": True,
+            "ok": not zero_signature,
             "kind": kind,
             "tokens": tokens,
             "artifact": str(out_path) if out_path else None,
+            "error": ("swarm produced no usable output (tokens=0, quality=0 — "
+                      "all agent calls likely errored)") if zero_signature else None,
             "result": {
                 "topic": topic,
                 "seed": seed,
-                "avg_quality": float(rec.get("avg_quality", 0) or 0) if rec else 0.0,
+                "avg_quality": quality,
                 "consensus_reached": bool(rec.get("consensus_reached", False)) if rec else False,
                 "cost_usd": float(rec.get("total_cost_usd", 0) or 0) if rec else 0.0,
             },
@@ -700,6 +709,7 @@ def _invoke_live(kind: str, *, tracker: BudgetTracker, **kw: Any) -> dict[str, A
 
         backend = ClaudeCLIBackend()
         call = AgentCall(
+            role="researcher",  # AgentCall's required first field
             prompt=(f"Research task:\n{topic}\n\nWrite a thorough, well-cited "
                     f"research synthesis. Cite arXiv IDs where applicable."),
             system_prompt="You are a careful research analyst. Be concrete and cite sources.",
@@ -1125,10 +1135,25 @@ def _run_cells(
     state.set_status(phase, STATUS_RUNNING)
     done = state.cells_done(phase)
     failed = state.cells_failed(phase)
+    # Circuit breaker: N consecutive cell FAILURES (retries exhausted) means the
+    # backend is down (outage / silent window exhaustion with empty stderr) —
+    # pause the phase instead of burning every remaining cell into cells_failed.
+    # Resume after recovery retries failed cells? No — failed cells stay failed;
+    # the breaker's job is to stop the bleeding BEFORE cells get marked failed
+    # en masse. (Live run 2026-06-10: 14 cells zeroed in 10 minutes.)
+    consecutive_failures = 0
 
     for cell_id, payload in cells:
         if cell_id in done or cell_id in failed:
             continue  # resume: skip completed/failed cell, no duplicate work
+
+        if consecutive_failures >= 3:
+            _warn(f"[{phase}] circuit breaker: {consecutive_failures} "
+                  f"consecutive cell failures — backend likely down; pausing "
+                  f"(resume retries the remaining cells)")
+            state.set_status(phase, STATUS_PAUSED)
+            state.sync_tokens_from(tracker)
+            raise _Paused(phase)
 
         known_cost = _cell_known_cost(invoke_kind, payload, dry_run=dry_run)
         # Budget gate BEFORE doing the work, using the cell's KNOWN cost. A
@@ -1171,6 +1196,7 @@ def _run_cells(
             state.sync_tokens_from(tracker)
 
             if res.get("ok", True):
+                consecutive_failures = 0
                 state.mark_cell_done(phase, cell_id, tokens=tokens,
                                      artifact=res.get("artifact"), result=res)
                 if on_result is not None:
@@ -1195,6 +1221,7 @@ def _run_cells(
                 state.mark_cell_failed(phase, cell_id, error=last_error,
                                        attempts=attempts,
                                        tokens=cell_tokens_total)
+                consecutive_failures += 1
                 break
             _warn(f"[{phase}] cell {cell_id} attempt {attempts} errored "
                   f"({last_error[:120]}); retrying")

@@ -1364,3 +1364,62 @@ def test_C2_bench_arm_sets_feature_override_env(monkeypatch, tmp_path: Path):
     assert seen["filter_ids"] == ("p1", "p2")
     assert os.environ.get("BLITZ_FEATURE_OVERRIDES") is None  # restored
     assert res["result"]["per_prompt"] == {"p1": 0.7}
+
+
+# ===========================================================================
+# Live-outage hardening (2026-06-10): zero-signature + circuit breaker
+# ===========================================================================
+
+
+def test_consensus_zero_signature_is_errored(monkeypatch, tmp_path: Path):
+    """A swarm run that force-finalizes with tokens=0 + quality=0 (all agent
+    calls errored) must come back ok=False so C4 retries/excludes it — never
+    recorded as a real 0.0 sample. (Live: 14/20 cells silently zeroed.)"""
+    import sys as _sys
+    import types as _types
+
+    async def _fake_run_swarm(topic, **kw):
+        return tmp_path / "out.md"
+
+    orch = _sys.modules.get("orchestrator") or _types.ModuleType("orchestrator")
+    monkeypatch.setattr(orch, "run_swarm", _fake_run_swarm, raising=False)
+    _sys.modules["orchestrator"] = orch
+
+    tracker = bu.BudgetTracker(hard_ceiling=10_000, dry_run=True)
+
+    # No metrics record at all -> zero signature -> errored.
+    monkeypatch.setattr(bu, "_read_metrics_record_for_topic", lambda *a, **k: None)
+    res = bu._invoke_live("consensus", tracker=tracker, topic="t", seed=0)
+    assert res["ok"] is False
+    assert "no usable output" in res["error"]
+
+    # Record with real tokens + quality -> healthy.
+    monkeypatch.setattr(bu, "_read_metrics_record_for_topic",
+                        lambda *a, **k: {"total_tokens": 5000, "avg_quality": 7.1})
+    monkeypatch.setattr(bu, "_tokens_of", lambda rec: 5000)
+    res2 = bu._invoke_live("consensus", tracker=tracker, topic="t", seed=0)
+    assert res2["ok"] is True and res2["result"]["avg_quality"] == 7.1
+
+
+def test_circuit_breaker_pauses_after_consecutive_failures(state_file: Path, monkeypatch):
+    """3 consecutive cell FAILURES (retries exhausted) trip the breaker: the
+    phase PAUSES instead of burning every remaining cell into cells_failed.
+    (Live: a claude outage zeroed 14 cells in 10 minutes.)"""
+    real_invoke = bu._invoke
+
+    def _backend_down(kind, **kw):
+        res = real_invoke(kind, **kw)
+        if kind == "single_agent":  # every floor cell fails, repeatedly
+            bad = dict(res)
+            bad["ok"] = False
+            bad["error"] = "backend down"
+            return bad
+        return res
+
+    monkeypatch.setattr(bu, "_invoke", _backend_down)
+    assert bu.run_job(_args(state_file, phase="baseline"), started_at=9600.0) == 0
+    data = json.loads(state_file.read_text())
+    assert data["phases"]["baseline"]["status"] == bu.STATUS_PAUSED
+    failed = data["phases"]["baseline"].get("cells_failed", [])
+    assert len(failed) == 3  # breaker tripped before the 4th could burn
+    assert "floor:k3" not in failed and "floor:k4" not in failed
