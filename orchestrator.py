@@ -65,6 +65,25 @@ JUDGE_VOTE_SCHEMA = {
     "required": ["aggregate_score", "rationale"],
 }
 
+def _judge_vote_schema(rubric_dims: tuple[str, ...]) -> dict:
+    """JUDGE_VOTE_SCHEMA with rubric_scores keyed by the actual rubric dims.
+
+    A free-form `{"type": "object"}` cannot be expressed in Codex's strict
+    structured-output mode, so the scores would be forced to `{}`. Naming
+    the dimensions keeps per-dimension scores on every backend.
+    """
+    schema = json.loads(json.dumps(JUDGE_VOTE_SCHEMA))
+    schema["properties"]["rubric_scores"] = {
+        "type": "object",
+        "properties": {
+            dim: {"type": "number", "minimum": 0, "maximum": 10}
+            for dim in rubric_dims
+        },
+        "required": list(rubric_dims),
+    }
+    return schema
+
+
 PAIRWISE_VERDICT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -742,7 +761,7 @@ def _make_judge_fn(
             role="judge_ensemble",
             prompt=prompt,
             system_prompt="Return JSON only. Be strict, independent, and concise.",
-            schema=JUDGE_VOTE_SCHEMA,
+            schema=_judge_vote_schema(tuple(rubric_dims)),
             model=model or cfg.swarm.default_model,
             timeout_s=min(AGENT_TIMEOUT_SECONDS, 90),
             cwd=Path(__file__).parent,

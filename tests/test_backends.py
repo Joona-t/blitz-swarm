@@ -44,7 +44,7 @@ def test_codex_backend_uses_output_file_schema_and_safe_flags(monkeypatch, tmp_p
         calls["cwd"] = cwd
         output_path = Path(cmd[cmd.index("--output-last-message") + 1])
         schema_path = Path(cmd[cmd.index("--output-schema") + 1])
-        assert json.loads(schema_path.read_text()) == AGENT_SCHEMA
+        assert json.loads(schema_path.read_text()) == backends.to_strict_output_schema(AGENT_SCHEMA)
         output_path.write_text(json.dumps(_ok_payload()), encoding="utf-8")
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
