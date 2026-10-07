@@ -5,14 +5,51 @@ max_rounds = 4
 default_model = "sonnet"
 timeout_seconds = 300
 max_agents = 10
+quality_profile = "max"
 # Domain preset for role prompts. Loads from prompts/<domain>/.
 # Built-in: "general" (default), "crypto" (v0.1.x trading-research preset).
 # Custom domains: drop a folder in prompts/ with the same role files.
-domain = "crypto"
+domain = "general"
 # MAR-style persona-typed critics (factual / logical / counterfactual).
 # Off by default — flip to true to use the persona registry from
 # prompts/loader.py::assign_personas. Phase 1 mechanism (arXiv 2512.20845).
 persona_critics = false
+
+[backend]
+default = "codex"
+# Leave unset to fail clearly when Codex is unavailable. Set to "claude" or
+# "gemini" only when you explicitly want a fallback backend.
+fallback = ""
+
+[backend.codex]
+model = "gpt-5.5"
+reasoning_effort = "high"
+sandbox = "read-only"
+approval_policy = "never"
+ephemeral = true
+
+[backend.claude]
+model = "sonnet"
+reasoning_effort = "high"
+sandbox = "read-only"
+approval_policy = "never"
+ephemeral = true
+
+[guard]
+enabled = true
+mode = "balanced"
+
+[judge_ensemble]
+enabled = true
+n_judges = 3
+ks_threshold = 0.05
+ks_consecutive = 2
+min_rounds = 2
+
+[selector]
+enabled = true
+granularity = "section"
+n_judges = 3
 
 [memory]
 max_context_tokens = 2000
@@ -21,6 +58,7 @@ hop_expansion = 1
 insight_dedup_threshold = 0.85
 query_link_threshold = 0.7
 llm_ops_threshold = 10  # activate LLM memory ops after this many queries
+gmemory_tier = 3
 
 [redis]
 host = "localhost"

@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.2.1] — 2026-05-20
+
+### Codex-first orchestration
+
+- Added `backends.py` with `AgentCall`, `AgentResult`, and local adapters for Codex, Claude, and Gemini.
+- Made Codex CLI the default backend in `blitz.toml`, using read-only sandboxing, ephemeral sessions, JSONL output, final-message files, temp schema files, and local schema validation.
+- Routed consensus agents, Mythos invocations, planning helpers, memory LLM helpers, judge ensemble hooks, and selector hooks through the backend layer.
+- Added CLI/config controls: `--backend`, `--quality-profile`, `--sandbox`, `--no-selector`, `--no-judge-ensemble`, and `--no-cascade-guard`.
+- Wired `cascade_guard`, `judge_ensemble`, selector synthesis, and conservative AgentDropout-style contribution pruning into the main run loop.
+- Added pytest collection hygiene so generated `mythos-bench/artifacts/**/test_*.py` files are not collected by default.
+
+### Tests
+
+260 passing, 14 conditional skips:
+
+- Added backend tests for Codex command construction, JSONL/final-message parsing, schema validation, timeout handling, missing CLI handling, and malformed intermediate output precedence.
+- Added orchestration wiring tests for backend routing, cascade filtering, judge ensemble output, selector synthesis, AgentDropout floors, and no direct active-path Claude subprocess calls.
+
 ## [0.2.0] — 2026-05-09
 
 ### Frontier methodology + mechanism + memory + recursion upgrade

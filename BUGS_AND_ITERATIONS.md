@@ -153,6 +153,19 @@ CLI probe (2026-05-09): `claude -p --model opus` routes to `claude-opus-4-7` wit
 
 **Commit:** TBD.
 
+## 2026-10-07: BUG-002 — Codex backend rejected every structured call (non-strict --output-schema)
+
+**Problem:** With the default `[backend] default = "codex"`, every Blitz agent call, judge vote and pairwise verdict came back errored (`codex exit 1`). The API response was `Invalid schema for response_format 'codex_output_schema': ... 'additionalProperties' is required to be supplied and to be false`.
+
+**Root cause:** `codex exec --output-schema` sends the schema as an OpenAI **strict** json_schema. Strict mode requires `additionalProperties: false` on every object and every property listed in `required`. It also can't express free-form objects. None of our schemas (AGENT_OUTPUT_SCHEMA, JUDGE_VOTE_SCHEMA with `rubric_scores: {type: object}`, PAIRWISE_VERDICT_SCHEMA, mythos/memory schemas) met that. The unit tests mocked `subprocess.run` and only asserted that `--output-schema` was passed, so the contract was never checked against the real CLI.
+
+**Fix:** `backends.to_strict_output_schema()` normalises any schema before CodexLocalBackend writes `schema.json`. It adds `additionalProperties: false`, lists every key in `required`, makes originally-optional keys nullable, and turns free-form objects into empty strict objects. `backends.strip_strict_nulls()` drops those nulls from the parsed result before `validate_json_schema`, so callers still see the loose contract. The judge call now uses `orchestrator._judge_vote_schema(rubric_dims)`, which names each rubric dimension so the per-dimension scores survive strict mode. Source schemas are unchanged, and the Claude/Gemini backends are untouched.
+
+**Regression test:** `tests/test_codex_strict_schema.py` runs a strict-mode checker over every real schema after conversion, checks the null round-trip, and checks that the backend writes a strict-valid `schema.json`. Live check (needs codex CLI, uses your own subscription): `python -c "import agents; from pathlib import Path; from backends import *; print(CodexLocalBackend(reasoning_effort='low').call(AgentCall(role='t', prompt='Is 2+2=4? Fill the schema minimally.', schema=agents.AGENT_OUTPUT_SCHEMA, cwd=Path('.'))).errored)"` should print `False`. Verified 2026-10-07 with codex-cli 0.160.0 for the AGENT, JUDGE and PAIRWISE schemas.
+
+**Found in:** PR #1 (`codex/codex-first-backend`), found by skeptic review.
+**Commit:** see PR #1 history.
+
 <!-- Format:
 ## YYYY-MM-DD: Short Title
 

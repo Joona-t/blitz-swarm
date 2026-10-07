@@ -1,8 +1,8 @@
-"""Shared subprocess invocation for Mythos roles.
+"""Shared invocation for Mythos roles.
 
-Wraps `claude -p --model X [--effort Y] --json-schema Z` into a single
-helper that returns parsed JSON + cost telemetry. Mirrors the parsing
-contract from orchestrator.py::invoke_agent (CLI envelope unwrapping).
+Wraps the configured local backend into a single helper that returns
+parsed JSON + cost telemetry. Codex is the default backend for local
+runs; Claude remains available through the backend abstraction.
 
 Kept inside mythos/ because Mythos has different output schemas, longer
 timeouts, and a different retry policy than blitz-swarm consensus mode.
@@ -11,11 +11,13 @@ timeouts, and a different retry policy than blitz-swarm consensus mode.
 from __future__ import annotations
 
 import json
-import subprocess
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from backends import AgentCall, make_backend, parse_json_loose
+from config import load_config
 from .policies import resolve_model
 
 # Path to prompts/ relative to this file
@@ -50,45 +52,31 @@ def invoke(
     timeout_s: int,
     max_turns: int = 4,
 ) -> InvokeResult:
-    """Invoke a single Mythos role via `claude -p`.
+    """Invoke a single Mythos role through the configured local backend.
 
     Returns InvokeResult with parsed dict or error. Never raises on CLI
     failure — wraps the failure into the result so the runner can decide
     what to do (replan, abort, etc.).
     """
-    model, effort = resolve_model(model_alias)
-
-    cmd = [
-        "claude",
-        "-p", user_prompt,
-        "--system-prompt", system_prompt,
-        "--output-format", "json",
-        "--model", model,
-        "--max-turns", str(max_turns),
-        "--json-schema", schema_json,
-        "--dangerously-skip-permissions",
-    ]
-    if effort:
-        cmd.extend(["--effort", effort])
-
     start = time.monotonic()
     try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
+        model, effort = resolve_model(model_alias)
+        cfg = load_config()
+        backend_id = os.environ.get("BLITZ_BACKEND") or cfg.backend.default or "codex"
+        provider = getattr(cfg.backend, backend_id, cfg.backend.codex)
+        sandbox = os.environ.get("BLITZ_SANDBOX") or provider.sandbox
+        backend_model = provider.model or model
+        if backend_id == "claude":
+            backend_model = model
+        backend = make_backend(
+            backend_id,
+            model=backend_model,
+            reasoning_effort=provider.reasoning_effort,
+            sandbox=sandbox,
+            approval_policy=provider.approval_policy,
+            ephemeral=provider.ephemeral,
         )
-    except subprocess.TimeoutExpired:
-        return InvokeResult(
-            parsed=None,
-            raw_stdout="",
-            cost_usd=0.0,
-            input_tokens=0,
-            output_tokens=0,
-            elapsed_s=time.monotonic() - start,
-            error=f"{role} timed out after {timeout_s}s",
-        )
+        schema = json.loads(schema_json)
     except Exception as e:
         return InvokeResult(
             parsed=None,
@@ -97,49 +85,40 @@ def invoke(
             input_tokens=0,
             output_tokens=0,
             elapsed_s=time.monotonic() - start,
-            error=f"{role} subprocess exception: {e!r}",
+            error=f"{role} backend setup exception: {e!r}",
         )
 
-    elapsed = time.monotonic() - start
+    res = backend.call(AgentCall(
+        role=role,
+        prompt=user_prompt,
+        system_prompt=system_prompt,
+        schema=schema,
+        model=backend_model,
+        timeout_s=timeout_s,
+        sandbox=sandbox,
+        approval_policy=provider.approval_policy,
+        reasoning_effort=effort or provider.reasoning_effort,
+        ephemeral=provider.ephemeral,
+    ))
 
-    if proc.returncode != 0:
-        return InvokeResult(
-            parsed=None,
-            raw_stdout=proc.stdout,
-            cost_usd=0.0,
-            input_tokens=0,
-            output_tokens=0,
-            elapsed_s=elapsed,
-            error=f"{role} exit {proc.returncode}: {proc.stderr[:300]}",
-        )
-
-    envelope = _parse_envelope(proc.stdout)
-    cost = float(envelope.get("total_cost_usd", 0.0)) if envelope else 0.0
-    usage = (envelope or {}).get("usage", {}) or {}
-    in_tok = int(usage.get("input_tokens", 0))
-    out_tok = int(usage.get("output_tokens", 0))
-
-    # Envelope-level errors (eg. error_max_turns) come through with exit 0.
-    err: str | None = None
-    if envelope and envelope.get("is_error"):
-        subtype = envelope.get("subtype", "unknown")
-        terminal = envelope.get("terminal_reason", "")
-        err = f"{role} CLI is_error={subtype} terminal={terminal}"
-
-    parsed = _parse_inner_result(envelope, role)
-
+    parsed = res.parsed or parse_json_loose(res.text)
+    err = res.error
     if not err and not parsed:
         err = f"{role} returned no parseable JSON"
 
     return InvokeResult(
         parsed=parsed,
-        raw_stdout=proc.stdout,
-        cost_usd=cost,
-        input_tokens=in_tok,
-        output_tokens=out_tok,
-        elapsed_s=elapsed,
+        raw_stdout=res.raw_stdout,
+        cost_usd=res.cost_usd,
+        input_tokens=res.input_tokens,
+        output_tokens=res.output_tokens,
+        elapsed_s=res.elapsed_s,
         error=err,
-        _envelope=envelope,
+        _envelope={
+            "backend_id": res.backend_id,
+            "model": res.model,
+            "validation_errors": res.validation_errors,
+        },
     )
 
 
