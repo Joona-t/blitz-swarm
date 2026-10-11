@@ -21,9 +21,15 @@ from backends.core import (
 )
 
 
+NO_MODEL_ERROR = (
+    "no model resolved for this call: configure [models] + "
+    "[backend.providers.<id>.tiers] in blitz.toml (see --list-models)"
+)
+
+
 @dataclass
 class OllamaHTTPBackend:
-    model: str = "qwen2.5:7b"
+    model: str | None = None
     base_url: str = "http://localhost:11434"
     backend_id: str = "ollama"
     adapter_kind: str = "ollama_http"
@@ -44,6 +50,12 @@ class OllamaHTTPBackend:
 
     def call(self, call: AgentCall) -> AgentResult:
         model = call.model or self.model
+        if not model:
+            return AgentResult(
+                backend_id=self.backend_id, adapter_kind=self.adapter_kind,
+                model=None, text="", raw_stdout="", parsed=None, elapsed_s=0.0,
+                errored=True, error=NO_MODEL_ERROR,
+            )
         payload = {
             "model": model,
             "prompt": combined_prompt(call),

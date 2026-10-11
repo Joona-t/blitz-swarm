@@ -38,7 +38,9 @@ class ManagedAgentsConfig:
     session_max_runtime_min: int = 60
     spend_cap_usd_per_run: float = 5.0
     spend_cap_usd_per_day: float = 50.0
-    coordinator_model: str = "claude-opus-4-7"
+    # Set by the caller from config (e.g. resolve_model("coordinator", ...)
+    # or a [managed_agents] key); never a literal default here.
+    coordinator_model: str = ""
     coordinator_prompt: str = (
         "You are the coordinator of a research swarm. Decompose the topic "
         "into sub-questions, delegate to specialist agents, integrate their "

@@ -1,4 +1,10 @@
-"""CLI backend adapters for Codex, Claude, and Gemini."""
+"""CLI backend adapters for Codex, Claude, and Gemini.
+
+Adapters carry no model defaults: the model string arrives on every
+`AgentCall` from `backends.models.resolve_model`, or as the provider's
+legacy `model` key via the registry. A call without a model is an explicit
+error result, never a silent CLI default.
+"""
 
 from __future__ import annotations
 
@@ -12,8 +18,6 @@ from pathlib import Path
 
 from backends.core import (
     DEFAULT_APPROVAL,
-    DEFAULT_CODEX_MODEL,
-    DEFAULT_CODEX_REASONING,
     DEFAULT_SANDBOX,
     AgentCall,
     AgentResult,
@@ -21,7 +25,18 @@ from backends.core import (
     combined_prompt,
     normalize_result,
     parse_json_loose,
+    strip_strict_nulls,
+    to_strict_output_schema,
     validate_json_schema,
+)
+
+# Prompts larger than this go to `claude -p` via stdin instead of argv
+# (argv has an OS limit; stdin does not). backends-07.
+CLAUDE_STDIN_PROMPT_BYTES = 100 * 1024
+
+NO_MODEL_ERROR = (
+    "no model resolved for this call: configure [models] + "
+    "[backend.providers.<id>.tiers] in blitz.toml (see --list-models)"
 )
 
 
@@ -52,10 +67,30 @@ def _read_text_if_present(path: Path) -> str:
     return ""
 
 
+def _error_result(backend, model: str | None, error: str, *, elapsed_s: float = 0.0,
+                  raw_stdout: str = "") -> AgentResult:
+    return AgentResult(
+        backend_id=backend.backend_id,
+        adapter_kind=backend.adapter_kind,
+        model=model,
+        text="",
+        raw_stdout=raw_stdout,
+        parsed=None,
+        elapsed_s=elapsed_s,
+        errored=True,
+        error=error,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Codex
+# ---------------------------------------------------------------------------
+
+
 @dataclass
 class CodexLocalBackend:
-    model: str = DEFAULT_CODEX_MODEL
-    reasoning_effort: str = DEFAULT_CODEX_REASONING
+    model: str | None = None
+    reasoning_effort: str | None = None
     sandbox: str = DEFAULT_SANDBOX
     approval_policy: str = DEFAULT_APPROVAL
     ephemeral: bool = True
@@ -75,22 +110,15 @@ class CodexLocalBackend:
         return shutil.which("codex") is not None
 
     def call(self, call: AgentCall) -> AgentResult:
-        if not self.is_available():
-            return AgentResult(
-                backend_id=self.backend_id,
-                adapter_kind=self.adapter_kind,
-                model=call.model or self.model,
-                text="",
-                raw_stdout="",
-                parsed=None,
-                elapsed_s=0.0,
-                errored=True,
-                error="codex CLI not found on PATH",
-            )
-
         model = call.model or self.model
+        if not self.is_available():
+            return _error_result(self, model, "codex CLI not found on PATH")
+        if not model:
+            return _error_result(self, None, NO_MODEL_ERROR)
+
         sandbox = call.sandbox or self.sandbox
         approval = call.approval_policy or self.approval_policy
+        effort = call.reasoning_effort or self.reasoning_effort
         prompt = combined_prompt(call)
 
         with tempfile.TemporaryDirectory(prefix="blitz-codex-") as td:
@@ -99,7 +127,10 @@ class CodexLocalBackend:
             schema_path: Path | None = None
             if call.schema:
                 schema_path = tmp / "schema.json"
-                schema_path.write_text(json.dumps(call.schema), encoding="utf-8")
+                schema_path.write_text(
+                    json.dumps(to_strict_output_schema(call.schema)),
+                    encoding="utf-8",
+                )
 
             cmd = [
                 "codex",
@@ -110,11 +141,10 @@ class CodexLocalBackend:
                 "--json",
                 "--output-last-message", str(output_path),
             ]
-            if call.reasoning_effort or self.reasoning_effort:
-                cmd.extend([
-                    "-c",
-                    f"model_reasoning_effort={json.dumps(call.reasoning_effort or self.reasoning_effort)}",
-                ])
+            if effort:
+                # Codex effort vocabulary comes from the provider config
+                # (`reasoning_effort` / `[effort]`), forwarded verbatim.
+                cmd.extend(["-c", f"model_reasoning_effort={json.dumps(effort)}"])
             if call.cwd:
                 cmd.extend(["--cd", str(call.cwd)])
             if call.ephemeral and self.ephemeral:
@@ -134,28 +164,15 @@ class CodexLocalBackend:
                     cwd=str(call.cwd) if call.cwd else None,
                 )
             except subprocess.TimeoutExpired as exc:
-                return AgentResult(
-                    backend_id=self.backend_id,
-                    adapter_kind=self.adapter_kind,
-                    model=model,
-                    text="",
-                    raw_stdout=exc.stdout if isinstance(exc.stdout, str) else "",
-                    parsed=None,
+                return _error_result(
+                    self, model, f"codex timed out after {call.timeout_s}s",
                     elapsed_s=time.monotonic() - start,
-                    errored=True,
-                    error=f"codex timed out after {call.timeout_s}s",
+                    raw_stdout=exc.stdout if isinstance(exc.stdout, str) else "",
                 )
             except Exception as exc:
-                return AgentResult(
-                    backend_id=self.backend_id,
-                    adapter_kind=self.adapter_kind,
-                    model=model,
-                    text="",
-                    raw_stdout="",
-                    parsed=None,
+                return _error_result(
+                    self, model, f"codex subprocess exception: {exc!r}",
                     elapsed_s=time.monotonic() - start,
-                    errored=True,
-                    error=f"codex subprocess exception: {exc!r}",
                 )
 
             elapsed = time.monotonic() - start
@@ -164,7 +181,7 @@ class CodexLocalBackend:
                 final_text = _extract_last_codex_agent_message(proc.stdout)
             if not final_text:
                 final_text = proc.stdout.strip()
-            result = normalize_result(
+            return normalize_result(
                 backend_id=self.backend_id,
                 adapter_kind=self.adapter_kind,
                 model=model,
@@ -177,13 +194,44 @@ class CodexLocalBackend:
                     f"codex exit {proc.returncode}: {(proc.stderr or '')[:500]}"
                     if proc.returncode != 0 else None
                 ),
+                strict_nulls=True,
             )
-            return result
+
+
+# ---------------------------------------------------------------------------
+# Claude
+# ---------------------------------------------------------------------------
+
+_CLAUDE_EFFORT_SUPPORT: bool | None = None
+
+
+def claude_supports_effort() -> bool:
+    """Probe `claude --help` once for `--effort`; cached for the process.
+
+    Tests reset the cache with `reset_claude_probe_cache()` and mock
+    `subprocess.run`. The probe is not a model invocation.
+    """
+    global _CLAUDE_EFFORT_SUPPORT
+    if _CLAUDE_EFFORT_SUPPORT is None:
+        try:
+            proc = subprocess.run(
+                ["claude", "--help"], capture_output=True, text=True, timeout=20,
+            )
+            _CLAUDE_EFFORT_SUPPORT = "--effort" in f"{proc.stdout or ''}{proc.stderr or ''}"
+        except Exception:
+            _CLAUDE_EFFORT_SUPPORT = False
+    return _CLAUDE_EFFORT_SUPPORT
+
+
+def reset_claude_probe_cache() -> None:
+    global _CLAUDE_EFFORT_SUPPORT
+    _CLAUDE_EFFORT_SUPPORT = None
 
 
 @dataclass
 class ClaudeCLIBackend:
-    model: str = "sonnet"
+    model: str | None = None
+    reasoning_effort: str | None = None
     backend_id: str = "claude"
     adapter_kind: str = "claude_cli"
 
@@ -198,31 +246,49 @@ class ClaudeCLIBackend:
         return shutil.which("claude") is not None
 
     def call(self, call: AgentCall) -> AgentResult:
-        if not self.is_available():
-            return AgentResult(
-                backend_id=self.backend_id, adapter_kind=self.adapter_kind,
-                model=call.model or self.model, text="", raw_stdout="",
-                parsed=None, elapsed_s=0.0, errored=True,
-                error="claude CLI not found on PATH",
-            )
         model = call.model or self.model
-        cmd = ["claude", "-p", call.prompt, "--output-format", "json", "--model", model]
+        if not self.is_available():
+            return _error_result(self, model, "claude CLI not found on PATH")
+        if not model:
+            return _error_result(self, None, NO_MODEL_ERROR)
+
+        prompt = call.prompt
+        use_stdin = len(prompt.encode("utf-8")) > CLAUDE_STDIN_PROMPT_BYTES
+        cmd = ["claude", "-p"]
+        if not use_stdin:
+            cmd.append(prompt)
+        cmd.extend(["--output-format", "json", "--model", model])
+        effort = call.reasoning_effort or self.reasoning_effort
+        if effort and claude_supports_effort():
+            cmd.extend(["--effort", effort])
         if call.system_prompt:
             cmd.extend(["--system-prompt", call.system_prompt])
         if call.schema:
             cmd.extend(["--json-schema", json.dumps(call.schema)])
+
+        run_kwargs: dict = {
+            "capture_output": True,
+            "text": True,
+            "timeout": call.timeout_s,
+            "cwd": str(call.cwd) if call.cwd else None,
+        }
+        if use_stdin:
+            run_kwargs["input"] = prompt
+        else:
+            run_kwargs["stdin"] = subprocess.DEVNULL
+
         start = time.monotonic()
         try:
-            proc = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=call.timeout_s,
-                cwd=str(call.cwd) if call.cwd else None,
-            )
+            proc = subprocess.run(cmd, **run_kwargs)
         except subprocess.TimeoutExpired:
-            return AgentResult(
-                backend_id=self.backend_id, adapter_kind=self.adapter_kind,
-                model=model, text="", raw_stdout="", parsed=None,
-                elapsed_s=time.monotonic() - start, errored=True,
-                error=f"claude timed out after {call.timeout_s}s",
+            return _error_result(
+                self, model, f"claude timed out after {call.timeout_s}s",
+                elapsed_s=time.monotonic() - start,
+            )
+        except Exception as exc:
+            return _error_result(
+                self, model, f"claude subprocess exception: {exc!r}",
+                elapsed_s=time.monotonic() - start,
             )
         elapsed = time.monotonic() - start
         envelope = parse_json_loose(proc.stdout)
@@ -232,7 +298,8 @@ class ClaudeCLIBackend:
         in_tok = 0
         out_tok = 0
         if envelope:
-            cost = float(envelope.get("total_cost_usd", 0.0) or 0.0)
+            raw_cost = envelope.get("total_cost_usd")
+            cost = float(raw_cost) if isinstance(raw_cost, (int, float)) else None
             usage = envelope.get("usage", {}) or {}
             in_tok = int(usage.get("input_tokens", 0) or 0)
             out_tok = int(usage.get("output_tokens", 0) or 0)
@@ -259,7 +326,13 @@ class ClaudeCLIBackend:
             elapsed_s=elapsed, errored=proc.returncode != 0 or bool(validation_errors),
             error=error, cost_usd=cost, input_tokens=in_tok,
             output_tokens=out_tok, validation_errors=validation_errors,
+            metadata={"effort": effort, "prompt_via": "stdin" if use_stdin else "argv"},
         )
+
+
+# ---------------------------------------------------------------------------
+# Gemini
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -274,15 +347,13 @@ class GeminiCLIBackend:
         return shutil.which("gemini") is not None
 
     def call(self, call: AgentCall) -> AgentResult:
+        model = call.model or self.model
         if not self.is_available():
-            return AgentResult(
-                backend_id=self.backend_id, adapter_kind=self.adapter_kind,
-                model=call.model or self.model, text="", raw_stdout="",
-                parsed=None, elapsed_s=0.0, errored=True,
-                error="gemini CLI not found on PATH",
-            )
+            return _error_result(self, model, "gemini CLI not found on PATH")
+        if not model:
+            return _error_result(self, None, NO_MODEL_ERROR)
         prompt = combined_prompt(call)
-        cmd = ["gemini", "-p", prompt]
+        cmd = ["gemini", "-m", model, "-p", prompt]
         start = time.monotonic()
         try:
             proc = subprocess.run(
@@ -290,17 +361,20 @@ class GeminiCLIBackend:
                 cwd=str(call.cwd) if call.cwd else None,
             )
         except subprocess.TimeoutExpired:
-            return AgentResult(
-                backend_id=self.backend_id, adapter_kind=self.adapter_kind,
-                model=call.model or self.model, text="", raw_stdout="",
-                parsed=None, elapsed_s=time.monotonic() - start, errored=True,
-                error=f"gemini timed out after {call.timeout_s}s",
+            return _error_result(
+                self, model, f"gemini timed out after {call.timeout_s}s",
+                elapsed_s=time.monotonic() - start,
+            )
+        except Exception as exc:
+            return _error_result(
+                self, model, f"gemini subprocess exception: {exc!r}",
+                elapsed_s=time.monotonic() - start,
             )
         elapsed = time.monotonic() - start
         return normalize_result(
             backend_id=self.backend_id,
             adapter_kind=self.adapter_kind,
-            model=call.model or self.model,
+            model=model,
             text=proc.stdout.strip(),
             raw_stdout=proc.stdout,
             schema=call.schema,

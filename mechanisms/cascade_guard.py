@@ -62,8 +62,10 @@ class AtomicClaim:
 @dataclass
 class GuardConfig:
     mode: GuardMode = "balanced"
-    decompose_model: str = "haiku"          # used by orchestrator integration
-    adjudicate_model: str = "sonnet"
+    # Injected by the orchestrator from the `guard` role tier; empty = the
+    # heuristic (word-overlap) path only. Never a literal model default.
+    decompose_model: str = ""
+    adjudicate_model: str = ""
     max_claims_per_msg: int = 12
     yellow_release_threshold: float = 0.7
     cache_ttl_s: int = 600

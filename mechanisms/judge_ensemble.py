@@ -42,7 +42,9 @@ class JudgeConfig:
     min_rounds: int = 2
     score_buckets: int = 11              # 0..10 maps to k=10
     seed_strategy: Literal["prompt_seed", "model_mix", "both"] = "prompt_seed"
-    judge_models: tuple[str, ...] = ("sonnet", "sonnet", "haiku")
+    # Model strings are injected by the caller (orchestrator resolves the
+    # `judge` role tier via backends.models.resolve_model); never defaulted here.
+    judge_models: tuple[str, ...] = ()
     rubric_dims: tuple[str, ...] = ("coverage", "accuracy", "clarity", "depth")
     distribution: Literal["empirical", "bb_mixture"] = "empirical"
     aggregator: Literal["mean", "median", "trimmed_mean"] = "mean"
@@ -252,7 +254,8 @@ class JudgeEnsemble:
         for i in range(self.cfg.n_judges):
             judge_id = f"judge_{i:02d}"
             seed = self._seed_for(i, round_n)
-            model = self.cfg.judge_models[i % len(self.cfg.judge_models)]
+            models = self.cfg.judge_models
+            model = models[i % len(models)] if models else ""
             t0 = time.monotonic()
             try:
                 vote = self.judge_fn(

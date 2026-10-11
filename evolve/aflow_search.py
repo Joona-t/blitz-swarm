@@ -41,7 +41,7 @@ class RoleKind(Enum):
 class Node:
     id: str
     kind: RoleKind
-    cli: str = "claude:sonnet"
+    cli: str = "claude"      # provider id only ([backend.providers]); model comes from role tiers
 
 
 @dataclass(frozen=True)

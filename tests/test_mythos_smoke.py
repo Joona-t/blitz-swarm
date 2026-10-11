@@ -23,26 +23,57 @@ def test_mythos_package_imports():
             CostBudget,
             MythosResult,
             load_mythos_config,
-            resolve_model,
             run_mythos,
         )
     finally:
         sys.path.pop(0)
     assert run_mythos is not None
-    assert MythosConfig().planner_model == "mythos"
+    # v0.3.0: no alias table. Empty = use blitz.toml [models].<role> tier.
+    assert MythosConfig().planner_model == ""
+    assert not hasattr(__import__("mythos.policies", fromlist=["x"]), "MODEL_ALIASES")
 
 
-def test_resolve_model_aliases():
+def test_role_tier_resolution_order(monkeypatch):
+    """mythos.toml tier beats blitz.toml [models]; env BLITZ_MODEL_<ROLE> and
+    BLITZ_MODEL beat the mythos.toml tier; provider `model` never shadows the
+    role tier (the v0.2 `provider.model or model` bug)."""
     sys.path.insert(0, str(REPO_ROOT))
     try:
-        from mythos.policies import resolve_model
+        from config import load_config
+        from mythos._invoke import resolve_role_model
     finally:
         sys.path.pop(0)
-    assert resolve_model("mythos") == ("opus", "max")
-    assert resolve_model("sonnet") == ("sonnet", None)
-    assert resolve_model("opus") == ("opus", None)
-    # Unknown alias passes through
-    assert resolve_model("claude-opus-4-7") == ("claude-opus-4-7", None)
+    cfg = load_config()
+    for var in ("BLITZ_MODEL", "BLITZ_MODEL_PLANNER", "BLITZ_MODEL_EXECUTOR", "BLITZ_BACKEND"):
+        monkeypatch.delenv(var, raising=False)
+    claude = cfg.backend.get_provider("claude")
+    claude.model = "legacy-provider-wide"          # must NOT win over the role tier
+
+    deep = resolve_role_model("planner", "deep", cfg, backend_id="claude")
+    assert (deep.model, deep.tier, deep.effort) == (claude.tiers["deep"], "deep", claude.effort["deep"])
+    fast = resolve_role_model("planner", "fast", cfg, backend_id="claude")
+    assert fast.model == claude.tiers["fast"]
+    # no overlay tier -> blitz.toml [models].planner
+    base = resolve_role_model("planner", "", cfg, backend_id="claude")
+    assert base.tier == cfg.models.roles["planner"]
+
+    monkeypatch.setenv("BLITZ_MODEL_PLANNER", "fast")
+    assert resolve_role_model("planner", "deep", cfg, backend_id="claude").model == claude.tiers["fast"]
+    monkeypatch.setenv("BLITZ_MODEL", "cli-override")
+    assert resolve_role_model("planner", "deep", cfg, backend_id="claude").model == "cli-override"
+
+
+def test_cost_budget_token_ceiling():
+    sys.path.insert(0, str(REPO_ROOT))
+    try:
+        from mythos.policies import CostBudget
+    finally:
+        sys.path.pop(0)
+    b = CostBudget(ceiling_usd=5.0, token_ceiling=100)
+    b.charge(None, tokens=60)        # unknown cost is not 0 spend
+    assert b.spent_usd == 0.0 and not b.exceeded()
+    b.charge(None, tokens=40)
+    assert b.tokens_exceeded() and b.exceeded() and not b.cost_exceeded()
 
 
 def test_cost_budget():
@@ -67,11 +98,13 @@ def test_load_mythos_config_with_toml():
     finally:
         sys.path.pop(0)
     cfg = load_mythos_config(REPO_ROOT / "mythos.toml")
-    # Defaults from mythos.toml
-    assert cfg.planner_model == "mythos"
-    assert cfg.executor_model == "sonnet"
-    assert cfg.verifier_model == "mythos"
+    # v0.3.0: mythos.toml [models] names TIERS, resolved per backend through
+    # backends.models.resolve_model (claude deep tier = Fable 5.1).
+    assert cfg.planner_model == "deep"
+    assert cfg.executor_model == "fast"
+    assert cfg.verifier_model == "deep"
     assert cfg.cost_ceiling_usd == 5.0
+    assert cfg.token_ceiling == 2_000_000
     assert cfg.max_replans == 3
 
 
@@ -134,6 +167,8 @@ def test_mythos_dry_run_no_cli_call():
     assert "planner_model" in out.stdout
     assert "executor_model" in out.stdout
     assert "verifier_model" in out.stdout
+    assert "token_ceiling" in out.stdout
+    assert "resolved" in out.stdout and "planner=" in out.stdout
     assert "No CLI calls will be made" in out.stdout
 
 

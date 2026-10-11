@@ -1,61 +1,56 @@
-"""Mythos Swarm — policies, model aliases, cost budget.
+"""Mythos Swarm — role tiers, cost/token budget, config overlay.
 
-The model alias layer decouples our code from Anthropic's naming churn.
-"mythos" today maps to ("opus", effort="max"); the day a real Mythos model
-ships, we change one dict entry and the whole swarm picks it up.
+Mythos names ROLES (planner / executor / verifier). Each role's model comes
+from `backends.models.resolve_model(role, backend_id, cfg, override=<tier>)`
+where `<tier>` is the optional `[models]` value in mythos.toml ("deep",
+"fast", ...). The tier resolves through the active backend's
+`[backend.providers.<id>.tiers]` table in blitz.toml, so switching
+`--backend` switches every Mythos model with it. No model name lives here.
 """
 
 from __future__ import annotations
 
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
-# ---------------------------------------------------------------------------
-# Model aliases
-# ---------------------------------------------------------------------------
-
-# alias -> (claude --model value, --effort value or None)
-# CLI probe (2026-05-09) confirmed: --model opus routes to claude-opus-4-7,
-# --effort accepts {low, medium, high, xhigh, max}. Mythos = opus + effort max.
-MODEL_ALIASES: dict[str, tuple[str, str | None]] = {
-    "mythos": ("opus", "max"),     # extended-thinking Opus; the killer model
-    "opus": ("opus", None),        # plain Opus 4.7 — orchestration without thinking budget
-    "sonnet": ("sonnet", None),    # workhorse executor
-    "haiku": ("haiku", None),      # cheapest executor
-}
-
-
-def resolve_model(alias: str) -> tuple[str, str | None]:
-    """Map an alias to (model, effort) for `claude -p` invocation.
-
-    Unknown aliases pass through unchanged with effort=None — lets users
-    pass concrete model IDs (e.g. "claude-opus-4-7") directly.
-    """
-    if alias in MODEL_ALIASES:
-        return MODEL_ALIASES[alias]
-    return (alias, None)
+MYTHOS_ROLES: tuple[str, ...] = ("planner", "executor", "verifier")
 
 
 # ---------------------------------------------------------------------------
-# Cost budget — hard ceiling enforcement
+# Budget — cost ceiling (only when cost is known) + token ceiling (always)
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class CostBudget:
-    """Track cumulative cost across a Mythos run; abort when ceiling hit."""
+    """Track cumulative spend across a Mythos run; abort when a ceiling hits.
+
+    `ceiling_usd` applies only to cost the provider actually reported (an
+    unknown cost is charged as nothing, never as 0 toward a false "fine").
+    `token_ceiling` (input + output tokens) applies always; 0 disables it.
+    """
     ceiling_usd: float = 5.0
     spent_usd: float = 0.0
+    token_ceiling: int = 0
+    tokens_spent: int = 0
 
-    def charge(self, amount_usd: float) -> None:
-        self.spent_usd += amount_usd
+    def charge(self, amount_usd: float | None, tokens: int = 0) -> None:
+        if amount_usd is not None:
+            self.spent_usd += amount_usd
+        self.tokens_spent += max(0, int(tokens or 0))
 
     def remaining(self) -> float:
         return max(0.0, self.ceiling_usd - self.spent_usd)
 
-    def exceeded(self) -> bool:
+    def cost_exceeded(self) -> bool:
         return self.spent_usd >= self.ceiling_usd
+
+    def tokens_exceeded(self) -> bool:
+        return self.token_ceiling > 0 and self.tokens_spent >= self.token_ceiling
+
+    def exceeded(self) -> bool:
+        return self.cost_exceeded() or self.tokens_exceeded()
 
 
 # ---------------------------------------------------------------------------
@@ -65,17 +60,19 @@ class CostBudget:
 
 @dataclass
 class MythosConfig:
-    # Models (aliases — resolved via resolve_model at call time)
-    planner_model: str = "mythos"
-    executor_model: str = "sonnet"
-    verifier_model: str = "mythos"
+    # Per-role TIER override (mythos.toml [models]). Empty = use blitz.toml
+    # [models].<role>. Env BLITZ_MODEL / BLITZ_MODEL_<ROLE> beat both.
+    planner_model: str = ""
+    executor_model: str = ""
+    verifier_model: str = ""
 
     # Loop budget
     max_replans: int = 3
     max_executors: int = 8         # cap on parallel sub-specs per round
 
-    # Cost ceiling
-    cost_ceiling_usd: float = 5.0
+    # Ceilings
+    cost_ceiling_usd: float = 5.0  # applies only when the provider reports cost
+    token_ceiling: int = 2_000_000 # input + output tokens; applies always
 
     # Timeouts
     planner_timeout_s: int = 600   # extended-thinking can take a while
@@ -87,7 +84,11 @@ class MythosConfig:
 
     # Feature flags
     use_redis: bool = False        # default off; Mythos runs are usually one-shot
-    use_memory: bool = True        # G-Memory shared blackboard with mode tag
+    use_memory: bool = True        # G-Memory shared blackboard with mode tag (WP2 wires it)
+
+    def tier_for(self, role: str) -> str | None:
+        """The mythos.toml tier override for `role`, or None."""
+        return getattr(self, f"{role}_model", "") or None
 
 
 def load_mythos_config(path: Path | None = None) -> MythosConfig:
@@ -109,11 +110,11 @@ def load_mythos_config(path: Path | None = None) -> MythosConfig:
     models = raw.get("models", {}) or {}
     for k in ("planner_model", "executor_model", "verifier_model"):
         if k in models:
-            setattr(cfg, k, models[k])
+            setattr(cfg, k, str(models[k]))
 
     policies = raw.get("policies", {}) or {}
     for k in (
-        "max_replans", "max_executors", "cost_ceiling_usd",
+        "max_replans", "max_executors", "cost_ceiling_usd", "token_ceiling",
         "planner_timeout_s", "executor_timeout_s", "verifier_timeout_s",
         "output_dir", "use_redis", "use_memory",
     ):

@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from agents import BlitzAgent
-from backends import AgentCall, AgentResult
+from backends import AgentCall, AgentResult, resolve_model
 from config import load_config
 from mechanisms.cascade_guard import CascadeGuard
 from mechanisms.cascade_guard import GuardConfig as CascadeGuardConfig
@@ -70,7 +70,6 @@ def _agent(agent_id: str, role: str) -> BlitzAgent:
         role=role,
         subtopic="topic",
         system_prompt="system",
-        model="sonnet",
     )
 
 
@@ -91,7 +90,9 @@ def test_invoke_agent_uses_backend_layer_and_codex_model():
 
     assert output["findings"].startswith("## Finding")
     assert output["backend_id"] == "codex"
-    assert fake.calls[0].model == cfg.backend.codex.model
+    # v0.3.0: model resolved through [models] role tier -> provider tiers,
+    # never a provider-wide literal.
+    assert fake.calls[0].model == resolve_model("researcher", "codex", cfg).model
     assert fake.calls[0].sandbox == "read-only"
     assert fake.calls[0].approval_policy == "never"
 

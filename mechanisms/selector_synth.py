@@ -14,14 +14,14 @@ Pipeline:
     3. select_within_cluster — pairwise judging + Bradley-Terry MLE
                             picks the highest-skill span per cluster
     4. assemble           — concatenate selected spans, optional
-                            haiku-smoothed transitions
+                            LLM-smoothed transitions (smooth_model)
 
 Bradley-Terry MLE: iterative Minorization-Maximization (MM).
 No scipy required. Converges in ~30 iterations for typical N<=10 spans.
 
 Pluggable hooks: `pairwise_judge_fn` is the only LLM call. Default
 mock implementation is for tests; orchestrator integration replaces
-with a Claude Sonnet subprocess.
+with the configured backend on the `judge` role tier.
 """
 
 from __future__ import annotations
@@ -42,14 +42,15 @@ from typing import Callable, Iterable, Literal
 class SelectorConfig:
     granularity: Literal["whole", "section", "paragraph"] = "section"
     n_judges: int = 3
-    judge_models: tuple[str, ...] = ("sonnet", "sonnet", "haiku")
+    # Injected by the orchestrator from the `judge` role tier; no literal default.
+    judge_models: tuple[str, ...] = ()
     pairwise_random_order: bool = True
     bt_regularization: float = 1e-3
     bt_max_iterations: int = 100
     bt_tolerance: float = 1e-6
     min_section_chars: int = 200
     transition_strategy: Literal["smooth", "concat"] = "concat"
-    smooth_model: str = "haiku"
+    smooth_model: str = ""             # injected; empty = no LLM smoothing
     candidate_cap: int = 5             # qualifier round if more
 
 

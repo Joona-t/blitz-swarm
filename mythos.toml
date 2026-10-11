@@ -3,21 +3,28 @@
 # Keep blitz.toml separate; this overlays only when --mode mythos is active.
 
 [models]
-# Aliases resolved via mythos.policies.MODEL_ALIASES.
-# Default: planner + verifier on Mythos (extended-thinking Opus),
-# executor on Sonnet for cheap parallelism.
-planner_model = "mythos"
-executor_model = "sonnet"
-verifier_model = "mythos"
+# Role -> TIER (not model names). Tiers resolve through the active backend's
+# [backend.providers.<id>.tiers] table in blitz.toml via
+# backends.models.resolve_model(role, backend_id, cfg).
+#
+# On the claude backend: deep = "fable" (Fable 5.1, effort "max") — this is
+# the Mythos planner + verifier. fast = "haiku" for cheap parallel executors.
+# Switch backends with --backend / BLITZ_BACKEND; the tiers follow.
+# Override per role with BLITZ_MODEL_PLANNER / _EXECUTOR / _VERIFIER.
+planner_model = "deep"
+executor_model = "fast"
+verifier_model = "deep"
 
 [policies]
 # Loop budget
 max_replans = 3
 max_executors = 8
 
-# Hard cost ceiling per task (USD). Run aborts and emits partial artifact if hit.
-# CLI probe showed a single trivial Mythos call costs ~$0.33; $5 gives 15× headroom.
+# Cost ceiling per task (USD). Applies ONLY when the provider reports cost or
+# [backend.providers.<id>.pricing] is configured; unknown cost never trips it.
 cost_ceiling_usd = 5.0
+# Token ceiling per task (input + output). Applies always.
+token_ceiling = 2_000_000
 
 # Timeouts (seconds)
 planner_timeout_s = 600

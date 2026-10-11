@@ -32,7 +32,7 @@ RelevanceFn = Callable[[str, str, str], tuple[float, float]]
 SparsifyFn = Callable[[list[dict], str, str], tuple[list[dict], float]]
 
 
-def heuristic_relevance(new_query: str, candidate_text: str, model: str = "haiku") -> tuple[float, float]:
+def heuristic_relevance(new_query: str, candidate_text: str, model: str = "") -> tuple[float, float]:
     """Heuristic relevance — Jaccard token overlap. Returns (score 0..1, cost 0)."""
     a_words = set(new_query.lower().split())
     b_words = set(candidate_text.lower().split())
@@ -43,7 +43,7 @@ def heuristic_relevance(new_query: str, candidate_text: str, model: str = "haiku
 
 
 def heuristic_sparsify(
-    utterances: list[dict], new_query: str, model: str = "haiku",
+    utterances: list[dict], new_query: str, model: str = "",
 ) -> tuple[list[dict], float]:
     """Heuristic sparsification — keep top 5 by relevance to new_query. Free."""
     scored: list[tuple[float, dict]] = []
@@ -75,8 +75,13 @@ def retrieve(
     use_llm: bool = True,
     relevance_fn: RelevanceFn | None = None,
     sparsify_fn: SparsifyFn | None = None,
+    model: str = "",
 ) -> RetrievalResult:
-    """Run the 6-step retrieval pipeline."""
+    """Run the 6-step retrieval pipeline.
+
+    `model` is forwarded to the LLM hooks; the orchestrator resolves it from
+    the `memory_ops` role tier. Empty = heuristic hooks (no model needed).
+    """
     relevance_fn = relevance_fn or heuristic_relevance
     sparsify_fn = sparsify_fn or heuristic_sparsify
     cost = 0.0
@@ -109,7 +114,7 @@ def retrieve(
     if use_llm and candidates:
         scored: list[tuple[float, object]] = []
         for c in candidates[:MAX_LLM_RELEVANCE_CALLS]:
-            rel, c_cost = relevance_fn(new_query, c.query_text, "haiku")
+            rel, c_cost = relevance_fn(new_query, c.query_text, model)
             scored.append((rel, c))
             cost += c_cost
         scored.sort(key=lambda x: x[0], reverse=True)

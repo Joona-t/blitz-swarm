@@ -1,8 +1,11 @@
 """Cross-CLI router — selects which local CLI handles each role call.
 
-Configuration: a TOML routing table maps `(domain, role)` -> `cli_id`.
-Default fallback is `claude`. Adapters are detected at construction
-time via `shutil.which`; missing CLIs gracefully fall back.
+Configuration: a TOML routing table maps `(domain, role)` -> `cli_id`, where
+`cli_id` is a PROVIDER id from blitz.toml `[backend.providers]` (never a model
+name; models resolve per role via backends.models). Adapters are detected at
+construction time via `shutil.which`; when a `BlitzConfig` is passed, only
+providers defined under `[backend.providers]` are eligible and
+`[backend] default` is the fallback. Missing CLIs gracefully fall back.
 
 All adapters use subprocess invocation. No CLI is required for testing —
 the adapters are pluggable.
@@ -166,17 +169,23 @@ class CLIRouter:
         *,
         adapters: list[CLIAdapter] | None = None,
         fallback_cli: str = "claude",
+        cfg=None,
     ):
         self.routing_table = routing_table or []
         if adapters is None:
             adapters = [ClaudeCLI(), CodexCLI(), GeminiCLI()]
+        configured: set[str] | None = None
+        if cfg is not None:
+            configured = set(cfg.backend.providers)
+            fallback_cli = cfg.backend.default or fallback_cli
         self.adapters: dict[str, CLIAdapter] = {
-            a.cli_id: a for a in adapters if a.is_available()
+            a.cli_id: a for a in adapters
+            if a.is_available() and (configured is None or a.cli_id in configured)
         }
         self.fallback_cli = fallback_cli
 
     @classmethod
-    def from_toml(cls, path: Path, *, adapters: list[CLIAdapter] | None = None) -> "CLIRouter":
+    def from_toml(cls, path: Path, *, adapters: list[CLIAdapter] | None = None, cfg=None) -> "CLIRouter":
         """Parse a routing-table TOML file.
 
         Schema:
@@ -201,7 +210,7 @@ class CLIRouter:
                     continue
                 for role, cli_id in role_map.items():
                     entries.append(RouteEntry(domain=domain_name, role=role, cli_id=cli_id))
-        return cls(entries, adapters=adapters)
+        return cls(entries, adapters=adapters, cfg=cfg)
 
     def route(
         self,

@@ -73,7 +73,9 @@ _TRUNCATE_CHARS: int = 12_000
 
 # Live CLI wiring (rule: user's own CLI subscription via subprocess — never a
 # paid API). The extraction call is text-in/text-out with all tools disabled.
-_CLI_MODEL: str = "sonnet"
+# The model is resolved per backend from blitz.toml [models] tiers under the
+# `candidate_extractor` role (falls back to [models].default) — no literal.
+_CLI_MODEL_ROLE: str = "candidate_extractor"
 _CLI_DISALLOWED_TOOLS: str = "Bash,Edit,Write,Read,Task,WebFetch,WebSearch"
 DEFAULT_TIMEOUT_S: int = 240
 
@@ -285,17 +287,26 @@ def _live_candidates(
     return ranked
 
 
+def _extraction_model(backend: str) -> str:
+    """Model string for the extraction call: blitz.toml [models] tier for the
+    ``candidate_extractor`` role on ``backend`` (backends.models.resolve_model)."""
+    from backends.models import resolve_model  # noqa: PLC0415
+    from config import load_config  # noqa: PLC0415
+
+    return resolve_model(_CLI_MODEL_ROLE, backend, load_config()).model
+
+
 def _build_argv_tail(backend: str) -> list[str] | None:
     """Flags appended after ``[backend, '-p', prompt]``; None if unsupported.
 
-    Only the ``claude`` CLI is wired (text-out, sonnet, all tools disabled —
-    pure extraction, the model must not touch the repo). Unknown backends are
-    a fail-soft ``[]`` upstream, not an exception.
+    Only the ``claude`` CLI is wired (text-out, default-tier model, all tools
+    disabled — pure extraction, the model must not touch the repo). Unknown
+    backends are a fail-soft ``[]`` upstream, not an exception.
     """
     if backend == "claude":
         return [
             "--output-format", "text",
-            "--model", _CLI_MODEL,
+            "--model", _extraction_model(backend),
             "--disallowedTools", _CLI_DISALLOWED_TOOLS,
         ]
     return None

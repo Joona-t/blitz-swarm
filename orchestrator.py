@@ -22,7 +22,8 @@ from agents import (
     BlitzAgent,
     plan_agents,
 )
-from backends import AgentBackend, AgentCall, make_backend
+from backends import AgentBackend, AgentCall, make_provider_backend
+from backends.models import ModelResolutionError, ResolvedModel, format_models_table, resolve_model
 from config import load_config
 from consensus import (
     check_consensus,
@@ -66,6 +67,25 @@ JUDGE_VOTE_SCHEMA = {
     "required": ["aggregate_score", "rationale"],
 }
 
+def _judge_vote_schema(rubric_dims: tuple[str, ...]) -> dict:
+    """JUDGE_VOTE_SCHEMA with rubric_scores keyed by the actual rubric dims.
+
+    A free-form `{"type": "object"}` cannot be expressed in Codex's strict
+    structured-output mode, so the scores would be forced to `{}`. Naming
+    the dimensions keeps per-dimension scores on every backend (BUG-002).
+    """
+    schema = json.loads(json.dumps(JUDGE_VOTE_SCHEMA))
+    schema["properties"]["rubric_scores"] = {
+        "type": "object",
+        "properties": {
+            dim: {"type": "number", "minimum": 0, "maximum": 10}
+            for dim in rubric_dims
+        },
+        "required": list(rubric_dims),
+    }
+    return schema
+
+
 PAIRWISE_VERDICT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -100,9 +120,29 @@ def _backend_settings(
     return cfg, selected, provider, resolved_sandbox
 
 
+def _resolved_for_agent(agent: BlitzAgent, backend_id: str, cfg) -> ResolvedModel:
+    """Resolve the agent's model+effort through [models] role tiers -> provider tiers.
+
+    `agent.model` is not consulted: the role tier, `--model` / `BLITZ_MODEL` /
+    `BLITZ_MODEL_<ROLE>` are the contract (backends/models.py). Raises
+    ModelResolutionError, never a silent default.
+    """
+    return resolve_model(agent.role, backend_id, cfg)
+
+
 def _model_for_agent(agent: BlitzAgent, backend_id: str, provider, cfg) -> str:
-    """Map legacy role models to backend-native models."""
-    return provider.model or agent.model or cfg.swarm.default_model
+    """Model string for `agent` (see `_resolved_for_agent`)."""
+    return _resolved_for_agent(agent, backend_id, cfg).model
+
+
+def _model_label(role: str, backend_id: str, cfg) -> str:
+    """`<model> (<tier>, effort=<e>)` for dry-run / banner prints; a resolution
+    error is shown inline instead of raised so dry runs stay informative."""
+    try:
+        r = resolve_model(role, backend_id, cfg)
+    except ModelResolutionError as exc:
+        return f"! {exc}"
+    return f"{r.model} ({r.tier}, effort={r.effort or '-'})"
 
 
 def _make_runtime_backend(
@@ -116,17 +156,9 @@ def _make_runtime_backend(
         backend_id=backend_id,
         sandbox=sandbox,
     )
-    return make_backend(
-        selected,
-        adapter=provider.adapter,
-        model=provider.model or cfg.swarm.default_model,
-        reasoning_effort=provider.reasoning_effort,
-        sandbox=resolved_sandbox,
-        approval_policy=provider.approval_policy,
-        ephemeral=provider.ephemeral,
-        base_url=provider.base_url,
-        **provider.metadata,
-    )
+    # Data-driven by provider.adapter; wraps the [backend] fallback chain so
+    # an "unavailable"-class error is retried once on the next provider.
+    return make_provider_backend(selected, cfg, sandbox=resolved_sandbox)
 
 
 def _feature_enabled(
@@ -217,7 +249,8 @@ def invoke_agent(
         backend_id=selected_backend,
         sandbox=resolved_sandbox,
     )
-    model = _model_for_agent(agent, selected_backend, provider, cfg)
+    resolved = _resolved_for_agent(agent, selected_backend, cfg)
+    model = resolved.model
     _telemetry = {}
 
     def _tag(output: dict) -> dict:
@@ -243,7 +276,7 @@ def invoke_agent(
                 cwd=Path(__file__).parent,
                 sandbox=resolved_sandbox,
                 approval_policy=provider.approval_policy,
-                reasoning_effort=provider.reasoning_effort,
+                reasoning_effort=resolved.effort or provider.reasoning_effort or None,
                 ephemeral=provider.ephemeral,
             ))
             _telemetry = {
@@ -735,7 +768,13 @@ def _make_judge_fn(
     provider,
     sandbox: str,
 ):
-    """Build JudgeEnsemble's pluggable LLM hook on top of AgentBackend."""
+    """Build JudgeEnsemble's pluggable LLM hook on top of AgentBackend.
+
+    The judge model is the `judge` role tier (blitz.toml [models].judge);
+    JudgeConfig.judge_models is filled from the same resolution by
+    `_run_judge_ensemble`, so `model_alias` is the resolved model string.
+    """
+    judge = resolve_model("judge", backend_id, cfg)
 
     def _judge(
         candidate: str,
@@ -745,7 +784,7 @@ def _make_judge_fn(
         seed: int,
         rubric_dims: tuple[str, ...],
     ) -> JudgeVote:
-        model = provider.model or model_alias or cfg.swarm.default_model
+        model = model_alias or judge.model
         prompt = (
             f"You are {judge_id}, an independent quality judge.\n\n"
             f"Evaluate this candidate research output for the task.\n"
@@ -760,13 +799,13 @@ def _make_judge_fn(
             role="judge_ensemble",
             prompt=prompt,
             system_prompt="Return JSON only. Be strict, independent, and concise.",
-            schema=JUDGE_VOTE_SCHEMA,
-            model=model or cfg.swarm.default_model,
+            schema=_judge_vote_schema(tuple(rubric_dims)),
+            model=model,
             timeout_s=min(AGENT_TIMEOUT_SECONDS, 90),
             cwd=Path(__file__).parent,
             sandbox=sandbox,
             approval_policy=provider.approval_policy,
-            reasoning_effort=provider.reasoning_effort,
+            reasoning_effort=judge.effort or provider.reasoning_effort or None,
             ephemeral=provider.ephemeral,
         ))
         parsed = result.parsed or {}
@@ -832,7 +871,7 @@ def _run_judge_ensemble(
 ) -> dict:
     candidate = build_context(candidate_outputs, for_role="quality_judge")
     history = build_context(history_outputs, for_role="quality_judge")
-    model = provider.model or cfg.swarm.default_model
+    model = resolve_model("judge", backend_id, cfg).model
     judge_cfg = JudgeConfig(
         n_judges=cfg.judge_ensemble.n_judges,
         ks_threshold=cfg.judge_ensemble.ks_threshold,
@@ -906,10 +945,14 @@ def _make_pairwise_judge_fn(
     provider,
     sandbox: str,
 ):
-    """Build SelectorSynth's pairwise judge hook on top of AgentBackend."""
+    """Build SelectorSynth's pairwise judge hook on top of AgentBackend.
+
+    Pairwise judges run on the `judge` role tier (blitz.toml [models].judge).
+    """
+    judge = resolve_model("judge", backend_id, cfg)
 
     def _pairwise(span_a: Span, span_b: Span, topic: str, judge_id: str, seed: int) -> PairwiseVerdict:
-        model = provider.model or cfg.swarm.default_model
+        model = judge.model
         prompt = (
             f"You are {judge_id}, judging two candidate research spans for: {topic}\n\n"
             "Choose the span that is more accurate, specific, complete, and clear. "
@@ -922,12 +965,12 @@ def _make_pairwise_judge_fn(
             prompt=prompt,
             system_prompt="Return JSON only with winner and rationale.",
             schema=PAIRWISE_VERDICT_SCHEMA,
-            model=model or provider.model or cfg.swarm.default_model,
+            model=model,
             timeout_s=min(AGENT_TIMEOUT_SECONDS, 90),
             cwd=Path(__file__).parent,
             sandbox=sandbox,
             approval_policy=provider.approval_policy,
-            reasoning_effort=provider.reasoning_effort,
+            reasoning_effort=judge.effort or provider.reasoning_effort or None,
             ephemeral=provider.ephemeral,
         ))
         parsed = result.parsed or {}
@@ -956,13 +999,11 @@ def _run_selector_synthesis(
     provider,
     sandbox: str,
 ) -> dict:
+    judge_model = resolve_model("judge", backend_id, cfg).model
     selector_cfg = MechanismSelectorConfig(
         granularity=cfg.selector.granularity,
         n_judges=cfg.selector.n_judges,
-        judge_models=tuple(
-            (provider.model or cfg.swarm.default_model)
-            for _ in range(cfg.selector.n_judges)
-        ),
+        judge_models=tuple(judge_model for _ in range(cfg.selector.n_judges)),
     )
     selector = SelectorSynth(
         selector_cfg,
@@ -1106,16 +1147,23 @@ async def run_swarm(
         override=use_selector,
         name="selector",
     )
-    guard = (
-        CascadeGuard(CascadeGuardConfig(mode=runtime_cfg.guard.mode))
-        if guard_enabled else None
-    )
+    guard = None
+    if guard_enabled:
+        # LLM hooks (claim decomposition / adjudication) run on the `guard`
+        # role tier when enabled; the model is injected here, never defaulted
+        # inside mechanisms/cascade_guard.py.
+        guard_model = resolve_model("guard", selected_backend, runtime_cfg).model
+        guard = CascadeGuard(CascadeGuardConfig(
+            mode=runtime_cfg.guard.mode,
+            decompose_model=guard_model,
+            adjudicate_model=guard_model,
+        ))
 
     print(f"\n{'='*60}")
     print(f"BLITZ-SWARM — {topic}")
     print(f"{'='*60}\n")
     print(
-        f"Backend: {selected_backend} | model={provider.model or runtime_cfg.swarm.default_model} "
+        f"Backend: {selected_backend} | default model={_model_label('*', selected_backend, runtime_cfg)} "
         f"| adapter={provider.adapter} | profile={profile} | sandbox={resolved_sandbox}"
     )
     print(
@@ -1127,7 +1175,7 @@ async def run_swarm(
     print()
 
     # --- METRICS: Initialize ---
-    mc = MetricsCollector()
+    mc = MetricsCollector(cfg=runtime_cfg, backend_id=selected_backend)
     mc.start_run(run_id, topic)
 
     # --- SPAWN ---
@@ -1150,7 +1198,7 @@ async def run_swarm(
     print(f"Swarm: {len(agents)} agents ({len(researchers)} researchers, "
           f"{len(evaluators)} evaluators, {len(synthesizer_agents)} synthesizer)")
     for a in agents:
-        print(f"  {a.id:20s} | {a.role:15s} | model={a.model}")
+        print(f"  {a.id:20s} | {a.role:15s} | model={_model_label(a.role, selected_backend, runtime_cfg)}")
     print()
 
     # Connect blackboard (optional)
@@ -1447,7 +1495,8 @@ async def run_swarm(
     filepath = save_output(topic, final_doc)
 
     total_agents_invoked = sum(len(rnd) for rnd in all_round_outputs)
-    cost_str = f"${metrics_record.get('total_cost_usd', 0):.4f}"
+    _total_cost = metrics_record.get("total_cost_usd")
+    cost_str = "n/a (no cost reported; add [backend.providers.<id>.pricing])" if _total_cost is None else f"${_total_cost:.4f}"
     tokens_str = f"{metrics_record.get('total_input_tokens', 0) + metrics_record.get('total_output_tokens', 0):,}"
 
     print(f"{'='*60}")
@@ -1495,9 +1544,10 @@ def _dry_run(
     print(f"BLITZ-SWARM DRY RUN — {topic}")
     print(f"{'='*60}\n")
     print(
-        f"Backend: {selected_backend} | model={provider.model or cfg.swarm.default_model} "
+        f"Backend: {selected_backend} | default model={_model_label('*', selected_backend, cfg)} "
         f"| adapter={provider.adapter} | profile={profile} | sandbox={resolved_sandbox}"
     )
+    print("Per-role models: --list-models prints the full role -> tier -> model table.")
     print()
 
     agents = plan_agents(
@@ -1519,7 +1569,7 @@ def _dry_run(
     print()
 
     for a in agents:
-        print(f"  {a.id:20s} | {a.role:15s} | model={a.model}")
+        print(f"  {a.id:20s} | {a.role:15s} | model={_model_label(a.role, selected_backend, cfg)}")
         if a.role == "researcher":
             # Show subtopic assignment
             sub = a.subtopic
@@ -1536,7 +1586,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Blitz-Swarm: parallel multi-agent research swarm",
     )
-    parser.add_argument("topic", help="The topic / task spec")
+    parser.add_argument("topic", nargs="?", default=None, help="The topic / task spec")
     parser.add_argument(
         "--mode", choices=["consensus", "mythos"], default="consensus",
         help="Swarm mode: 'consensus' (default, flat parallel) or "
@@ -1557,6 +1607,16 @@ def main():
     parser.add_argument(
         "--backend", default=None,
         help="Backend provider id from blitz.toml [backend.providers]",
+    )
+    parser.add_argument(
+        "--model", default=None,
+        help="Override the model for ALL roles (a model string or a tier name "
+             "from [backend.providers.<id>.tiers]). Per-role: env BLITZ_MODEL_<ROLE>.",
+    )
+    parser.add_argument(
+        "--list-models", action="store_true",
+        help="Print the resolved role -> tier -> model table for the chosen "
+             "backend and exit (no model is invoked)",
     )
     parser.add_argument(
         "--quality-profile", choices=["max", "balanced", "cheap"], default=None,
@@ -1597,6 +1657,18 @@ def main():
     )
 
     args = parser.parse_args()
+
+    if args.model:
+        # Resolution step 1 for every role in this process (backends/models.py).
+        os.environ["BLITZ_MODEL"] = args.model
+
+    if args.list_models:
+        cfg = load_config()
+        print(format_models_table(cfg, args.backend))
+        return
+
+    if not args.topic:
+        parser.error("topic is required unless --list-models is given")
 
     if args.mode == "mythos":
         _run_mythos_mode(args)
@@ -1652,13 +1724,17 @@ def _run_mythos_mode(args) -> None:
         print(f"\n{'='*60}")
         print(f"MYTHOS DRY RUN — {args.topic}")
         print(f"{'='*60}\n")
+        from mythos.runner import describe_models
+
         print(f"Config:")
-        print(f"  planner_model     = {cfg.planner_model}")
-        print(f"  executor_model    = {cfg.executor_model}")
-        print(f"  verifier_model    = {cfg.verifier_model}")
+        print(f"  planner_model     = {cfg.planner_model or '(blitz.toml [models].planner)'}  (tier)")
+        print(f"  executor_model    = {cfg.executor_model or '(blitz.toml [models].executor)'}  (tier)")
+        print(f"  verifier_model    = {cfg.verifier_model or '(blitz.toml [models].verifier)'}  (tier)")
+        print(f"  resolved          = {describe_models(cfg)}")
         print(f"  max_replans       = {cfg.max_replans}")
         print(f"  max_executors     = {cfg.max_executors}")
         print(f"  cost_ceiling_usd  = {cfg.cost_ceiling_usd}")
+        print(f"  token_ceiling     = {cfg.token_ceiling}")
         print(f"  output_dir        = {cfg.output_dir}")
         print(f"  backend           = {os.environ.get('BLITZ_BACKEND') or load_config().backend.default}")
         loaded = load_config()

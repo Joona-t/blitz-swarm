@@ -97,7 +97,7 @@ DEFAULT_RESEARCH_TOPICS: tuple[str, ...] = (
     "MAST failure modes and rule-based detectors for multi-agent systems",
     "verifier-gated hierarchical planner-executor agent architectures",
     "GEPA / prompt-evolution optimization against a held-out bench",
-    "cost-aware model routing (haiku/sonnet/opus) for agent swarms",
+    "cost-aware model-tier routing (fast/standard/deep) for agent swarms",
 )
 
 # Fallback baseline topics if no slate file is present (dry-run friendly).
@@ -703,17 +703,24 @@ def _invoke_live(kind: str, *, tracker: BudgetTracker, **kw: Any) -> dict[str, A
         # sample (Wang-style cheap baseline the swarm must beat). Scored by the
         # SAME functional composite (0-1) the verify phase uses, so the gate's
         # floor comparison is apples-to-apples.
-        from backends.adapters.cli import ClaudeCLIBackend  # noqa: PLC0415
+        from backends import make_provider_backend, resolve_model  # noqa: PLC0415
         from backends.core import AgentCall  # noqa: PLC0415
         from bench.detectors import research_quality_composite  # noqa: PLC0415
+        from config import load_config  # noqa: PLC0415
 
-        backend = ClaudeCLIBackend()
+        cfg = load_config()
+        backend_id = kw.get("backend_id") or cfg.backend.default
+        # Same `researcher` role tier the swarm's researchers run on, so the
+        # floor comparison is apples-to-apples (kw["model"] = explicit override).
+        resolved = resolve_model("researcher", backend_id, cfg, override=kw.get("model") or None)
+        backend = make_provider_backend(resolved.backend_id, cfg)
         call = AgentCall(
             role="researcher",  # AgentCall's required first field
             prompt=(f"Research task:\n{topic}\n\nWrite a thorough, well-cited "
                     f"research synthesis. Cite arXiv IDs where applicable."),
             system_prompt="You are a careful research analyst. Be concrete and cite sources.",
-            model=str(kw.get("model", "sonnet")),
+            model=resolved.model,
+            reasoning_effort=resolved.effort,
             timeout_s=int(kw.get("timeout_s", 600)),
         )
         ar = backend.call(call)
@@ -2250,10 +2257,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Skip the C3 pre-flight feasibility refusal (the "
                          "calibration cell still runs and is recorded).")
     ap.add_argument("--backend", default="claude",
-                    help="LLM backend for swarm runs: claude (default, honors the "
-                         "claude-only job choice) / codex / gemini / ollama. Threaded "
-                         "into run_swarm backend_id. NOTE: the swarm's 'sonnet' agents "
-                         "require the claude backend; the codex default fails on them.")
+                    help="Provider id from blitz.toml [backend.providers] for swarm "
+                         "runs (default: claude, honoring the claude-only job choice). "
+                         "Threaded into run_swarm backend_id; every role's model "
+                         "resolves from [models] tiers for that provider.")
     ap.add_argument("--slate", default="bench/slate_upgrade.toml",
                     help="Bench slate TOML for baseline + verify phases.")
     ap.add_argument("--state-file", default=str(DEFAULT_STATE_FILE),

@@ -48,7 +48,7 @@ def test_codex_backend_uses_output_file_schema_and_safe_flags(monkeypatch, tmp_p
         calls["cwd"] = cwd
         output_path = Path(cmd[cmd.index("--output-last-message") + 1])
         schema_path = Path(cmd[cmd.index("--output-schema") + 1])
-        assert json.loads(schema_path.read_text()) == AGENT_SCHEMA
+        assert json.loads(schema_path.read_text()) == backends.to_strict_output_schema(AGENT_SCHEMA)
         output_path.write_text(json.dumps(_ok_payload()), encoding="utf-8")
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
@@ -92,7 +92,7 @@ def test_codex_backend_falls_back_to_jsonl_agent_message(monkeypatch):
 
     monkeypatch.setattr(cli_adapters.subprocess, "run", fake_run)
 
-    result = CodexLocalBackend().call(AgentCall(
+    result = CodexLocalBackend(model="test-model").call(AgentCall(
         role="researcher",
         prompt="hello",
         schema=AGENT_SCHEMA,
@@ -100,6 +100,20 @@ def test_codex_backend_falls_back_to_jsonl_agent_message(monkeypatch):
 
     assert result.parsed == _ok_payload()
     assert not result.errored
+
+
+def test_codex_backend_without_model_is_an_explicit_error(monkeypatch):
+    monkeypatch.setattr(cli_adapters.shutil, "which", lambda name: "/usr/bin/codex")
+
+    def fake_run(cmd, **kwargs):
+        raise AssertionError("must not spawn without a model")
+
+    monkeypatch.setattr(cli_adapters.subprocess, "run", fake_run)
+
+    result = CodexLocalBackend().call(AgentCall(role="researcher", prompt="hello"))
+
+    assert result.errored
+    assert "no model resolved" in result.error
 
 
 def test_codex_backend_prefers_final_file_over_malformed_intermediate(monkeypatch):
@@ -118,7 +132,7 @@ def test_codex_backend_prefers_final_file_over_malformed_intermediate(monkeypatc
 
     monkeypatch.setattr(cli_adapters.subprocess, "run", fake_run)
 
-    result = CodexLocalBackend().call(AgentCall(
+    result = CodexLocalBackend(model="test-model").call(AgentCall(
         role="researcher",
         prompt="hello",
         schema=AGENT_SCHEMA,
@@ -138,7 +152,7 @@ def test_codex_backend_schema_validation_marks_error(monkeypatch):
 
     monkeypatch.setattr(cli_adapters.subprocess, "run", fake_run)
 
-    result = CodexLocalBackend().call(AgentCall(
+    result = CodexLocalBackend(model="test-model").call(AgentCall(
         role="researcher",
         prompt="hello",
         schema=AGENT_SCHEMA,
@@ -165,7 +179,7 @@ def test_codex_backend_timeout(monkeypatch):
 
     monkeypatch.setattr(cli_adapters.subprocess, "run", fake_run)
 
-    result = CodexLocalBackend().call(AgentCall(
+    result = CodexLocalBackend(model="test-model").call(AgentCall(
         role="researcher",
         prompt="hello",
         timeout_s=3,
@@ -226,6 +240,7 @@ def test_registry_makes_builtin_and_custom_backends():
     custom = backends.make_backend("fake", model="m")
 
     assert builtin.adapter_kind == "codex_cli"
+    assert builtin.model is None   # no literal default: models come from config tiers
     assert custom.kwargs["backend_id"] == "fake"
     assert custom.kwargs["model"] == "m"
     assert "fake_adapter" in backends.registered_backends()
@@ -300,20 +315,28 @@ def test_ollama_backend_fake_http(monkeypatch):
     assert result.output_tokens == 5
 
 
-def test_backend_config_supports_provider_registry_and_legacy_aliases(tmp_path):
+def test_backend_config_is_an_open_provider_dict(tmp_path):
+    """v0.3.0 contract: `[backend.providers.*]` is open-ended, the legacy
+    `[backend.<id>]` table form still loads, and the four hard-wired
+    attributes (cfg.backend.codex/claude/gemini/ollama) are gone."""
     cfg_path = tmp_path / "blitz.toml"
     cfg_path.write_text(textwrap.dedent("""
+        [models]
+        default = "standard"
+
         [backend]
         default = "ollama"
         fallback = ["codex"]
 
         [backend.providers.ollama]
         adapter = "ollama_http"
-        model = "llama3.2"
         base_url = "http://127.0.0.1:11434"
+        [backend.providers.ollama.tiers]
+        standard = "local-tag"
 
         [backend.codex]
-        model = "gpt-test"
+        adapter = "codex_cli"
+        model = "legacy-model"
         reasoning_effort = "xhigh"
     """), encoding="utf-8")
 
@@ -323,5 +346,9 @@ def test_backend_config_supports_provider_registry_and_legacy_aliases(tmp_path):
     assert cfg.backend.fallback == ["codex"]
     assert cfg.backend.get_provider("ollama").adapter == "ollama_http"
     assert cfg.backend.get_provider("ollama").base_url == "http://127.0.0.1:11434"
-    assert cfg.backend.get_provider("codex").model == "gpt-test"
-    assert cfg.backend.codex.reasoning_effort == "xhigh"
+    assert cfg.backend.get_provider("ollama").tiers == {"standard": "local-tag"}
+    assert cfg.backend.get_provider("codex").model == "legacy-model"
+    assert cfg.backend.get_provider("codex").reasoning_effort == "xhigh"
+    assert not hasattr(cfg.backend, "codex")
+    assert backends.resolve_model("researcher", "ollama", cfg).model == "local-tag"
+    assert backends.resolve_model("researcher", "codex", cfg).model == "legacy-model"

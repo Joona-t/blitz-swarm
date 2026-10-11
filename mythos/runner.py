@@ -17,7 +17,7 @@ from . import planner as planner_mod
 from . import verifier as verifier_mod
 from .executor import ExecutorOutput, run_executors_parallel
 from .planner import Plan
-from .policies import CostBudget, MythosConfig
+from .policies import MYTHOS_ROLES, CostBudget, MythosConfig
 from .verifier import Verification
 
 
@@ -47,6 +47,27 @@ class MythosResult:
         }
 
 
+
+def describe_models(cfg: MythosConfig) -> str:
+    """`planner=<model>(tier,effort) | ...` resolved for the active backend;
+    resolution errors are shown inline (dry-run friendly, no model call)."""
+    from backends.models import ModelResolutionError  # noqa: PLC0415
+    from config import load_config  # noqa: PLC0415
+    from ._invoke import resolve_role_model  # noqa: PLC0415
+
+    try:
+        blitz_cfg = load_config()
+    except Exception as exc:  # malformed blitz.toml: say so, do not guess
+        return f"config error: {exc}"
+    parts = []
+    for role in MYTHOS_ROLES:
+        try:
+            r = resolve_role_model(role, cfg.tier_for(role), blitz_cfg)
+            parts.append(f"{role}={r.model} ({r.backend_id}:{r.tier}, effort={r.effort or '-'})")
+        except ModelResolutionError as exc:
+            parts.append(f"{role}=! {exc}")
+    return " | ".join(parts)
+
 async def run_mythos(task: str, config: MythosConfig | None = None) -> MythosResult:
     """Run the full Mythos loop on a task.
 
@@ -56,7 +77,7 @@ async def run_mythos(task: str, config: MythosConfig | None = None) -> MythosRes
         else → finalize
     """
     cfg = config or MythosConfig()
-    budget = CostBudget(ceiling_usd=cfg.cost_ceiling_usd)
+    budget = CostBudget(ceiling_usd=cfg.cost_ceiling_usd, token_ceiling=cfg.token_ceiling)
 
     run_dir = artifact_mod.make_run_dir(task, cfg.output_dir)
     t_start = time.monotonic()
@@ -64,12 +85,10 @@ async def run_mythos(task: str, config: MythosConfig | None = None) -> MythosRes
     print(f"\n{'='*60}")
     print(f"MYTHOS SWARM — {task}")
     print(f"Run dir: {run_dir}")
-    print(f"Budget:  ${budget.ceiling_usd:.2f} | "
+    print(f"Budget:  ${budget.ceiling_usd:.2f} | tokens: {budget.token_ceiling or 'unlimited'} | "
           f"max replans: {cfg.max_replans} | "
           f"max executors: {cfg.max_executors}")
-    print(f"Models:  planner={cfg.planner_model} | "
-          f"executor={cfg.executor_model} | "
-          f"verifier={cfg.verifier_model}")
+    print(f"Models:  {describe_models(cfg)}")
     print(f"{'='*60}\n")
 
     history: list[dict] = []
@@ -78,7 +97,7 @@ async def run_mythos(task: str, config: MythosConfig | None = None) -> MythosRes
     print(f"--- Round 0: Planner ---")
     t0 = time.monotonic()
     plan = planner_mod.decompose(task, cfg)
-    budget.charge(plan.cost_usd)
+    budget.charge(plan.cost_usd, tokens=plan.tokens)
     print(f"  Planner done [{time.monotonic()-t0:.1f}s] "
           f"cost=${plan.cost_usd:.4f} budget=${budget.spent_usd:.2f}/${budget.ceiling_usd:.2f}")
 
@@ -126,7 +145,7 @@ async def run_mythos(task: str, config: MythosConfig | None = None) -> MythosRes
         # --- Cost ceiling check before executors ---
         if budget.exceeded():
             return _finalize_aborted(
-                "cost_exceeded", task, plan, executor_outputs, verification,
+                "tokens_exceeded" if budget.tokens_exceeded() else "cost_exceeded", task, plan, executor_outputs, verification,
                 budget, round_n, run_dir, history, t_start,
             )
 
@@ -135,7 +154,7 @@ async def run_mythos(task: str, config: MythosConfig | None = None) -> MythosRes
         t0 = time.monotonic()
         executor_outputs = await run_executors_parallel(plan.sub_specs, cfg)
         for o in executor_outputs:
-            budget.charge(o.cost_usd)
+            budget.charge(o.cost_usd, tokens=o.tokens)
         elapsed = time.monotonic() - t0
         round_exec_cost = sum(o.cost_usd for o in executor_outputs)
         print(f"  Executors done [{elapsed:.1f}s] cost=${round_exec_cost:.4f} "
@@ -144,7 +163,7 @@ async def run_mythos(task: str, config: MythosConfig | None = None) -> MythosRes
 
         if budget.exceeded():
             return _finalize_aborted(
-                "cost_exceeded", task, plan, executor_outputs, verification,
+                "tokens_exceeded" if budget.tokens_exceeded() else "cost_exceeded", task, plan, executor_outputs, verification,
                 budget, round_n, run_dir, history, t_start,
             )
 
@@ -152,7 +171,7 @@ async def run_mythos(task: str, config: MythosConfig | None = None) -> MythosRes
         print(f"--- Round {round_n}: Verifier ---")
         t0 = time.monotonic()
         verification = verifier_mod.verify(task, plan, executor_outputs, cfg)
-        budget.charge(verification.cost_usd)
+        budget.charge(verification.cost_usd, tokens=verification.tokens)
         print(f"  Verifier done [{time.monotonic()-t0:.1f}s] "
               f"verdict={verification.verdict} cost=${verification.cost_usd:.4f} "
               f"budget=${budget.spent_usd:.2f}/${budget.ceiling_usd:.2f}")
@@ -179,7 +198,7 @@ async def run_mythos(task: str, config: MythosConfig | None = None) -> MythosRes
 
         if budget.exceeded():
             return _finalize_aborted(
-                "cost_exceeded", task, plan, executor_outputs, verification,
+                "tokens_exceeded" if budget.tokens_exceeded() else "cost_exceeded", task, plan, executor_outputs, verification,
                 budget, round_n, run_dir, history, t_start,
             )
 
@@ -193,7 +212,7 @@ async def run_mythos(task: str, config: MythosConfig | None = None) -> MythosRes
             verification.to_dict(),
             cfg,
         )
-        budget.charge(plan.cost_usd)
+        budget.charge(plan.cost_usd, tokens=plan.tokens)
         print(f"  Replan done [{time.monotonic()-t0:.1f}s] "
               f"cost=${plan.cost_usd:.4f} budget=${budget.spent_usd:.2f}/${budget.ceiling_usd:.2f}")
         artifact_mod.write_plan(run_dir, plan, round_n=round_n + 1)
@@ -304,6 +323,8 @@ def _build_metrics(history, budget, t_start) -> dict:
         "rounds": history,
         "total_cost_usd": round(budget.spent_usd, 4),
         "cost_ceiling_usd": budget.ceiling_usd,
+        "token_ceiling": budget.token_ceiling,
+        "tokens_spent": budget.tokens_spent,
         "wall_clock_s": round(time.monotonic() - t_start, 1),
         "total_input_tokens": total_input_tokens,
         "total_output_tokens": total_output_tokens,

@@ -24,6 +24,7 @@ class Verification:
     summary: str
     confidence: float
     cost_usd: float = 0.0
+    tokens: int = 0
     elapsed_s: float = 0.0
     raw: dict = field(default_factory=dict)
     error: str | None = None
@@ -85,7 +86,8 @@ def verify(
         system_prompt=system,
         user_prompt=user,
         schema_json=VERIFIER_SCHEMA_JSON,
-        model_alias=config.verifier_model,
+        model_role="verifier",
+        tier=config.verifier_model,
         timeout_s=config.verifier_timeout_s,
     )
 
@@ -102,6 +104,7 @@ def verify(
             summary=res.error or "verifier returned no JSON",
             confidence=0.0,
             cost_usd=res.cost_usd,
+            tokens=res.tokens,
             elapsed_s=res.elapsed_s,
             error=res.error,
         )
@@ -115,6 +118,7 @@ def verify(
         summary=parsed.get("summary", ""),
         confidence=float(parsed.get("confidence", 0.0)),
         cost_usd=res.cost_usd,
+        tokens=res.tokens,
         elapsed_s=res.elapsed_s,
         raw=parsed,
     )

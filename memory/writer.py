@@ -23,34 +23,24 @@ from memory.models import TaskStatus
 def _memory_backend_json(prompt: str, system_prompt: str, schema: dict, timeout_s: int) -> dict | None:
     """Run compact memory LLM calls through the configured backend."""
     try:
-        from backends import AgentCall, make_backend
+        from backends import AgentCall, make_provider_backend, resolve_model
         from config import load_config
 
         cfg = load_config()
-        backend_id = cfg.backend.default or "codex"
-        provider = cfg.backend.get_provider(backend_id)
-        model = provider.model or cfg.swarm.default_model
-        backend = make_backend(
-            backend_id,
-            adapter=provider.adapter,
-            model=model,
-            reasoning_effort=provider.reasoning_effort,
-            sandbox=provider.sandbox,
-            approval_policy=provider.approval_policy,
-            ephemeral=provider.ephemeral,
-            base_url=provider.base_url,
-            **provider.metadata,
-        )
+        # Memory helpers run on the `memory_ops` role tier (blitz.toml [models]).
+        resolved = resolve_model("memory_ops", None, cfg)
+        provider = cfg.backend.get_provider(resolved.backend_id)
+        backend = make_provider_backend(resolved.backend_id, cfg, sandbox=provider.sandbox)
         result = backend.call(AgentCall(
             role="memory_writer",
             prompt=prompt,
             system_prompt=system_prompt,
             schema=schema,
-            model=model,
+            model=resolved.model,
             timeout_s=timeout_s,
             sandbox=provider.sandbox,
             approval_policy=provider.approval_policy,
-            reasoning_effort=provider.reasoning_effort,
+            reasoning_effort=resolved.effort or provider.reasoning_effort or None,
             ephemeral=provider.ephemeral,
         ))
         if result.errored:

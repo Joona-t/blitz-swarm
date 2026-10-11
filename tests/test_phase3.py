@@ -428,8 +428,8 @@ def test_validate_spec_caps_specialists():
 
 def test_check_coordinator_depth_blocks_more_than_one():
     specs = [
-        AgentSpec("coordinator", "claude-opus", "x"),
-        AgentSpec("coordinator", "claude-opus", "y"),
+        AgentSpec("coordinator", "model-a", "x"),
+        AgentSpec("coordinator", "model-a", "y"),
     ]
     with pytest.raises(CoordinatorDepthExceeded):
         check_coordinator_depth(specs)
@@ -460,7 +460,7 @@ def test_managed_agents_bootstrap_succeeds_with_api_key(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
     cfg = ManagedAgentsConfig()
     adapter = ManagedAgentsAdapter.bootstrap(
-        cfg, [AgentSpec("researcher", "claude-sonnet", "x")],
+        cfg, [AgentSpec("researcher", "model-b", "x")],
     )
     assert isinstance(adapter, ManagedAgentsAdapter)
     assert adapter.spend.cap_per_run == cfg.spend_cap_usd_per_run

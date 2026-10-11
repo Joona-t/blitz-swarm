@@ -101,7 +101,10 @@ class BlitzAgent:
     role: str
     subtopic: str
     system_prompt: str
-    model: str = "sonnet"
+    # Not a model name. The orchestrator resolves every agent's model from
+    # its ROLE via blitz.toml [models] tiers (backends.models.resolve_model);
+    # this field is only a free-form hint carried for trace metadata.
+    model: str = ""
     max_iterations: int = 3
     # v0.2: persona-typed critics (MAR mechanism). None for non-critic roles
     # or single-critic mode. Populated by `plan_agents` when
@@ -290,12 +293,6 @@ def _split_subtopics_llm(
 # Agent planning
 # ---------------------------------------------------------------------------
 
-# Model overrides for specific roles (others use default "sonnet")
-ROLE_MODEL_OVERRIDES = {
-    "quality_judge": "sonnet",
-    "synthesizer": "sonnet",
-}
-
 PLANNING_SCHEMA = json.dumps({
     "type": "object",
     "properties": {
@@ -409,7 +406,6 @@ def plan_agents(
             role="researcher",
             subtopic=subtopic,
             system_prompt=sys_prompt,
-            model=ROLE_MODEL_OVERRIDES.get("researcher", "sonnet"),
             prompt_path=path,
             prompt_sha256=sha,
         ))
@@ -437,7 +433,6 @@ def plan_agents(
                 role="critic",
                 subtopic=topic,
                 system_prompt=sys_prompt,
-                model="sonnet",
                 persona=persona,
                 prompt_path=path,
                 prompt_sha256=sha,
@@ -451,7 +446,6 @@ def plan_agents(
                 role="critic",
                 subtopic=topic,
                 system_prompt=sys_prompt,
-                model="sonnet",
                 prompt_path=path,
                 prompt_sha256=sha,
             ))
@@ -464,7 +458,6 @@ def plan_agents(
             role="fact_checker",
             subtopic=topic,
             system_prompt=sys_prompt,
-            model="sonnet",
             prompt_path=path,
             prompt_sha256=sha,
         ))
@@ -476,7 +469,6 @@ def plan_agents(
         role="quality_judge",
         subtopic=topic,
         system_prompt=sys_prompt,
-        model=ROLE_MODEL_OVERRIDES.get("quality_judge", "sonnet"),
         prompt_path=path,
         prompt_sha256=sha,
     ))
@@ -488,7 +480,6 @@ def plan_agents(
         role="synthesizer",
         subtopic=topic,
         system_prompt=sys_prompt,
-        model=ROLE_MODEL_OVERRIDES.get("synthesizer", "sonnet"),
         prompt_path=path,
         prompt_sha256=sha,
     ))
@@ -542,35 +533,25 @@ def _planning_backend_json(
 ) -> dict | None:
     """Run a small planning call through the configured backend."""
     try:
-        from backends import AgentCall, make_backend
+        from backends import AgentCall, make_provider_backend, resolve_model
         from config import load_config
 
         cfg = load_config()
-        backend_id = backend_id or cfg.backend.default or "codex"
-        provider = cfg.backend.get_provider(backend_id)
-        model = provider.model or cfg.swarm.default_model
+        # Planning runs on the `planner` role tier (blitz.toml [models]).
+        resolved = resolve_model("planner", backend_id, cfg)
+        provider = cfg.backend.get_provider(resolved.backend_id)
         resolved_sandbox = sandbox or provider.sandbox
-        backend = make_backend(
-            backend_id,
-            adapter=provider.adapter,
-            model=model,
-            reasoning_effort=provider.reasoning_effort,
-            sandbox=resolved_sandbox,
-            approval_policy=provider.approval_policy,
-            ephemeral=provider.ephemeral,
-            base_url=provider.base_url,
-            **provider.metadata,
-        )
+        backend = make_provider_backend(resolved.backend_id, cfg, sandbox=resolved_sandbox)
         result = backend.call(AgentCall(
             role="planner",
             prompt=prompt,
             system_prompt=system_prompt,
             schema=schema,
-            model=model,
+            model=resolved.model,
             timeout_s=timeout_s,
             sandbox=resolved_sandbox,
             approval_policy=provider.approval_policy,
-            reasoning_effort=provider.reasoning_effort,
+            reasoning_effort=resolved.effort or provider.reasoning_effort or None,
             ephemeral=provider.ephemeral,
         ))
         if result.errored:

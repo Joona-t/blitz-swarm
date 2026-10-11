@@ -236,9 +236,14 @@ def test_live_parses_fenced_json_and_validates(monkeypatch, md_paths):
     assert len(calls) == 1
     argv, kwargs = calls[0]
     assert argv[0] == "claude" and argv[1] == "-p"
+    # v0.3.0: the model is the `candidate_extractor` role tier on the claude
+    # provider (blitz.toml [models] -> [backend.providers.claude.tiers]).
+    from backends.models import resolve_model
+    from config import load_config
+    expected_model = resolve_model("candidate_extractor", "claude", load_config()).model
     assert argv[3:] == [
         "--output-format", "text",
-        "--model", "sonnet",
+        "--model", expected_model,
         "--disallowedTools", "Bash,Edit,Write,Read,Task,WebFetch,WebSearch",
     ]
     assert kwargs.get("timeout") == 77

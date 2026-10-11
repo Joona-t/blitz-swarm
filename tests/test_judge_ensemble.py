@@ -341,9 +341,9 @@ def test_aggregator_median():
 
 
 def test_mock_judge_fn_deterministic():
-    a = mock_judge_fn("hello world", "", "judge_00", "sonnet", 42,
+    a = mock_judge_fn("hello world", "", "judge_00", "model-a", 42,
                       ("coverage", "accuracy", "clarity", "depth"))
-    b = mock_judge_fn("hello world", "", "judge_00", "sonnet", 42,
+    b = mock_judge_fn("hello world", "", "judge_00", "model-a", 42,
                       ("coverage", "accuracy", "clarity", "depth"))
     assert a.aggregate_score == b.aggregate_score
     assert a.rubric_scores == b.rubric_scores

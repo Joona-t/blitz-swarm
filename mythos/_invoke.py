@@ -1,11 +1,17 @@
 """Shared invocation for Mythos roles.
 
-Wraps the configured local backend into a single helper that returns
-parsed JSON + cost telemetry. Codex is the default backend for local
-runs; Claude remains available through the backend abstraction.
+One helper: resolve the role's model (tier -> provider model string via
+backends.models.resolve_model), build the configured backend (with the
+[backend] fallback chain) and return parsed JSON + cost/token telemetry.
 
 Kept inside mythos/ because Mythos has different output schemas, longer
 timeouts, and a different retry policy than blitz-swarm consensus mode.
+
+Model precedence for a role (see backends/models.py):
+  --model / BLITZ_MODEL  >  BLITZ_MODEL_<ROLE>  >  mythos.toml [models] tier
+  >  blitz.toml [models].<role> tier  >  [models].default tier  >  provider
+  legacy `model`  >  ModelResolutionError. The provider-wide `model` key never
+  shadows the role tier (the v0.2 `provider.model or model` bug).
 """
 
 from __future__ import annotations
@@ -16,9 +22,9 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from backends import AgentCall, make_backend
+from backends import AgentCall, make_provider_backend
+from backends.models import ENV_OVERRIDE, ResolvedModel, resolve_model, role_env_var
 from config import load_config
-from .policies import resolve_model
 
 # Path to prompts/ relative to this file
 PROMPTS_DIR = Path(__file__).parent / "prompts"
@@ -28,12 +34,16 @@ PROMPTS_DIR = Path(__file__).parent / "prompts"
 class InvokeResult:
     parsed: dict | None         # parsed JSON output (None on failure)
     raw_stdout: str             # full stdout for debugging
-    cost_usd: float             # from CLI envelope
+    cost_usd: float             # from the provider envelope; 0.0 when unknown
     input_tokens: int
     output_tokens: int
     elapsed_s: float
     error: str | None = None    # populated on failure
     _envelope: dict | None = field(default=None, repr=False)
+
+    @property
+    def tokens(self) -> int:
+        return int(self.input_tokens or 0) + int(self.output_tokens or 0)
 
 
 def load_prompt(name: str) -> str:
@@ -42,17 +52,37 @@ def load_prompt(name: str) -> str:
     return path.read_text(encoding="utf-8")
 
 
+def resolve_role_model(model_role: str, tier: str | None, cfg, backend_id: str | None = None) -> ResolvedModel:
+    """Resolve `model_role` honouring the mythos.toml tier override.
+
+    `tier` (mythos.toml `<role>_model`) wins over blitz.toml `[models]` but
+    loses to the explicit `--model` / BLITZ_MODEL / BLITZ_MODEL_<ROLE>
+    overrides, so the documented precedence holds.
+    """
+    backend_id = backend_id or os.environ.get("BLITZ_BACKEND") or cfg.backend.default or None
+    var = role_env_var(model_role)
+    env_override = os.environ.get(ENV_OVERRIDE) or (os.environ.get(var) if var else None)
+    if env_override:
+        return resolve_model(model_role, backend_id, cfg)
+    return resolve_model(model_role, backend_id, cfg, override=tier or None)
+
+
 def invoke(
     *,
     role: str,
     system_prompt: str,
     user_prompt: str,
     schema_json: str,
-    model_alias: str,
+    model_role: str,
+    tier: str | None = None,
     timeout_s: int,
     max_turns: int = 4,
 ) -> InvokeResult:
     """Invoke a single Mythos role through the configured local backend.
+
+    `role` is the label for logs/errors (e.g. "executor[spec-3]"); `model_role`
+    is the resolver role ("planner" | "executor" | "verifier"); `tier` is the
+    optional mythos.toml tier override for it.
 
     Returns InvokeResult with parsed dict or error. Never raises on CLI
     failure — wraps the failure into the result so the runner can decide
@@ -60,23 +90,11 @@ def invoke(
     """
     start = time.monotonic()
     try:
-        model, effort = resolve_model(model_alias)
         cfg = load_config()
-        backend_id = os.environ.get("BLITZ_BACKEND") or cfg.backend.default or "codex"
-        provider = cfg.backend.get_provider(backend_id)
+        resolved = resolve_role_model(model_role, tier, cfg)
+        provider = cfg.backend.get_provider(resolved.backend_id)
         sandbox = os.environ.get("BLITZ_SANDBOX") or provider.sandbox
-        backend_model = provider.model or model
-        backend = make_backend(
-            backend_id,
-            adapter=provider.adapter,
-            model=backend_model,
-            reasoning_effort=provider.reasoning_effort,
-            sandbox=sandbox,
-            approval_policy=provider.approval_policy,
-            ephemeral=provider.ephemeral,
-            base_url=provider.base_url,
-            **provider.metadata,
-        )
+        backend = make_provider_backend(resolved.backend_id, cfg, sandbox=sandbox)
         schema = json.loads(schema_json)
     except Exception as e:
         return InvokeResult(
@@ -94,11 +112,11 @@ def invoke(
         prompt=user_prompt,
         system_prompt=system_prompt,
         schema=schema,
-        model=backend_model,
+        model=resolved.model,
         timeout_s=timeout_s,
         sandbox=sandbox,
         approval_policy=provider.approval_policy,
-        reasoning_effort=effort or provider.reasoning_effort,
+        reasoning_effort=resolved.effort or provider.reasoning_effort or None,
         ephemeral=provider.ephemeral,
     ))
 
@@ -110,61 +128,16 @@ def invoke(
     return InvokeResult(
         parsed=parsed,
         raw_stdout=res.raw_stdout,
-        cost_usd=res.cost_usd,
+        cost_usd=float(res.cost_usd or 0.0),
         input_tokens=res.input_tokens,
         output_tokens=res.output_tokens,
         elapsed_s=res.elapsed_s,
         error=err,
         _envelope={
             "backend_id": res.backend_id,
-            "model": res.model,
+            "model": res.model or resolved.model,
+            "tier": resolved.tier,
+            "effort": resolved.effort,
             "validation_errors": res.validation_errors,
         },
     )
-
-
-def _parse_envelope(stdout: str) -> dict | None:
-    """Parse the outer CLI JSON envelope."""
-    if not stdout.strip():
-        return None
-    try:
-        env = json.loads(stdout)
-        if isinstance(env, dict):
-            return env
-    except json.JSONDecodeError:
-        pass
-    return None
-
-
-def _parse_inner_result(envelope: dict | None, role: str) -> dict | None:
-    """Extract the role's structured JSON from the envelope.
-
-    Order of preference:
-      1. envelope["structured_output"] — set when --json-schema is used and
-         the model emits via tool call (the documented happy path).
-      2. envelope["result"] as dict — fallback if CLI ever inlines it.
-      3. envelope["result"] as string — try direct JSON parse, then embedded
-         {…} extraction (last resort).
-    """
-    if not envelope:
-        return None
-
-    so = envelope.get("structured_output")
-    if isinstance(so, dict):
-        return so
-
-    inner = envelope.get("result")
-    if isinstance(inner, dict):
-        return inner
-    if isinstance(inner, str) and inner.strip():
-        try:
-            return json.loads(inner)
-        except json.JSONDecodeError:
-            import re
-            m = re.search(r"\{.*\}", inner, re.DOTALL)
-            if m:
-                try:
-                    return json.loads(m.group(0))
-                except json.JSONDecodeError:
-                    return None
-    return None

@@ -24,6 +24,7 @@ class ExecutorOutput:
     concerns: list[str]
     confidence: float
     cost_usd: float = 0.0
+    tokens: int = 0
     elapsed_s: float = 0.0
     raw: dict = field(default_factory=dict)
     error: str | None = None
@@ -61,7 +62,8 @@ def run_executor(sub_spec: dict, config: MythosConfig) -> ExecutorOutput:
         system_prompt=system,
         user_prompt=user,
         schema_json=EXECUTOR_SCHEMA_JSON,
-        model_alias=config.executor_model,
+        model_role="executor",
+        tier=config.executor_model,
         timeout_s=config.executor_timeout_s,
     )
 
@@ -73,6 +75,7 @@ def run_executor(sub_spec: dict, config: MythosConfig) -> ExecutorOutput:
             concerns=[],
             confidence=0.0,
             cost_usd=res.cost_usd,
+            tokens=res.tokens,
             elapsed_s=res.elapsed_s,
             error=res.error or "executor returned no JSON",
         )
@@ -85,6 +88,7 @@ def run_executor(sub_spec: dict, config: MythosConfig) -> ExecutorOutput:
         concerns=list(parsed.get("concerns", [])),
         confidence=float(parsed.get("confidence", 0.0)),
         cost_usd=res.cost_usd,
+        tokens=res.tokens,
         elapsed_s=res.elapsed_s,
         raw=parsed,
     )

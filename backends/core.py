@@ -14,10 +14,25 @@ from pathlib import Path
 from typing import Protocol
 
 
-DEFAULT_CODEX_MODEL = "gpt-5.5"
-DEFAULT_CODEX_REASONING = "high"
 DEFAULT_SANDBOX = "read-only"
 DEFAULT_APPROVAL = "never"
+
+# Error substrings that mean "this provider cannot serve right now" (CLI
+# missing, server down, rate-limited/overloaded). Timeouts and schema
+# failures are NOT in this class: the provider answered, badly.
+UNAVAILABLE_MARKERS = (
+    "not found on path",
+    "connection refused",
+    "request failed",
+    "http 429",
+    "http 502",
+    "http 503",
+    "http 504",
+    "unavailable",
+    "overloaded",
+    "rate limit",
+    "rate_limit",
+)
 
 
 @dataclass(slots=True)
@@ -73,7 +88,7 @@ class AgentResult:
     errored: bool = False
     error: str | None = None
     fallback_used: bool = False
-    cost_usd: float = 0.0
+    cost_usd: float | None = None     # None = provider did not report cost (never 0)
     input_tokens: int = 0
     output_tokens: int = 0
     validation_errors: list[str] = field(default_factory=list)
@@ -144,6 +159,96 @@ def parse_json_loose(text: str) -> dict | None:
     return None
 
 
+def is_unavailable_error(result: "AgentResult") -> bool:
+    """True when `result` errored for an 'unavailable'-class reason.
+
+    `[backend] fallback` is tried exactly once per call on this class only.
+    """
+    if not result.errored:
+        return False
+    err = (result.error or "").lower()
+    return any(marker in err for marker in UNAVAILABLE_MARKERS)
+
+
+def to_strict_output_schema(schema: dict) -> dict:
+    """Convert a loose JSON schema into OpenAI strict structured-output form.
+
+    `codex exec --output-schema` (and OpenAI-compatible `response_format`
+    json_schema with strict=true) rejects any object node that lacks
+    `additionalProperties: false` or that does not list every property in
+    `required` (400 invalid_json_schema, codex exit 1). Our schemas are
+    written loosely (optional keys, free-form objects), so normalise them
+    here instead of at every call site:
+
+    - every object gets `additionalProperties: false`;
+    - every property is listed in `required`; properties that were
+      optional in the source become nullable (`type: [t, "null"]`, and
+      `null` is appended to any `enum`) so the model can still omit them;
+    - a free-form object (no `properties`) becomes an empty strict object,
+      the only object shape strict mode can express without keys.
+
+    `strip_strict_nulls` undoes the nullable widening on the parsed result.
+    See BUGS_AND_ITERATIONS.md BUG-002.
+    """
+    return _strict_node(schema)
+
+
+def _strict_node(node):
+    if not isinstance(node, dict):
+        return node
+    out = dict(node)
+    if out.get("type") == "object":
+        props = out.get("properties") or {}
+        originally_required = set(out.get("required") or [])
+        new_props = {}
+        for key, sub in props.items():
+            strict_sub = _strict_node(sub)
+            if key not in originally_required:
+                strict_sub = _make_nullable(strict_sub)
+            new_props[key] = strict_sub
+        out["properties"] = new_props
+        out["required"] = list(new_props.keys())
+        out["additionalProperties"] = False
+    elif out.get("type") == "array" and isinstance(out.get("items"), dict):
+        out["items"] = _strict_node(out["items"])
+    return out
+
+
+def _make_nullable(node: dict) -> dict:
+    node = dict(node)
+    t = node.get("type")
+    if isinstance(t, str) and t != "null":
+        node["type"] = [t, "null"]
+    elif isinstance(t, list) and "null" not in t:
+        node["type"] = [*t, "null"]
+    if isinstance(node.get("enum"), list) and None not in node["enum"]:
+        node["enum"] = [*node["enum"], None]
+    return node
+
+
+def strip_strict_nulls(value, schema: dict | None):
+    """Drop `null` values for keys the *source* schema marked optional.
+
+    Strict mode forces the model to emit every key, using null for the ones
+    it would have omitted. Removing them restores the loose contract that
+    `validate_json_schema` and downstream `.get(key, default)` callers expect.
+    """
+    if not isinstance(schema, dict) or not isinstance(value, (dict, list)):
+        return value
+    if schema.get("type") == "object" and isinstance(value, dict):
+        props = schema.get("properties") or {}
+        required = set(schema.get("required") or [])
+        cleaned = {}
+        for key, item in value.items():
+            if item is None and key not in required:
+                continue
+            cleaned[key] = strip_strict_nulls(item, props.get(key))
+        return cleaned
+    if schema.get("type") == "array" and isinstance(value, list):
+        return [strip_strict_nulls(item, schema.get("items")) for item in value]
+    return value
+
+
 def validate_json_schema(data: dict | None, schema: dict | None) -> list[str]:
     """Small JSON-schema subset validator for agent result contracts."""
     if schema is None:
@@ -210,12 +315,22 @@ def normalize_result(
     elapsed_s: float = 0.0,
     errored: bool = False,
     error: str | None = None,
-    cost_usd: float = 0.0,
+    cost_usd: float | None = None,
     input_tokens: int = 0,
     output_tokens: int = 0,
     metadata: dict | None = None,
+    parsed: dict | None = None,
+    strict_nulls: bool = False,
 ) -> AgentResult:
-    parsed = parse_json_loose(text)
+    """Build an AgentResult from raw text.
+
+    `parsed` short-circuits JSON extraction when the adapter already has the
+    object; `strict_nulls=True` strips nulls a strict-mode schema forced in.
+    """
+    if parsed is None:
+        parsed = parse_json_loose(text)
+    if strict_nulls:
+        parsed = strip_strict_nulls(parsed, schema)
     validation_errors = validate_json_schema(parsed, schema)
     final_error = error
     if not final_error and validation_errors:
