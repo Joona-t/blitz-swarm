@@ -8,30 +8,36 @@ Adds a message-layer governance layer that:
   4. On agent errors, marks descendant messages tainted and excludes
      them from subsequent rounds' context.
 
-Three modes — selected via GuardConfig.mode:
-  speed     skip Yellow verification, threshold 0.5
-  balanced  verify Yellow at hubs (synthesizer/judge), threshold 0.7
-  strict    verify all Yellow, block on Red, threshold 0.9
+Modes — selected via GuardConfig.mode (`[guard] mode` in blitz.toml):
   off       identity passthrough (for ablation)
+  speed     heuristic screen, never blocks
+  balanced  heuristic screen, verify Yellow at hubs (synthesizer/judge), block on Red
+  strict    heuristic screen, verify all Yellow, block on Red
+  max       REAL LLM hooks on the `guard` role tier: claim decomposition
+            (SPO-style atomic claims) + contradiction adjudication against the
+            Green anchors; verify all Yellow, block on Red (mechanisms-02)
 
-This module ships the LLM-free skeleton: lineage graph, taint
-propagation, context filtering, mode policy. The decompose() and
-screen() methods are pluggable hooks — the default implementation is a
-heuristic (sentence-split + cosine-similarity stub) that lets tests run
-without LLM calls. Wire to Claude Haiku via subprocess in orchestrator
-integration (Phase 1 v0.2.0-alpha.2).
+off/speed/balanced/strict use `heuristic_decompose` (sentence split) and
+`heuristic_screen` (word overlap). That is a *placeholder screen*, not LLM
+adjudication, and `CascadeGuard` says so once on construction
+("heuristic screen") so nobody mistakes it. `CascadeGuard.from_config`
+builds the right hooks for the configured mode: `make_llm_hooks` resolves
+the `guard` role through `backends.models.resolve_model` and calls the
+configured local backend — no model name lives here.
 """
 
 from __future__ import annotations
 
+import json
 import re
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Callable, Iterable, Literal
+from typing import Any, Callable, Iterable, Literal
 
 ClaimVerdict = Literal["green", "yellow", "red"]
-GuardMode = Literal["speed", "balanced", "strict", "off"]
+GuardMode = Literal["speed", "balanced", "strict", "max", "off"]
+LLM_MODES: frozenset[str] = frozenset({"max"})
 
 # Hub roles get tighter screening — outbound claims from these agents have
 # the highest blast radius if tainted.
@@ -62,8 +68,10 @@ class AtomicClaim:
 @dataclass
 class GuardConfig:
     mode: GuardMode = "balanced"
-    decompose_model: str = "haiku"          # used by orchestrator integration
-    adjudicate_model: str = "sonnet"
+    # Injected by the orchestrator from the `guard` role tier; empty = the
+    # heuristic (word-overlap) path only. Never a literal model default.
+    decompose_model: str = ""
+    adjudicate_model: str = ""
     max_claims_per_msg: int = 12
     yellow_release_threshold: float = 0.7
     cache_ttl_s: int = 600
@@ -76,7 +84,15 @@ class GuardConfig:
 
     @property
     def verify_all_yellow(self) -> bool:
-        return self.mode == "strict"
+        return self.mode in ("strict", "max")
+
+    @property
+    def blocks_on_red(self) -> bool:
+        return self.mode in ("balanced", "strict", "max") and self.block_on_red
+
+    @property
+    def uses_llm_hooks(self) -> bool:
+        return self.mode in LLM_MODES
 
     @property
     def is_active(self) -> bool:
@@ -123,7 +139,7 @@ _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z])")
 def heuristic_decompose(findings: str, *, max_claims: int = 12) -> list[str]:
     """Simple sentence-split decomposition. No LLM call.
 
-    The orchestrator integration replaces this with a Haiku call that
+    The orchestrator integration replaces this with a `guard`-tier LLM call that
     extracts SPO-style atomic claims. Heuristic version is a strict
     sentence-splitter — adequate for tests and a sane fallback.
     """
@@ -176,6 +192,101 @@ def heuristic_screen(
 
 
 # ---------------------------------------------------------------------------
+# LLM hooks (mode = "max") — real claim decomposition + contradiction
+# adjudication on the `guard` role tier. The backend is any object with
+# `.call(AgentCall) -> AgentResult` (tests inject a fake).
+# ---------------------------------------------------------------------------
+
+DECOMPOSE_SCHEMA: dict = {
+    "type": "object",
+    "properties": {"claims": {"type": "array", "items": {"type": "string"}}},
+    "required": ["claims"],
+}
+ADJUDICATE_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "verdict": {"type": "string", "enum": ["green", "yellow", "red"]},
+        "reason": {"type": "string"},
+    },
+    "required": ["verdict"],
+}
+
+_DECOMPOSE_SYSTEM = (
+    "You extract atomic, verifiable claims from an agent's research findings. "
+    "Each claim is one subject-predicate-object statement that can be checked "
+    "on its own, in the findings' own words. Return JSON {\"claims\": [...]} only."
+)
+_ADJUDICATE_SYSTEM = (
+    "You adjudicate one new claim against previously verified (green) claims. "
+    "green = the anchors support/entail it; red = an anchor contradicts it; "
+    "yellow = neither (novel or unverifiable from the anchors). "
+    "Return JSON {\"verdict\": green|yellow|red, \"reason\": \"...\"} only."
+)
+
+
+def make_llm_hooks(
+    backend: Any,
+    *,
+    model: str,
+    effort: str | None = None,
+    max_claims: int = 12,
+    max_anchors: int = 20,
+    timeout_s: int = 120,
+    log: Callable[[str], None] | None = None,
+) -> tuple[DecomposeFn, ScreenFn]:
+    """Build (decompose_fn, screen_fn) that call `backend` on `model`.
+
+    `model` is the resolved `guard`-tier model string (injected by the
+    caller via `backends.models.resolve_model`); never defaulted here. Both
+    hooks fall back to the heuristic on a backend error and say so through
+    `log`, so a flaky guard model degrades to the placeholder screen instead
+    of silently passing everything.
+    """
+    from backends import AgentCall  # local import: keeps this module importable standalone
+
+    def _call(role: str, system: str, prompt: str, schema: dict) -> dict | None:
+        res = backend.call(AgentCall(
+            role=role, model_role="guard", prompt=prompt, system_prompt=system,
+            schema=schema, model=model, timeout_s=timeout_s, reasoning_effort=effort,
+        ))
+        if getattr(res, "errored", False) or not getattr(res, "parsed", None):
+            if log:
+                log(f"[cascade_guard] {role}: backend error ({getattr(res, 'error', None)}); heuristic fallback")
+            return None
+        return res.parsed
+
+    def decompose(findings: str) -> list[str]:
+        if not findings or not findings.strip():
+            return []
+        parsed = _call("guard_decompose", _DECOMPOSE_SYSTEM,
+                       f"## Findings\n{findings}\n\nExtract at most {max_claims} atomic claims.",
+                       DECOMPOSE_SCHEMA)
+        if parsed is None:
+            return heuristic_decompose(findings, max_claims=max_claims)
+        claims = [str(c).strip() for c in parsed.get("claims", []) if str(c).strip()]
+        return claims[:max_claims] or heuristic_decompose(findings, max_claims=max_claims)
+
+    def screen(claim: AtomicClaim, neighbors: list[AtomicClaim]) -> ClaimVerdict:
+        anchors = [n for n in neighbors if n.verdict == "green"][:max_anchors]
+        if not anchors:
+            return "yellow"                       # nothing to adjudicate against
+        prompt = (
+            f"## New claim\n{claim.text}\n\n## Verified anchors\n"
+            + "\n".join(f"- {a.text}" for a in anchors)
+        )
+        parsed = _call("guard_adjudicate", _ADJUDICATE_SYSTEM, prompt, ADJUDICATE_SCHEMA)
+        if parsed is None:
+            return heuristic_screen(claim, neighbors)
+        verdict = str(parsed.get("verdict", "yellow")).lower()
+        if verdict in ("green", "yellow", "red"):
+            claim.verify_notes = str(parsed.get("reason", ""))[:300]
+            return verdict  # type: ignore[return-value]
+        return "yellow"
+
+    return decompose, screen
+
+
+# ---------------------------------------------------------------------------
 # CascadeGuard
 # ---------------------------------------------------------------------------
 
@@ -213,6 +324,39 @@ class CascadeGuard:
             )
         )
         self._screen_fn = screen_fn or heuristic_screen
+        self.hook_kind = "llm" if (decompose_fn is not None and screen_fn is not None) else "heuristic"
+        if self.cfg.is_active:
+            if self.hook_kind == "llm":
+                print(f"  Cascade guard: mode={self.cfg.mode} — LLM claim decomposition + "
+                      f"contradiction adjudication (guard tier: {self.cfg.adjudicate_model or '?'})")
+            else:
+                print(f"  Cascade guard: mode={self.cfg.mode} — heuristic screen "
+                      "(sentence split + word overlap; NOT LLM adjudication)")
+
+    @classmethod
+    def from_config(cls, blitz_cfg, backend_id: str | None = None, *, backend: Any = None) -> "CascadeGuard":
+        """Build the guard for `[guard] mode`.
+
+        mode "max": resolve the `guard` role tier (`resolve_model`) and build
+        real LLM hooks on the configured provider backend (`backend` may be
+        injected; default `make_provider_backend`). Other modes: heuristic.
+        """
+        from backends.models import resolve_model
+
+        resolved = resolve_model("guard", backend_id, blitz_cfg)
+        cfg = GuardConfig(mode=blitz_cfg.guard.mode, decompose_model=resolved.model,
+                          adjudicate_model=resolved.model)
+        if not cfg.uses_llm_hooks:
+            return cls(cfg)
+        if backend is None:
+            from backends import make_provider_backend
+
+            backend = make_provider_backend(resolved.backend_id, blitz_cfg)
+        decompose, screen = make_llm_hooks(
+            backend, model=resolved.model, effort=resolved.effort,
+            max_claims=cfg.max_claims_per_msg, log=print,
+        )
+        return cls(cfg, decompose_fn=decompose, screen_fn=screen)
 
     # ------------------------------------------------------------------
     # Public hooks
@@ -282,11 +426,7 @@ class CascadeGuard:
         output["_claim_counts"] = counts
 
         # Block on Red claims (balanced/strict only; speed never blocks)
-        if (
-            red_claims
-            and self.cfg.mode in ("balanced", "strict")
-            and self.cfg.block_on_red
-        ):
+        if red_claims and self.cfg.blocks_on_red:
             self._mark_tainted(agent_id, round_n, "red_claim")
             output["_blocked"] = True
             output["_block_reason"] = [c.text[:200] for c in red_claims][:3]

@@ -21,6 +21,7 @@ orchestrator integration replaces with a Claude CLI subprocess.
 
 from __future__ import annotations
 
+import asyncio
 import math
 import statistics
 import time
@@ -42,7 +43,9 @@ class JudgeConfig:
     min_rounds: int = 2
     score_buckets: int = 11              # 0..10 maps to k=10
     seed_strategy: Literal["prompt_seed", "model_mix", "both"] = "prompt_seed"
-    judge_models: tuple[str, ...] = ("sonnet", "sonnet", "haiku")
+    # Model strings are injected by the caller (orchestrator resolves the
+    # `judge` role tier via backends.models.resolve_model); never defaulted here.
+    judge_models: tuple[str, ...] = ()
     rubric_dims: tuple[str, ...] = ("coverage", "accuracy", "clarity", "depth")
     distribution: Literal["empirical", "bb_mixture"] = "empirical"
     aggregator: Literal["mean", "median", "trimmed_mean"] = "mean"
@@ -197,9 +200,24 @@ class JudgeEnsemble:
     # ------------------------------------------------------------------
 
     def round(self, candidate: str, debate_history: str = "") -> StabilityState:
-        """Run one debate round. Returns the stability state."""
+        """Run one debate round (judges called sequentially). Returns the
+        stability state."""
         round_n = len(self.history) + 1
         votes = self._cast_votes(candidate, debate_history, round_n)
+        return self._record_round(votes, round_n)
+
+    async def round_async(self, candidate: str, debate_history: str = "") -> StabilityState:
+        """Same as `round`, but the N judge calls fan out concurrently via
+        `asyncio.to_thread` + `gather` (core-loop-01). Votes land in judge
+        order, so the KS statistics are identical to the sequential path."""
+        round_n = len(self.history) + 1
+        votes = list(await asyncio.gather(*(
+            asyncio.to_thread(self._vote_one, i, candidate, debate_history, round_n)
+            for i in range(self.cfg.n_judges)
+        )))
+        return self._record_round(votes, round_n)
+
+    def _record_round(self, votes: list[JudgeVote], round_n: int) -> StabilityState:
         self.history.append(votes)
         state = self._update_state(votes, round_n)
         self.state_log.append(state)
@@ -247,35 +265,42 @@ class JudgeEnsemble:
     def _cast_votes(
         self, candidate: str, history: str, round_n: int
     ) -> list[JudgeVote]:
-        """Invoke each judge once for this round."""
-        votes: list[JudgeVote] = []
-        for i in range(self.cfg.n_judges):
-            judge_id = f"judge_{i:02d}"
-            seed = self._seed_for(i, round_n)
-            model = self.cfg.judge_models[i % len(self.cfg.judge_models)]
-            t0 = time.monotonic()
-            try:
-                vote = self.judge_fn(
-                    candidate, history, judge_id, model, seed,
-                    self.cfg.rubric_dims,
-                )
-                vote.round_n = round_n
-                vote.elapsed_s = time.monotonic() - t0
-            except Exception as e:
-                vote = JudgeVote(
-                    judge_id=judge_id,
-                    round_n=round_n,
-                    rubric_scores={},
-                    aggregate_score=0.0,
-                    score_bucket=0,
-                    rationale=f"judge error: {e!r}",
-                    model=model,
-                    seed=seed,
-                    elapsed_s=time.monotonic() - t0,
-                    errored=True,
-                )
-            votes.append(vote)
-        return votes
+        """Invoke each judge once for this round, sequentially."""
+        return [
+            self._vote_one(i, candidate, history, round_n)
+            for i in range(self.cfg.n_judges)
+        ]
+
+    def _vote_one(
+        self, i: int, candidate: str, history: str, round_n: int
+    ) -> JudgeVote:
+        """One judge's vote; an exception becomes an errored vote."""
+        judge_id = f"judge_{i:02d}"
+        seed = self._seed_for(i, round_n)
+        models = self.cfg.judge_models
+        model = models[i % len(models)] if models else ""
+        t0 = time.monotonic()
+        try:
+            vote = self.judge_fn(
+                candidate, history, judge_id, model, seed,
+                self.cfg.rubric_dims,
+            )
+            vote.round_n = round_n
+            vote.elapsed_s = time.monotonic() - t0
+        except Exception as e:
+            vote = JudgeVote(
+                judge_id=judge_id,
+                round_n=round_n,
+                rubric_scores={},
+                aggregate_score=0.0,
+                score_bucket=0,
+                rationale=f"judge error: {e!r}",
+                model=model,
+                seed=seed,
+                elapsed_s=time.monotonic() - t0,
+                errored=True,
+            )
+        return vote
 
     def _seed_for(self, judge_idx: int, round_n: int) -> int:
         """Rotate seed assignments across rounds to control position bias."""

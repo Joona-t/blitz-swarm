@@ -1,23 +1,32 @@
 cff-version: 1.2.0
 message: "If you use or reference this work, please cite it as below."
-title: "Blitz-Swarm: Parallel Multi-Agent Consensus Architecture"
+title: "Blitz-Swarm: Config-driven parallel multi-agent research swarm on local CLIs"
 type: software
 authors:
   - given-names: Joona
     family-names: Tyrninoksa
-    alias: Darkfire
 repository-code: "https://github.com/Joona-t/blitz-swarm"
 license: MIT
-version: "0.1.0"
-date-released: "2026-03-12"
+version: "0.3.0"
+date-released: "2026-10-11"
 abstract: >-
-  A parallel multi-agent architecture where all agents execute simultaneously,
-  share memory through a live blackboard, and converge through unanimous voting
-  with explicit dissent preservation. Implements G-Memory Tier 1 with Tiers 2-3
-  proposed.
+  A parallel multi-agent research swarm that runs every agent as a subprocess
+  of a local CLI (Claude Code, Codex, Gemini, Ollama, any OpenAI-compatible
+  server or any argv-templated CLI) with no paid token API on a default path.
+  Consensus mode stages round 1 (researchers, then evaluators, then a judge
+  ensemble), blasts later rounds in parallel through a shared blackboard that
+  is read back for every context, stops on evaluator unanimity with a holdout
+  override, and preserves unresolved dissent. Mythos mode runs a deep planner,
+  parallel executors and a deep verifier (Fable 5.1 on the Claude CLI by
+  default) with a subprocess test gate. Models are resolved from configuration
+  through one role-to-tier-to-model function; a three-tier G-Memory store
+  (SQLite FTS5, optional vectors) persists and retrieves across runs. 745
+  tests pass without invoking a model. No live benchmark run has been
+  executed; the limitations are documented.
 keywords:
   - multi-agent systems
   - parallel execution
   - consensus mechanisms
   - dissent preservation
   - G-Memory
+  - local LLM CLIs

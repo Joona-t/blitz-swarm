@@ -86,7 +86,7 @@ def write_executors(run_dir: Path, executor_outputs: list, round_n: int) -> None
             f"# Executor Output: {o.spec_id}",
             "",
             f"**Confidence:** {o.confidence:.2f} | "
-            f"**Cost:** ${o.cost_usd:.4f} | "
+            f"**Cost:** {'n/a' if o.cost_usd is None else f'${o.cost_usd:.4f}'} | "
             f"**Wall:** {o.elapsed_s:.1f}s",
             "",
             "## Deliverable",

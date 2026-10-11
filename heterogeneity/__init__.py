@@ -1,4 +1,7 @@
-"""Cross-CLI heterogeneity routing.
+"""Cross-CLI heterogeneity routing. **EXPERIMENTAL, UNWIRED.**
+
+Nothing in the orchestrator calls `CLIRouter`; it is gated by
+`[evolve] enabled` (mechanisms-01) and refuses to construct otherwise.
 
 Routes role calls to local CLIs Joona already has (`claude`, `codex`,
 `gemini`, `llm`). Rule-#10 compliant: all subprocess invocations against

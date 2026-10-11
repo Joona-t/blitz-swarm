@@ -1,6 +1,7 @@
 """Blitz-Swarm — Per-run metrics collection and analysis.
 
-Every run produces a structured metrics record appended to metrics.jsonl.
+Every run produces a structured metrics record appended to output/metrics.jsonl
+(gitignored; the tracked 2026-03..06 history is archived under docs/data/).
 Adapted from research-swarm's phase-based metrics for blitz-swarm's
 round-based iterative consensus model.
 
@@ -19,14 +20,25 @@ import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
-METRICS_PATH = Path(__file__).parent / "metrics.jsonl"
+from backends.models import pricing_for
 
-# Relative cost weights per model tier (normalized to haiku = 1)
-MODEL_COST_WEIGHT = {
-    "haiku": 1.0,
-    "sonnet": 3.0,
-    "opus": 15.0,
-}
+METRICS_PATH = Path(__file__).parent / "output" / "metrics.jsonl"
+
+
+def cost_from_pricing(cfg, backend_id: str | None, model: str | None,
+                      input_tokens: int, output_tokens: int) -> float | None:
+    """USD for a call from `[backend.providers.<id>.pricing."<model>"]`, or
+    None when the provider/model has no pricing entry (reported as n/a, never 0)."""
+    if cfg is None or not backend_id or not model:
+        return None
+    try:
+        provider = cfg.backend.get_provider(backend_id)
+    except KeyError:
+        return None
+    price = pricing_for(provider, model)
+    if price is None:
+        return None
+    return (input_tokens * price["input_per_mtok"] + output_tokens * price["output_per_mtok"]) / 1_000_000
 
 
 @dataclass
@@ -39,7 +51,7 @@ class RoundMetrics:
     agents_timeout: int = 0
     agents_raw: int = 0
     wall_clock_s: float = 0.0
-    cost_usd: float = 0.0
+    cost_usd: float | None = None     # None = no provider reported cost and no pricing configured
     input_tokens: int = 0
     output_tokens: int = 0
     ready_votes: int = 0
@@ -77,7 +89,7 @@ class RunMetrics:
     # Cost
     total_wall_clock_s: float = 0.0
     total_agent_invocations: int = 0
-    total_cost_usd: float = 0.0
+    total_cost_usd: float | None = None   # None = unknown (n/a), never coerced to 0
     total_input_tokens: int = 0
     total_output_tokens: int = 0
     estimated_cost_units: float = 0.0
@@ -86,7 +98,11 @@ class RunMetrics:
 class MetricsCollector:
     """Collects metrics during a blitz-swarm run, then persists to JSONL."""
 
-    def __init__(self):
+    def __init__(self, cfg=None, backend_id: str | None = None):
+        # `cfg` + `backend_id` enable pricing lookups for calls whose
+        # provider envelope carries tokens but no cost.
+        self.cfg = cfg
+        self.backend_id = backend_id
         self.run = RunMetrics()
         self._round_timers: dict[str, float] = {}
         self._agent_timings: list[dict] = []
@@ -113,7 +129,7 @@ class MetricsCollector:
         errors = 0
         timeouts = 0
         raw = 0
-        round_cost = 0.0
+        round_cost: float | None = None
         round_input_tokens = 0
         round_output_tokens = 0
 
@@ -128,10 +144,20 @@ class MetricsCollector:
                 raw += 1
             else:
                 ok += 1
-            # Accumulate cost from CLI envelope data
-            round_cost += o.get("_cost_usd", 0)
-            round_input_tokens += o.get("_input_tokens", 0)
-            round_output_tokens += o.get("_output_tokens", 0)
+            # Accumulate cost: provider-reported first, else configured pricing;
+            # unknown stays None (never summed as 0).
+            in_tok = int(o.get("_input_tokens", 0) or 0)
+            out_tok = int(o.get("_output_tokens", 0) or 0)
+            cost = o.get("_cost_usd")
+            if cost is None:
+                cost = cost_from_pricing(
+                    self.cfg, o.get("_backend_id") or self.backend_id,
+                    o.get("_model"), in_tok, out_tok,
+                )
+            if cost is not None:
+                round_cost = (round_cost or 0.0) + float(cost)
+            round_input_tokens += in_tok
+            round_output_tokens += out_tok
 
         rm = RoundMetrics(
             round_name=round_name,
@@ -141,14 +167,15 @@ class MetricsCollector:
             agents_timeout=timeouts,
             agents_raw=raw,
             wall_clock_s=round(wall_clock, 1),
-            cost_usd=round(round_cost, 6),
+            cost_usd=None if round_cost is None else round(round_cost, 6),
             input_tokens=round_input_tokens,
             output_tokens=round_output_tokens,
         )
 
         self.run.rounds[round_name] = asdict(rm)
         self.run.total_agent_invocations += len(outputs)
-        self.run.total_cost_usd += round_cost
+        if round_cost is not None:
+            self.run.total_cost_usd = (self.run.total_cost_usd or 0.0) + round_cost
         self.run.total_input_tokens += round_input_tokens
         self.run.total_output_tokens += round_output_tokens
 
@@ -180,27 +207,30 @@ class MetricsCollector:
 
     def record_agent_timing(self, agent_id: str, model: str,
                             elapsed_s: float, context_chars: int = 0):
-        """Record per-agent timing for cost estimation."""
+        """Record per-agent timing. `estimated_cost_units` is a model-agnostic
+        context-volume proxy (chars sent); real USD comes from the provider
+        envelope or `[backend.providers.<id>.pricing]`."""
         self._agent_timings.append({
             "agent_id": agent_id,
             "model": model,
             "elapsed_s": round(elapsed_s, 1),
             "context_chars": context_chars,
         })
-        weight = MODEL_COST_WEIGHT.get(model, 3.0)
-        self.run.estimated_cost_units += context_chars * weight
+        self.run.estimated_cost_units += context_chars
 
     def finalize(self):
         self.run.total_wall_clock_s = round(
             time.monotonic() - self._run_start, 1
         )
         self.run.estimated_cost_units = round(self.run.estimated_cost_units)
-        self.run.total_cost_usd = round(self.run.total_cost_usd, 4)
+        if self.run.total_cost_usd is not None:
+            self.run.total_cost_usd = round(self.run.total_cost_usd, 4)
 
     def save(self):
         """Append metrics record to JSONL file."""
         record = asdict(self.run)
         record["_agent_timings"] = self._agent_timings
+        METRICS_PATH.parent.mkdir(parents=True, exist_ok=True)
         with open(METRICS_PATH, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, separators=(",", ":")) + "\n")
         return record
@@ -303,10 +333,10 @@ def detect_regressions(records: list[dict], window: int = 3,
                 })
 
     # Cost regression (higher is worse)
-    current_cost = latest.get("total_cost_usd", 0)
-    prior_costs = [r.get("total_cost_usd", 0) for r in prior
+    current_cost = latest.get("total_cost_usd")
+    prior_costs = [r.get("total_cost_usd") for r in prior
                    if isinstance(r.get("total_cost_usd"), (int, float))]
-    if prior_costs:
+    if prior_costs and isinstance(current_cost, (int, float)):
         avg_cost = statistics.mean(prior_costs)
         if avg_cost > 0:
             delta = (current_cost - avg_cost) / avg_cost
@@ -348,8 +378,8 @@ def format_metrics_report(records: list[dict], last_n: int = 5) -> str:
         if r.get("override_applied"):
             consensus += "*"
         wall = r.get("total_wall_clock_s", 0)
-        cost_usd = r.get("total_cost_usd", 0)
-        cost_str = f"${cost_usd:.2f}" if cost_usd > 0 else "--"
+        cost_usd = r.get("total_cost_usd")
+        cost_str = f"${cost_usd:.2f}" if isinstance(cost_usd, (int, float)) else "n/a"
 
         lines.append(
             f"| {len(records) - last_n + i + 1} "
@@ -375,7 +405,7 @@ def format_metrics_report(records: list[dict], last_n: int = 5) -> str:
             ("total_wall_clock_s", "Wall Clock (s)"),
             ("rounds_to_consensus", "Rounds to Consensus"),
         ]:
-            vals = [r.get(key, 0) for r in last3]
+            vals = [r.get(key) for r in last3]
             if all(isinstance(v, (int, float)) for v in vals):
                 trend = "->"
                 if vals[-1] > vals[0] * 1.05:

@@ -1,5 +1,7 @@
 # Mythos Swarm — Research
 
+> **Founding design doc, 2026-05. Historical — not updated.** For what the code does today see `README.md` (and `docs/MODELS.md` for models/providers).
+
 > Draft research doc per CLAUDE.md workflow (research → plan → annotate → "implement it all"). **Do not implement yet.**
 > Author: Claude (Opus 4.7) | Date: 2026-05-09 | Source-of-truth for the Mythos Swarm design discussion.
 

@@ -8,8 +8,11 @@ contribute semantically clustered candidates. Trades recall for
 precision; the holding table preserves recall.
 
 Algorithm:
-    1. Pull unpromoted candidates with embeddings.
-    2. Single-link agglomerative cluster on cosine, threshold 0.78.
+    1. Pull unpromoted candidates (with or without embeddings).
+    2. Single-link agglomerative cluster: cosine >= threshold when both
+       sides have a vector, else exact normalized-content equality (a
+       candidate stored without a vector -- no embedder installed -- can
+       still promote when the same lesson recurs verbatim).
     3. For each cluster:
         a. support_size = |distinct(query_ids)|
         b. If support_size < N: tag last_evaluated_at, skip.
@@ -38,10 +41,15 @@ class CandidateRow:
     id: str
     content: str
     query_id: str
-    embedding: tuple[float, ...]
+    embedding: tuple[float, ...]      # () when stored without a vector
     confidence: float
     tags: list[str]
     created_at: float
+    vector_source: str = "model"
+
+
+def _norm_content(text: str) -> str:
+    return " ".join((text or "").lower().split())
 
 
 @dataclass(slots=True)
@@ -82,7 +90,8 @@ def _encode_blob(vec: Sequence[float]) -> bytes:
 def _fetch_candidates(db: sqlite3.Connection) -> list[CandidateRow]:
     rows = db.execute(
         """
-        SELECT id, content, query_id, embedding, confidence, tags_json, created_at
+        SELECT id, content, query_id, embedding, confidence, tags_json, created_at,
+               vector_source
         FROM insight_candidates
         WHERE promoted_at IS NULL
         ORDER BY created_at ASC
@@ -98,6 +107,7 @@ def _fetch_candidates(db: sqlite3.Connection) -> list[CandidateRow]:
         out.append(CandidateRow(
             id=r[0], content=r[1], query_id=r[2], embedding=emb,
             confidence=float(r[4] or 0.5), tags=tags, created_at=float(r[6]),
+            vector_source=str(r[7] or "model"),
         ))
     return out
 
@@ -124,9 +134,13 @@ def _cluster_candidates(
 
     for i in range(len(candidates)):
         for j in range(i + 1, len(candidates)):
-            sim = cosine(candidates[i].embedding, candidates[j].embedding)
-            if sim >= threshold:
-                union(candidates[i].id, candidates[j].id)
+            a, b = candidates[i], candidates[j]
+            if a.embedding and b.embedding:
+                same = cosine(a.embedding, b.embedding) >= threshold
+            else:
+                same = _norm_content(a.content) == _norm_content(b.content)
+            if same:
+                union(a.id, b.id)
 
     clusters_by_root: dict[str, list[CandidateRow]] = {}
     for c in candidates:
@@ -164,11 +178,11 @@ def _centroid(embeddings: list[tuple[float, ...]]) -> tuple[float, ...]:
 
 def _canonical_member(cluster: Cluster) -> int:
     """Index of the candidate closest to the centroid; confidence as tiebreak."""
-    centroid = _centroid(cluster.embeddings)
+    centroid = _centroid([e for e in cluster.embeddings if e])
     best_idx = 0
     best = (-1.0, -1.0)
     for i, emb in enumerate(cluster.embeddings):
-        sim = cosine(emb, centroid)
+        sim = cosine(emb, centroid) if (emb and centroid) else 0.0
         score = (sim, cluster.confidences[i])
         if score > best:
             best = score
@@ -185,7 +199,9 @@ def _promote_cluster(
         return None
     canonical_idx = _canonical_member(cluster)
     canonical_content = cluster.contents[canonical_idx]
-    centroid_emb = _centroid(cluster.embeddings)
+    vectors = [e for e in cluster.embeddings if e]
+    centroid_emb = _centroid(vectors)
+    vector_source = "model" if vectors else "none"
     avg_conf = sum(cluster.confidences) / len(cluster.confidences)
 
     insight_id = str(uuid.uuid4())
@@ -196,15 +212,15 @@ def _promote_cluster(
             """
             INSERT INTO insights
             (id, content, supporting_queries, tags_json, created_at,
-             last_validated_at, access_count, confidence, embedding)
-            VALUES (?,?,?,?,?,?,?,?,?)
+             last_validated_at, access_count, confidence, embedding, vector_source)
+            VALUES (?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 insight_id, canonical_content,
                 json.dumps(sorted(cluster.query_ids)),
                 json.dumps(sorted(cluster.tags)),
                 now, now, 0, avg_conf,
-                _encode_blob(centroid_emb),
+                _encode_blob(centroid_emb), vector_source,
             ),
         )
         for cand_id in cluster.candidate_ids:

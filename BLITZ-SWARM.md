@@ -1,5 +1,7 @@
 # BLITZ-SWARM
 
+> **Founding design doc, 2026-03. Historical — not updated.** For what the code does today see `README.md` (and `docs/MODELS.md` for models/providers).
+
 > A parallel multi-agent swarm architecture for collective AI intelligence.
 > All agents live. All agents share memory. All agents iterate together until consensus.
 

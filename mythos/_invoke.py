@@ -1,22 +1,30 @@
-"""Shared subprocess invocation for Mythos roles.
+"""Shared invocation for Mythos roles.
 
-Wraps `claude -p --model X [--effort Y] --json-schema Z` into a single
-helper that returns parsed JSON + cost telemetry. Mirrors the parsing
-contract from orchestrator.py::invoke_agent (CLI envelope unwrapping).
+One helper: resolve the role's model (tier -> provider model string via
+backends.models.resolve_model), build the configured backend (with the
+[backend] fallback chain) and return parsed JSON + cost/token telemetry.
 
 Kept inside mythos/ because Mythos has different output schemas, longer
 timeouts, and a different retry policy than blitz-swarm consensus mode.
+
+Model precedence for a role (see backends/models.py):
+  --model / BLITZ_MODEL  >  BLITZ_MODEL_<ROLE>  >  mythos.toml [models] tier
+  >  blitz.toml [models].<role> tier  >  [models].default tier  >  provider
+  legacy `model`  >  ModelResolutionError. The provider-wide `model` key never
+  shadows the role tier (the v0.2 `provider.model or model` bug).
 """
 
 from __future__ import annotations
 
 import json
-import subprocess
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .policies import resolve_model
+from backends import AgentCall, make_provider_backend
+from backends.models import ResolvedModel, resolve_model
+from config import load_config
 
 # Path to prompts/ relative to this file
 PROMPTS_DIR = Path(__file__).parent / "prompts"
@@ -26,12 +34,16 @@ PROMPTS_DIR = Path(__file__).parent / "prompts"
 class InvokeResult:
     parsed: dict | None         # parsed JSON output (None on failure)
     raw_stdout: str             # full stdout for debugging
-    cost_usd: float             # from CLI envelope
+    cost_usd: float | None      # from the provider envelope; None when unknown (never 0)
     input_tokens: int
     output_tokens: int
     elapsed_s: float
     error: str | None = None    # populated on failure
     _envelope: dict | None = field(default=None, repr=False)
+
+    @property
+    def tokens(self) -> int:
+        return int(self.input_tokens or 0) + int(self.output_tokens or 0)
 
 
 def load_prompt(name: str) -> str:
@@ -40,151 +52,97 @@ def load_prompt(name: str) -> str:
     return path.read_text(encoding="utf-8")
 
 
+def resolve_role_model(model_role: str, tier: str | None, cfg, mode_backend: str | None = None) -> ResolvedModel:
+    """Resolve `model_role` honouring the mythos.toml tier override.
+
+    `tier` (mythos.toml `<role>_model`) wins over blitz.toml `[models]` but
+    loses to the explicit `--model` / BLITZ_MODEL / BLITZ_MODEL_<ROLE>
+    overrides, so the documented precedence holds.
+
+    Backend precedence: `--backend` / BLITZ_BACKEND (explicit) > `mode_backend`
+    (mythos.toml `[models] backend`, the Mythos-mode default) > blitz.toml
+    `[backend] default`.
+    """
+    backend_id = os.environ.get("BLITZ_BACKEND") or mode_backend or cfg.backend.default or None
+    # `tier=` is the strict slot (resolver step 2b): overrides still win, and
+    # a tier the provider does not define raises instead of being sent
+    # verbatim as a model string.
+    return resolve_model(model_role, backend_id, cfg, tier=tier or None)
+
+
 def invoke(
     *,
     role: str,
     system_prompt: str,
     user_prompt: str,
     schema_json: str,
-    model_alias: str,
+    model_role: str,
+    tier: str | None = None,
     timeout_s: int,
     max_turns: int = 4,
+    mode_backend: str | None = None,
 ) -> InvokeResult:
-    """Invoke a single Mythos role via `claude -p`.
+    """Invoke a single Mythos role through the configured local backend.
+
+    `role` is the label for logs/errors (e.g. "executor[spec-3]"); `model_role`
+    is the resolver role ("planner" | "executor" | "verifier"); `tier` is the
+    optional mythos.toml tier override for it.
 
     Returns InvokeResult with parsed dict or error. Never raises on CLI
     failure — wraps the failure into the result so the runner can decide
     what to do (replan, abort, etc.).
     """
-    model, effort = resolve_model(model_alias)
-
-    cmd = [
-        "claude",
-        "-p", user_prompt,
-        "--system-prompt", system_prompt,
-        "--output-format", "json",
-        "--model", model,
-        "--max-turns", str(max_turns),
-        "--json-schema", schema_json,
-        "--dangerously-skip-permissions",
-    ]
-    if effort:
-        cmd.extend(["--effort", effort])
-
     start = time.monotonic()
     try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
-        )
-    except subprocess.TimeoutExpired:
-        return InvokeResult(
-            parsed=None,
-            raw_stdout="",
-            cost_usd=0.0,
-            input_tokens=0,
-            output_tokens=0,
-            elapsed_s=time.monotonic() - start,
-            error=f"{role} timed out after {timeout_s}s",
-        )
+        cfg = load_config()
+        resolved = resolve_role_model(model_role, tier, cfg, mode_backend=mode_backend)
+        provider = cfg.backend.get_provider(resolved.backend_id)
+        sandbox = os.environ.get("BLITZ_SANDBOX") or provider.sandbox
+        backend = make_provider_backend(resolved.backend_id, cfg, sandbox=sandbox)
+        schema = json.loads(schema_json)
     except Exception as e:
         return InvokeResult(
             parsed=None,
             raw_stdout="",
-            cost_usd=0.0,
+            cost_usd=None,
             input_tokens=0,
             output_tokens=0,
             elapsed_s=time.monotonic() - start,
-            error=f"{role} subprocess exception: {e!r}",
+            error=f"{role} backend setup exception: {e!r}",
         )
 
-    elapsed = time.monotonic() - start
+    res = backend.call(AgentCall(
+        role=role,
+        model_role=model_role,
+        prompt=user_prompt,
+        system_prompt=system_prompt,
+        schema=schema,
+        model=resolved.model,
+        timeout_s=timeout_s,
+        sandbox=sandbox,
+        approval_policy=provider.approval_policy,
+        reasoning_effort=resolved.effort or provider.reasoning_effort or None,
+        ephemeral=provider.ephemeral,
+    ))
 
-    if proc.returncode != 0:
-        return InvokeResult(
-            parsed=None,
-            raw_stdout=proc.stdout,
-            cost_usd=0.0,
-            input_tokens=0,
-            output_tokens=0,
-            elapsed_s=elapsed,
-            error=f"{role} exit {proc.returncode}: {proc.stderr[:300]}",
-        )
-
-    envelope = _parse_envelope(proc.stdout)
-    cost = float(envelope.get("total_cost_usd", 0.0)) if envelope else 0.0
-    usage = (envelope or {}).get("usage", {}) or {}
-    in_tok = int(usage.get("input_tokens", 0))
-    out_tok = int(usage.get("output_tokens", 0))
-
-    # Envelope-level errors (eg. error_max_turns) come through with exit 0.
-    err: str | None = None
-    if envelope and envelope.get("is_error"):
-        subtype = envelope.get("subtype", "unknown")
-        terminal = envelope.get("terminal_reason", "")
-        err = f"{role} CLI is_error={subtype} terminal={terminal}"
-
-    parsed = _parse_inner_result(envelope, role)
-
+    parsed = res.parsed
+    err = res.error
     if not err and not parsed:
         err = f"{role} returned no parseable JSON"
 
     return InvokeResult(
         parsed=parsed,
-        raw_stdout=proc.stdout,
-        cost_usd=cost,
-        input_tokens=in_tok,
-        output_tokens=out_tok,
-        elapsed_s=elapsed,
+        raw_stdout=res.raw_stdout,
+        cost_usd=None if res.cost_usd is None else float(res.cost_usd),
+        input_tokens=res.input_tokens,
+        output_tokens=res.output_tokens,
+        elapsed_s=res.elapsed_s,
         error=err,
-        _envelope=envelope,
+        _envelope={
+            "backend_id": res.backend_id,
+            "model": res.model or resolved.model,
+            "tier": resolved.tier,
+            "effort": resolved.effort,
+            "validation_errors": res.validation_errors,
+        },
     )
-
-
-def _parse_envelope(stdout: str) -> dict | None:
-    """Parse the outer CLI JSON envelope."""
-    if not stdout.strip():
-        return None
-    try:
-        env = json.loads(stdout)
-        if isinstance(env, dict):
-            return env
-    except json.JSONDecodeError:
-        pass
-    return None
-
-
-def _parse_inner_result(envelope: dict | None, role: str) -> dict | None:
-    """Extract the role's structured JSON from the envelope.
-
-    Order of preference:
-      1. envelope["structured_output"] — set when --json-schema is used and
-         the model emits via tool call (the documented happy path).
-      2. envelope["result"] as dict — fallback if CLI ever inlines it.
-      3. envelope["result"] as string — try direct JSON parse, then embedded
-         {…} extraction (last resort).
-    """
-    if not envelope:
-        return None
-
-    so = envelope.get("structured_output")
-    if isinstance(so, dict):
-        return so
-
-    inner = envelope.get("result")
-    if isinstance(inner, dict):
-        return inner
-    if isinstance(inner, str) and inner.strip():
-        try:
-            return json.loads(inner)
-        except json.JSONDecodeError:
-            import re
-            m = re.search(r"\{.*\}", inner, re.DOTALL)
-            if m:
-                try:
-                    return json.loads(m.group(0))
-                except json.JSONDecodeError:
-                    return None
-    return None

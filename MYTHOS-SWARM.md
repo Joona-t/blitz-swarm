@@ -1,5 +1,7 @@
 # Mythos Swarm
 
+> **Founding design doc, 2026-05. Historical — not updated.** For what the code does today see `README.md` (and `docs/MODELS.md` for models/providers).
+
 > Hierarchical orchestrator-executor mode for blitz-swarm.
 > Mythos planner + Sonnet executors + Mythos verifier — for tasks where reasoning *is* the deliverable.
 

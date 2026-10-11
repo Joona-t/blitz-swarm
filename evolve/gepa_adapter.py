@@ -8,6 +8,9 @@ import time). The actual gepa.optimize() call lives in
 scripts/optimize_prompts.py — that file imports gepa lazily and only
 runs when Joona invokes the script.
 
+EXPERIMENTAL, UNWIRED: `BlitzGEPAAdapter.evaluate` refuses unless
+`[evolve] enabled = true`.
+
 The adapter is responsible for:
     1. Loading swarm role prompts as a candidate dict
     2. Wrapping the bench as an evaluator
@@ -21,6 +24,8 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
+
+from evolve import require_enabled
 
 
 @dataclass(slots=True)
@@ -62,6 +67,7 @@ class BlitzGEPAAdapter:
 
     run_fn: RunWithPromptsFn
     score_fn: ScoreFn
+    blitz_cfg: Any = None          # BlitzConfig for the [evolve] gate; None = blitz.toml
 
     def evaluate(
         self,
@@ -70,6 +76,7 @@ class BlitzGEPAAdapter:
         *,
         capture_traces: bool = True,
     ) -> dict:
+        require_enabled(self.blitz_cfg, what="evolve.gepa_adapter.BlitzGEPAAdapter.evaluate")
         outputs: list[str] = []
         scores: list[float] = []
         trajectories: list[SwarmTrajectory | None] = []

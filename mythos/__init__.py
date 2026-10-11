@@ -1,7 +1,7 @@
 """Mythos Swarm — hierarchical orchestrator-executor mode for blitz-swarm.
 
-Mythos planner decomposes a task into sub-specs + invariants. Sonnet executors
-run the sub-specs in parallel. Mythos verifier gates the outputs and either
+Mythos planner (deep tier) decomposes a task into sub-specs + invariants.
+Fast-tier executors run the sub-specs in parallel. Mythos verifier gates the outputs and either
 accepts or sends a replan signal. Up to N replans before failing loudly.
 
 Distinct from blitz-swarm's flat consensus mode — this is the right shape for
@@ -18,7 +18,6 @@ from .policies import (
     MythosConfig,
     CostBudget,
     load_mythos_config,
-    resolve_model,
 )
 from .runner import MythosResult, run_mythos
 
@@ -27,6 +26,5 @@ __all__ = [
     "CostBudget",
     "MythosResult",
     "load_mythos_config",
-    "resolve_model",
     "run_mythos",
 ]

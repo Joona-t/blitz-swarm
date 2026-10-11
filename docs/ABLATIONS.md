@@ -1,5 +1,9 @@
 # Ablations and Design Decisions
 
+> **Superseded 2026-10-11 (v0.3.0).** This file describes the v0.1 system as of 2026-03-14 and is kept as history. For what the code does today see `README.md`, `docs/MODELS.md`, `docs/CLAIMS_AND_EVIDENCE.md`, `docs/IMPLEMENTATION_STATUS.md` and `docs/LIMITATIONS.md`. `metrics.jsonl` referenced below was archived to `docs/data/metrics-2026-03_06.jsonl`; live runs write `output/metrics.jsonl`.
+
+> **No ablation has been run since either.** Of the six decisions: (1) is now *staged* round 1, not fully simultaneous; (2) Tiers 2–3 are implemented and wired (v0.3.0), still unvalidated; (3) LanceDB is optional and off the default path — the store is SQLite FTS5 with optional vectors in SQLite; (4) MiniLM is optional, a hash stub stands in without it; (5) holdout override unchanged, never triggered live; (6) in-memory fallback unchanged.
+
 No formal ablation studies have been conducted. This document records the rationale behind key design decisions.
 
 ## 1. Parallel vs. Sequential Execution

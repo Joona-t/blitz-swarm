@@ -1,5 +1,7 @@
 # Mythos Swarm — Plan
 
+> **Founding design doc, 2026-05. Historical — not updated.** For what the code does today see `README.md` (and `docs/MODELS.md` for models/providers).
+
 > Granular implementation plan. Decisions on §6 hard questions filled in. Built per CLAUDE.md workflow.
 > Companion: `MYTHOS-SWARM-RESEARCH.md`. Author: Claude (Opus 4.7) | Date: 2026-05-09.
 

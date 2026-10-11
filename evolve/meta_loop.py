@@ -10,7 +10,12 @@ guards pass:
     - Holdout slate must not regress (anti-bench-gaming)
 
 Schema-validated patches via ALLOWED_KEY_PATHS — only specific TOML keys
-are tunable by L2; everything else escalates to L3.
+are tunable by L2; everything else escalates to L3. Every key path names a
+real `config.BlitzConfig` field (`<section>.<field>`); tests walk the
+dataclass to assert this (evolve-01).
+
+EXPERIMENTAL, UNWIRED: `evaluate_patch` / `propose_patches_from_insights`
+refuse unless `[evolve] enabled = true`.
 """
 
 from __future__ import annotations
@@ -22,6 +27,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Iterable
 
+from evolve import require_enabled
+
 
 class PatchScope(Enum):
     GLOBAL = "global"
@@ -29,19 +36,19 @@ class PatchScope(Enum):
     TOPIC = "topic"
 
 
-# Mapping: TOML key -> (type, allowed range or set, risk_class)
+# Mapping: "<section>.<field>" of config.BlitzConfig -> (type, allowed range or set, risk_class)
 ALLOWED_KEY_PATHS: dict[str, tuple] = {
     "swarm.max_rounds":                (int, range(1, 10), "high"),
     "swarm.max_agents":                (int, range(2, 26), "medium"),
     "swarm.persona_critics":           (bool, (True, False), "low"),
-    "consensus.judge_ensemble.n":      (int, range(1, 9), "low"),
-    "consensus.judge_ensemble.max_rounds": (int, range(1, 11), "low"),
-    "consensus.judge_ensemble.ks_threshold": (float, (0.001, 0.5), "medium"),
+    "judge_ensemble.n_judges":         (int, range(1, 9), "low"),
+    "judge_ensemble.min_rounds":       (int, range(1, 11), "low"),
+    "judge_ensemble.ks_threshold":     (float, (0.001, 0.5), "medium"),
     "memory.top_k_retrieval":          (int, range(1, 13), "low"),
     "memory.query_link_threshold":     (float, (0.5, 0.95), "medium"),
-    "evolve.gepa.max_metric_calls":    (int, range(100, 5001), "low"),
-    "evolve.aflow.max_iters":          (int, range(20, 601), "low"),
-    "guard.mode":                      (str, {"off", "speed", "balanced", "strict"}, "medium"),
+    "evolve.gepa_max_metric_calls":    (int, range(100, 5001), "low"),
+    "evolve.aflow_max_iters":          (int, range(20, 601), "low"),
+    "guard.mode":                      (str, {"off", "speed", "balanced", "strict", "max"}, "medium"),
     "selector.granularity":            (str, {"whole", "section", "paragraph"}, "low"),
 }
 
@@ -80,7 +87,7 @@ class MetaLoopConfig:
     regression_bound: float = 0.3        # max per-dim drop allowed
     cost_ratio_cap: float = 1.5
     holdout_min_delta: float = -0.2      # holdout can't drop more than this
-    high_risk_paths: tuple[str, ...] = ("swarm.max_rounds", "consensus.strategy")
+    high_risk_paths: tuple[str, ...] = ("swarm.max_rounds",)
 
 
 class SchemaValidationError(Exception):
@@ -134,8 +141,13 @@ def evaluate_patch(
     candidate_score: dict,
     holdout_score: dict | None = None,
     cfg: MetaLoopConfig | None = None,
+    blitz_cfg=None,
 ) -> PatchEvaluation:
-    """Decide merged / rejected / human_review based on guards."""
+    """Decide merged / rejected / human_review based on guards.
+
+    Gated: raises `evolve.EvolveDisabled` unless `[evolve] enabled = true`.
+    """
+    require_enabled(blitz_cfg, what="evolve.meta_loop.evaluate_patch")
     cfg = cfg or MetaLoopConfig()
 
     base_agg = float(baseline_score.get("aggregate", 0.0))
@@ -211,14 +223,16 @@ def propose_patches_from_insights(
     insights: list[dict],
     *,
     max_patches: int = 5,
+    blitz_cfg=None,
 ) -> list[ConfigPatch]:
-    """Heuristic patch proposer.
+    """Heuristic patch proposer. Gated by `[evolve] enabled`.
 
     Scans `meta:` insights for known patterns (e.g., `meta:gepa-converged`,
     `meta:judge-variance-high`) and produces ConfigPatch suggestions.
     Real implementation calls an LLM to synthesize patches from arbitrary
     insight content.
     """
+    require_enabled(blitz_cfg, what="evolve.meta_loop.propose_patches_from_insights")
     patches: list[ConfigPatch] = []
     seen_keys: set[str] = set()
 
@@ -229,28 +243,28 @@ def propose_patches_from_insights(
         ins_id = ins.get("id", "?")
 
         if "judge variance" in content or "judge-variance-high" in content:
-            if "consensus.judge_ensemble.n" not in seen_keys:
+            if "judge_ensemble.n_judges" not in seen_keys:
                 patches.append(ConfigPatch(
                     patch_id=str(uuid.uuid4()),
                     scope=PatchScope.GLOBAL, scope_value=None,
-                    key_path="consensus.judge_ensemble.n",
+                    key_path="judge_ensemble.n_judges",
                     old_value=1, new_value=3,
                     rationale="meta-loop: high judge variance observed",
                     source_insights=[ins_id], risk_class="low",
                 ))
-                seen_keys.add("consensus.judge_ensemble.n")
+                seen_keys.add("judge_ensemble.n_judges")
 
         elif "gepa converged" in content or "gepa-converged" in content:
-            if "evolve.gepa.max_metric_calls" not in seen_keys:
+            if "evolve.gepa_max_metric_calls" not in seen_keys:
                 patches.append(ConfigPatch(
                     patch_id=str(uuid.uuid4()),
                     scope=PatchScope.GLOBAL, scope_value=None,
-                    key_path="evolve.gepa.max_metric_calls",
+                    key_path="evolve.gepa_max_metric_calls",
                     old_value=1500, new_value=800,
                     rationale="meta-loop: GEPA converged at low K; reducing budget",
                     source_insights=[ins_id], risk_class="low",
                 ))
-                seen_keys.add("evolve.gepa.max_metric_calls")
+                seen_keys.add("evolve.gepa_max_metric_calls")
 
         elif "saturated round 2" in content or "saturated-round-2" in content:
             if "swarm.max_rounds" not in seen_keys:

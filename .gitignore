@@ -3,10 +3,26 @@ __pycache__/
 *.pyo
 .DS_Store
 output/
+metrics.jsonl
+.pytest_cache/
 *.db
+*.db-shm
+*.db-wal
 memory_vectors/
+jobs/state/
 .venv/
 *.egg-info/
 dist/
 build/
 compass_artifact_*.md
+
+# gmemory sqlite side files + pre-migration backups (scripts/migrate_memory_db.py)
+memory.db-*
+*.pre-gmemory.bak
+
+# scratch / local-only
+scratch/
+.scratch/
+tmp/
+.venv*/
+venv*/

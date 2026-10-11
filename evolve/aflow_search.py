@@ -4,9 +4,13 @@ Frames swarm-config optimization as MCTS over `SwarmGraph` mutations.
 Anchor: Liu et al. arXiv 2410.10762 (ICLR 2025 oral) "AFlow: Automating
 Agentic Workflow Generation."
 
-Six operators ship in v0.2:
+Six operators ship (OPERATOR_REGISTRY — the docstring count is asserted
+against it in tests/test_phase3.py):
     AddResearcher, RemoveCritic, AddDebateRound, SwapSynthForSelector,
-    AddJudgeEnsemble, IncreaseRounds, FuseRoles, SwapCLI
+    AddJudgeEnsemble, IncreaseRounds
+FuseRoles and SwapCLI are NOT implemented.
+
+EXPERIMENTAL, UNWIRED: `aflow_search` refuses unless `[evolve] enabled = true`.
 
 This module implements the LLM-free skeleton: graph IR, operator
 registry, MCTS with UCB1, fingerprint dedup. The mutator (the LLM
@@ -23,6 +27,8 @@ import random
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Callable, Iterable
+
+from evolve import require_enabled
 
 
 class RoleKind(Enum):
@@ -41,7 +47,7 @@ class RoleKind(Enum):
 class Node:
     id: str
     kind: RoleKind
-    cli: str = "claude:sonnet"
+    cli: str = "claude"      # provider id only ([backend.providers]); model comes from role tiers
 
 
 @dataclass(frozen=True)
@@ -267,8 +273,14 @@ def aflow_search(
     max_iters: int = 50,
     seed_score: float | None = None,
     rng_seed: int = 42,
+    blitz_cfg=None,
 ) -> dict:
-    """Run MCTS over swarm graphs. Returns dict with frontier + history."""
+    """Run MCTS over swarm graphs. Returns dict with frontier + history.
+
+    Gated: raises `evolve.EvolveDisabled` unless `[evolve] enabled = true`
+    (`blitz_cfg` defaults to blitz.toml).
+    """
+    require_enabled(blitz_cfg, what="evolve.aflow_search")
     rng = random.Random(rng_seed)
     root = MCTSNode(
         graph=seed, parent=None,
