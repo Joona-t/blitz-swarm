@@ -1,5 +1,7 @@
 # Phase 3 Recursive Self-Improvement — Implementation Deep Dive
 
+> **Superseded 2026-10-11 (v0.3.0).** Frozen 2026-05-09 design output; kept as history. What actually shipped is in `README.md`, `docs/IMPLEMENTATION_STATUS.md` and `docs/CLAIMS_AND_EVIDENCE.md`. Paths below that do not exist in the tree are marked `[never created]`. Dollar figures below assumed paid Anthropic API pricing; every default path runs on the user's own CLI subscription (rule #10), so read them as **token budgets**, not spend — see the note in each budget section.
+
 **Status:** Frozen research output from background-task agent run 2026-05-09.
 **Source:** Phase 3 GEPA + Aflow + meta-loop deep-dive subagent.
 **Consumed by:** `evolve/`, `heterogeneity/`, `managed_agents/`, `scripts/optimize_prompts.py` implementation.
@@ -45,6 +47,9 @@ L3  human audit + freeze                                — Joona reviews L2 cha
 
 ### Loop budgets (hard caps from `blitz.toml [evolve]`)
 
+> **Reframed 2026-10-11 (research-docs-06):** the `$` column assumed paid-API pricing; no default path pays per token. Read the dollar caps as token budgets (the "soft 200M / 1B" column is the operative one). The shipped `[evolve]` table has only `enabled = false`, `gepa_max_metric_calls`, `aflow_max_iters` — no dollar cap key exists. L1/L2 have never run.
+
+
 | Level | Frequency | Wall-clock cap | $$ cap (Managed-Agents) | Token cap (CLI) |
 |-------|-----------|----------------|-------------------------|----------------|
 | L0    | per task  | 300 s          | $0 (CLI)                | unbounded      |
@@ -80,7 +85,7 @@ blitz-swarm/
     gepa_adapter.py                        # GEPAAdapter -> swarm
     bench_evaluator.py                     # wraps bench.score for GEPA
   prompts/general/                         # *.md role prompts (existing)
-  evolve/runs/<timestamp>/                 # generation logs, candidates, pareto
+  evolve/runs/<timestamp>/                 # generation logs, candidates, pareto   [never created — nothing in evolve/ has run]
 ```
 
 ### 1.3 Concrete API
@@ -116,7 +121,7 @@ class BlitzGEPAAdapter(GEPAAdapter[SwarmTask, SwarmTrajectory, str]):
 # scripts/optimize_prompts.py
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--slate", default="bench/slate.jsonl")
+    ap.add_argument("--slate", default="bench/slate.jsonl")   # [never created] — real file: bench/slate_v1.toml
     ap.add_argument("--max-metric-calls", type=int, default=1500)
     ap.add_argument("--reflection-lm", default="claude-cli:opus")
     ap.add_argument("--components", nargs="+",
@@ -767,7 +772,7 @@ class BenchScore:
     elapsed_s: float
     seed: int
 
-def load_slate(path="bench/slate.jsonl", split=(0.7, 0.3), seed=42) -> tuple[list, list]: ...
+def load_slate(path="bench/slate.jsonl", split=(0.7, 0.3), seed=42) -> tuple[list, list]: ...   # [never created] — real file: bench/slate_v1.toml
 def score(swarm_config, slate, seed=42, backend="cli") -> BenchScore: ...
 def regression_check(baseline, candidate, bound=0.3) -> list[str]: ...
 ```
@@ -777,7 +782,7 @@ def regression_check(baseline, candidate, bound=0.3) -> list[str]: ...
 - Same `seed` → same `BenchScore.aggregate` within ±2%, ≥ 95% of time, over 5 reruns.
 - Slate file hash-pinned in CHANGELOG.
 - Judge ensemble random sub-judge ordering also seeded.
-- Holdout slate (`bench/holdout.jsonl`) never touched by GEPA/AFlow training.
+- Holdout slate (`bench/holdout.jsonl` `[never created]`; the slate is `bench/slate_v1.toml`) never touched by GEPA/AFlow training.
 
 ### 6.2 Test plan
 
@@ -902,8 +907,8 @@ If `backend = "managed_agents"`:
 | 1 | Selector + judge ensemble | `consensus.py` upgrades |
 | 2 | Insight graph + meta tags | `gmemory/` schema, tag taxonomy |
 | 3a | GEPA (Comp 1) | `scripts/optimize_prompts.py`, `evolve/gepa_adapter.py` |
-| 3b | AFlow (Comp 2) | `evolve/aflow_search.py`, `evolve/aflow/` |
-| 3c | Meta-loop (Comp 3) | `evolve/meta_loop.py`, `evolve/meta/` |
+| 3b | AFlow (Comp 2) | `evolve/aflow_search.py`, `evolve/aflow/` `[never created]` |
+| 3c | Meta-loop (Comp 3) | `evolve/meta_loop.py`, `evolve/meta/` `[never created]` |
 | 3d | Heterogeneity (Comp 4) | `heterogeneity/`, routing table |
 | 3e | Managed Agents (Comp 5, opt-in) | `managed_agents/` |
 

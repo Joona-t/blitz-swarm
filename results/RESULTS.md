@@ -1,5 +1,9 @@
 # Results
 
+> **Superseded 2026-10-11 (v0.3.0).** This file describes the v0.1 system as of 2026-03-14 and is kept as history. For what the code does today see `README.md`, `docs/MODELS.md`, `docs/CLAIMS_AND_EVIDENCE.md`, `docs/IMPLEMENTATION_STATUS.md` and `docs/LIMITATIONS.md`. `metrics.jsonl` referenced below was archived to `docs/data/metrics-2026-03_06.jsonl`; live runs write `output/metrics.jsonl`.
+
+> n=2 from 2026-03-14 on v0.1.0. No later run table exists; the only later live numbers are the four 2026-05-10 mythos-bench rows (also stale). The first v0.3.0 results will come from `bench/runner.py` (`docs/ROADMAP.md` item 1).
+
 ## Run Table (2 runs)
 
 | Run | Topic | Rounds | Consensus | Override | Quality | Coverage | Accuracy | Clarity | Depth | Cost | Time | Agents | Errors |

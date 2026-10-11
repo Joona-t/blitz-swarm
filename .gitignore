@@ -15,3 +15,14 @@ jobs/state/
 dist/
 build/
 compass_artifact_*.md
+
+# gmemory sqlite side files + pre-migration backups (scripts/migrate_memory_db.py)
+memory.db-*
+*.pre-gmemory.bak
+
+# scratch / local-only
+scratch/
+.scratch/
+tmp/
+.venv*/
+venv*/

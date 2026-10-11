@@ -82,11 +82,14 @@ class MythosConfig:
     verifier_timeout_s: int = 600
 
     # Verifier gates (backends-04). The LLM verdict alone never passes a round:
-    #  - mechanical check: when a deliverable contains a test file, the
-    #    artifact's own tests run in a subprocess and must pass;
+    #  - mechanical check (OPT-IN): when a deliverable contains a test file,
+    #    the artifact's own tests run in a subprocess and must pass. This
+    #    EXECUTES MODEL-WRITTEN CODE with the host user's filesystem/network
+    #    access (temp cwd, scrubbed env, timeout — no sandbox). Off by
+    #    default; enable only for artifacts you would run by hand.
     #  - confidence gate: a "pass" below `verifier_min_confidence` is demoted
     #    to needs_work.
-    verifier_run_tests: bool = True
+    verifier_run_tests: bool = False
     verifier_test_timeout_s: int = 120
     verifier_min_confidence: float = 0.6
 

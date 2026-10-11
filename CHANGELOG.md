@@ -1,5 +1,107 @@
 # Changelog
 
+## [0.3.0] — 2026-10-11 "Fable remediation"
+
+Driven by the adversarial audit of 2026-10-11 (`~/swarm-audit-2026-10-11.md`, Part 1; 47 findings,
+0 debunked) and the plan of record `docs/plans/2026-10-11-fable-remediation.md`. Finding ids in
+parentheses. Three owner asks: Mythos on Fable 5.1, remediate the findings, nothing model-, provider-
+or harness-specific hard-coded. Trail: `BUGS_AND_ITERATIONS.md` ITER-AUDIT-2.
+
+### WP1 — Model & provider layer (backends-01, backends-05, backends-07, core-loop-06)
+
+- `backends/models.py`: `resolve_model(role, backend, cfg)` with a fixed order — `--model`/`BLITZ_MODEL`
+  > `BLITZ_MODEL_<ROLE>` > explicit tier > `[models].<role>` tier > `[models].default` tier > provider
+  legacy `model` > `ModelResolutionError`. Code names roles and tiers; `blitz.toml` maps tiers to models.
+- `config.py`: open-ended `[backend.providers.*]` with `tiers`/`effort`/`pricing`/`command`; strict loader
+  (unknown key, bad type, undefined provider raise `ConfigError` naming path + key).
+- Adapters: `claude_cli` (`--effort` forwarding, stdin prompt > 100 KB), `codex_cli` (strict
+  `--output-schema` port of a4fc972 = BUG-002, effort mapping), `gemini_cli`, `ollama_http`,
+  `generic_cli` (argv template), `openai_http` (any local OpenAI-compatible server). Registry keyed by
+  adapter id; `[backend] fallback` honoured once per call on unavailable-class errors.
+- Mythos: planner/verifier = `deep` tier = `fable` (Fable 5.1) with effort `max` on claude; executors =
+  `fast`. `mythos/_invoke.py` provider-model-overrides-role bug fixed (BUG-005). `token_ceiling` applies
+  always; cost ceiling only when cost is reported; unknown cost is `None`, printed `n/a`.
+- `metrics.py` pricing from `[backend.providers.<id>.pricing]`; `mechanisms/*` take the model from the
+  caller; `jobs/*`, `mythos-bench/*`, `heterogeneity/` resolve through the layer.
+- `tests/test_no_hardcoded_models.py` greps the tree and fails on any literal model name outside
+  `tests/`, `blitz.toml`, `mythos.toml`. CLI: `--backend`, `--model <model|tier>`, `--list-models`.
+
+### WP2 — Memory runs (memory-01..08, research-docs-08, critic gap B)
+
+- `gmemory/store.py` `MemoryStore` is the only memory implementation: opens/migrates (one-time
+  `*.pre-gmemory.bak` of a legacy file), retrieves on stdlib `sqlite3` + FTS5 with no optional deps,
+  persists all three tiers, enforces the N=3 promotion gate, runs eviction every `[eviction]
+  cycle_frequency` tasks (BUG-004 — gmemory had zero production callers).
+- Wired into `orchestrator.run_swarm` (retrieval before round 1, persistence after synthesis) and Mythos
+  (`use_memory`). FTS5 MATCH input escaped. Missing embedder never aborts a write. `memory/` is a
+  32-line re-export shim; the Redis single-writer daemon and the LanceDB L2-as-cosine read are gone.
+- `scripts/migrate_memory_db.py` migrates old databases idempotently (`--check` reports only).
+
+### WP3 — Core loop honesty (core-loop-01..08, critic gap A)
+
+- Judge-ensemble votes and selector pairwise judgements fan out via `asyncio.to_thread` + `gather`.
+- Round-1 staging (researchers → evaluators → judges) is a data dependency and is printed as one;
+  round 2+ is a single blast.
+- The blackboard (Redis or in-memory, same interface) is the only round store and is read back for every
+  context. KS-stop is an explicit secondary halt behind `[judge_ensemble] halt` (default false).
+- `AgentCall.tools`/`max_turns`: consensus roles run tool-less (`--max-turns 1`) in
+  `output/scratch/<run_id>/`, never the repo root. All injected agent output and prior findings are fenced
+  as untrusted data (`context.py`). `max_agents` enforced; dead config keys removed; malformed TOML raises.
+- LLM-plan fallback logs loudly; the dissent section reports unresolved votes only (`consensus.final_votes`).
+- Tracked `metrics.jsonl` archived to `docs/data/metrics-2026-03_06.jsonl`; runs write
+  `output/metrics.jsonl` (gitignored).
+
+### WP4 — Bench / evolve / jobs / contrib (process-02, bench-01, bench-03, bench-04, evolve-01, mechanisms-01, mechanisms-02, backends-02, backends-04)
+
+- BUG-003: `jobs/blitz_upgrade.py` p-value `or 1` coerced p = 0.0 to 1.0 and dropped significant
+  techniques; now an explicit `None` check.
+- `bench/runner.py` runs `detect_all` on per-round outputs and says when it did not; "No MAST flags"
+  only when detectors ran. `bench/stats.py` uses the exact Student-t for df < 30 (normal approximation only
+  at df ≥ 30); paired comparison wired into the report. Runner reads the version from `pyproject.toml`.
+- `[evolve] enabled = false` gates `evolve/`, `heterogeneity/` and `scripts/optimize_prompts.py` (now a
+  real import-guarded GEPA driver); `meta_loop` allow-list names real config keys; all labelled
+  EXPERIMENTAL, UNWIRED.
+- `managed_agents/` → `contrib/managed_agents/` (paid API, opt-in, rule-#10 exception); the fake
+  `completed` path is removed — `run_task` raises `NotImplementedError` with a client attached.
+- Cascade guard: `[guard] mode = "max"` runs real LLM claim decomposition on the `guard` tier;
+  `balanced` is logged as the heuristic screen it is.
+- Mythos verifier demotes low-confidence passes; running the artifact's own tests in a subprocess is opt-in (`verifier_run_tests = false` by default — it executes model-written code; see BUG-006).
+
+### WP5 — Tests & packaging (process-03, process-04, process-08)
+
+- `pyproject.toml` version 0.3.0, extras, `.gitignore`, CI `.github/workflows/tests.yml`; tests for the
+  previously untested modules — `tests/test_config.py` (7 → 26), new `test_agents_planner.py` (19),
+  `test_embedder.py` (12), `test_metrics.py` (28), on top of WP3's `test_consensus.py` (9),
+  `test_blackboard.py` (14) and WP1's `test_models.py` (38).
+
+### WP6 — Docs truth pass (claims-01, process-01, research-docs-01, research-docs-02, research-docs-05, research-docs-06)
+
+- README rewritten for v0.3.0: corrected architecture diagram, "What ships" from real per-file test
+  counts, model/provider section with the role → tier table and three plug-in recipes, Mythos section,
+  experimental + contrib sections, limitations.
+- New `docs/MODELS.md` (resolution order, env vars, adapters, real `--list-models` / `--dry-run` output).
+- `docs/CLAIMS_AND_EVIDENCE.md`, `IMPLEMENTATION_STATUS.md`, `ROADMAP.md`, `LIMITATIONS.md` rewritten;
+  `RESEARCH_LOG.md`, `METHODOLOGY.md`, `RESEARCH_QUESTIONS.md`, `EVALUATION.md`, `ABLATIONS.md`,
+  `ARTIFACTS.md`, `results/RESULTS.md` and `docs/research/PHASE_*.md` carry a dated "superseded" banner
+  and every reference to a file that does not exist is marked.
+- `docs/BIBLIOGRAPHY.md`: placeholder URL removed, titles replaced with the arXiv-verified ones,
+  `managed_agents` path updated. PHASE_0/PHASE_3 paid-API dollar budgets reframed as token budgets.
+- `BUGS_AND_ITERATIONS.md`: BUG-003/004/005 renumbered per plan, ITER-AUDIT-2 finding → fix table,
+  template stub removed. `CITATION.cff` → 0.3.0. `mythos-bench/results/comparison.md` dated stale note.
+  Founding design docs (`BLITZ-SWARM.md`, `MYTHOS-SWARM*.md`) get a historical banner.
+
+### Tests
+
+745 passed, 14 conditional skips, 0 failed in a clean venv with only `pytest` + `pytest-asyncio`
+(759 collected; 667 / 14 at the WP1–4 commit 36767cd before WP5's tests). No test invokes a model.
+
+### Known stale / deferred
+
+- No live bench run (any version). `mythos-bench/results/` (4 rows, 2026-05-10) predates this release and
+  was not regenerated — needs live LLM runs.
+- The 10M-token upgrade job stalled at phase 1/5 on 2026-06-10; harness merged, run not completed.
+- `evolve/` + `heterogeneity/` have never run outside tests.
+
 ## [0.2.2] — 2026-05-21
 
 ### Harness-agnostic backend package

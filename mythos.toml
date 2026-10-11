@@ -35,10 +35,12 @@ planner_timeout_s = 600
 executor_timeout_s = 300
 verifier_timeout_s = 600
 
-# Verifier gates. The LLM verdict never passes a round on its own:
-# when a deliverable ships a test file, those tests run in a subprocess and
-# must pass; a "pass" with confidence below the floor becomes needs_work.
-verifier_run_tests = true
+# Verifier gates. A "pass" with confidence below the floor becomes needs_work.
+# verifier_run_tests = true additionally runs the artifact's OWN test files in a
+# subprocess (temp cwd, scrubbed env, timeout) — that EXECUTES MODEL-WRITTEN
+# CODE with your user's filesystem/network access, so it is off by default.
+# Turn it on only for artifacts you would run by hand anyway.
+verifier_run_tests = false
 verifier_test_timeout_s = 120
 verifier_min_confidence = 0.6
 

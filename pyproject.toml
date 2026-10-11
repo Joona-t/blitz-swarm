@@ -1,22 +1,55 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "blitz-swarm"
-version = "0.2.2"
+version = "0.3.0"
 description = "Parallel multi-agent swarm architecture for collective AI intelligence"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.12"
 authors = [{ name = "Joona", email = "joona@darkfire.dev" }]
-dependencies = [
-    "redis>=5.0",
-    "aiosqlite>=0.20",
-    "lancedb>=0.6",
-    "sentence-transformers>=3.0",
-]
+# Core runs on the standard library only (tomllib, sqlite3+FTS5, asyncio,
+# subprocess). LLM calls go through the user's own CLI (claude / codex /
+# gemini / ollama) as a subprocess — no SDK, no API key, no paid API.
+dependencies = []
 
 [project.optional-dependencies]
+# blackboard.py: Redis-backed blackboard (default is in-memory, no package needed)
+redis = ["redis>=5"]
+# embedder.py: sentence-transformers vectors for gmemory kNN; absent -> FTS5/BM25 only.
+# lancedb is listed for the legacy vector store only; nothing in the tree imports it today.
+memory = ["lancedb>=0.6", "sentence-transformers>=3"]
+# bench/stats.py: scipy.stats p-values when present; otherwise a pure-stdlib
+# Student-t / incomplete-beta fallback (summary.json records "p_method").
+bench = ["scipy"]
+# scripts/optimize_prompts.py (EXPERIMENTAL, gated by [evolve] enabled): GEPA prompt optimizer
+gepa = ["gepa"]
 dev = ["pytest", "pytest-asyncio"]
 
+[tool.setuptools]
+# Flat layout: top-level modules + packages listed explicitly so setuptools
+# does not try to auto-discover docs/, output/, prompts/, tests/ ...
+py-modules = [
+    "agents", "blackboard", "config", "consensus", "context",
+    "embedder", "metrics", "mythos_swarm", "orchestrator",
+]
+packages = [
+    "backends", "backends.adapters",
+    "bench",
+    "contrib", "contrib.managed_agents",
+    "evolve",
+    "gmemory",
+    "heterogeneity",
+    "jobs",
+    "mechanisms",
+    "memory",
+    "mythos",
+]
+
 [tool.pytest.ini_options]
+asyncio_mode = "auto"
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 markers = [

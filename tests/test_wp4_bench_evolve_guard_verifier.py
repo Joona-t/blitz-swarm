@@ -488,7 +488,7 @@ def test_verifier_mechanical_check_demotes_pass_when_artifact_tests_fail(monkeyp
 
     seen = []
     vmod = _patch_invoke(monkeypatch, verdict="pass", confidence=0.95, capture=seen)
-    cfg = MythosConfig(verifier_test_timeout_s=60)
+    cfg = MythosConfig(verifier_run_tests=True, verifier_test_timeout_s=60)
     v = vmod.verify("task", _Plan(sub_specs=[], global_invariants=[]), [_Exec("s1", _FAILING)], cfg)
     assert v.llm_verdict == "pass" and v.verdict == "needs_work"
     assert v.mechanical["ran"] is True and v.mechanical["passed"] is False
@@ -506,7 +506,7 @@ def test_verifier_mechanical_check_keeps_pass_when_artifact_tests_pass(monkeypat
 
     vmod = _patch_invoke(monkeypatch, verdict="pass", confidence=0.95)
     v = vmod.verify("task", _Plan(sub_specs=[], global_invariants=[]), [_Exec("s1", _PASSING)],
-                    MythosConfig(verifier_test_timeout_s=60))
+                    MythosConfig(verifier_run_tests=True, verifier_test_timeout_s=60))
     assert v.verdict == "pass" and v.mechanical["passed"] is True
     assert any("artifact tests passed" in n for n in v.gate_notes)
 
@@ -551,13 +551,14 @@ def test_verifier_timeout_counts_as_failure(monkeypatch):
 def test_mythos_config_verifier_knobs_load_from_toml(tmp_path):
     from mythos.policies import MythosConfig, load_mythos_config
 
-    assert MythosConfig().verifier_min_confidence == 0.6 and MythosConfig().verifier_run_tests is True
+    # Executing model-written tests is opt-in (security review 2026-10-11).
+    assert MythosConfig().verifier_min_confidence == 0.6 and MythosConfig().verifier_run_tests is False
     p = tmp_path / "m.toml"
     p.write_text("[policies]\nverifier_run_tests = false\nverifier_min_confidence = 0.8\nverifier_test_timeout_s = 7\n")
     c = load_mythos_config(p)
     assert (c.verifier_run_tests, c.verifier_min_confidence, c.verifier_test_timeout_s) == (False, 0.8, 7)
     shipped = load_mythos_config()
-    assert shipped.verifier_run_tests is True and shipped.verifier_min_confidence == 0.6
+    assert shipped.verifier_run_tests is False and shipped.verifier_min_confidence == 0.6
 
 
 # ===========================================================================

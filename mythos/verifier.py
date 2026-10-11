@@ -215,7 +215,7 @@ def verify(
     # Mechanical check first: its result is also handed to the LLM verifier
     # as evidence (it must not contradict a red test run).
     mechanical = None
-    if getattr(config, "verifier_run_tests", True):
+    if getattr(config, "verifier_run_tests", False):
         mechanical = run_artifact_tests(
             executor_outputs, timeout_s=int(getattr(config, "verifier_test_timeout_s", 120)))
 

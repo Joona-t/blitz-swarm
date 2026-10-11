@@ -1,5 +1,9 @@
 # Methodology
 
+> **Superseded 2026-10-11 (v0.3.0).** This file describes the v0.1 system as of 2026-03-14 and is kept as history. For what the code does today see `README.md`, `docs/MODELS.md`, `docs/CLAIMS_AND_EVIDENCE.md`, `docs/IMPLEMENTATION_STATUS.md` and `docs/LIMITATIONS.md`. `metrics.jsonl` referenced below was archived to `docs/data/metrics-2026-03_06.jsonl`; live runs write `output/metrics.jsonl`.
+
+> **What changed since:** config is `blitz.toml [swarm]` (`max_rounds = 4`, `timeout_seconds = 300`, `max_agents = 10`), models are tiers resolved per role (`docs/MODELS.md`), round 1 is staged, the blackboard is read back, and the bench experiment design that replaces this ad-hoc per-run structure is `bench/runner.py` + `bench/stats.py` (paired t, exact Student-t for df < 30, Cohen's d_z, bootstrap CI) — none of which has been run live. Cost is `n/a` on providers without `[pricing]`.
+
 ## Experiment Structure
 
 Each run constitutes a single experiment:
