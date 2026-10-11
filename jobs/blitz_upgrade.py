@@ -61,8 +61,8 @@ DEFAULT_STATE_FILE = DEFAULT_STATE_DIR / "upgrade_state.json"
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-# repo-root metrics.jsonl — the swarm's own per-run metrics (see metrics.py).
-METRICS_PATH = REPO_ROOT / "metrics.jsonl"
+# output/metrics.jsonl — the swarm's own per-run metrics (see metrics.py).
+METRICS_PATH = REPO_ROOT / "output" / "metrics.jsonl"
 
 # Phases run strictly in this order. Index in the list == execution rank.
 PHASES: tuple[str, ...] = ("baseline", "research", "implement", "verify", "gate")
@@ -1884,7 +1884,11 @@ def _decide_one_technique(rec: dict[str, Any], *, baseline_floor: float,
 
     if has_full_stats:
         cohens = float(rec.get("cohens_d", 0) or 0)
-        p = float(rec.get("p_value", 1) or 1)
+        # BUG-003: `or 1` coerced a genuine p=0.0 (strongest possible
+        # evidence) into p=1.0 and flipped KEEP to DROP. Only None/missing
+        # means "no p-value" (treated as 1.0 = not significant).
+        p_raw = rec.get("p_value")
+        p = 1.0 if p_raw is None else float(p_raw)
         ci = rec.get("bootstrap_ci", [0.0, 0.0])
         ci_lo = float(ci[0]) if isinstance(ci, (list, tuple)) and ci else 0.0
         clears_floor = mean_on >= baseline_floor

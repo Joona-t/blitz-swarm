@@ -11,6 +11,7 @@ arXiv 2512.20845).
 """
 
 import json
+import sys
 from dataclasses import dataclass, field
 
 from prompts.loader import (
@@ -240,55 +241,6 @@ def _split_subtopics_heuristic(topic: str, count: int) -> list[str]:
     return subtopics
 
 
-def _split_subtopics_llm(
-    topic: str,
-    count: int,
-    *,
-    backend_id: str | None = None,
-    sandbox: str | None = None,
-) -> list[str]:
-    """Split a topic into subtopics using an LLM call.
-
-    Invokes the configured local backend to generate targeted subtopics.
-    Falls back to heuristic if the LLM call fails.
-    """
-    schema = {
-        "type": "object",
-        "properties": {
-            "subtopics": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": f"Exactly {count} specific, non-overlapping subtopics.",
-            },
-        },
-        "required": ["subtopics"],
-    }
-
-    prompt = (
-        f"Analyze this research topic and split it into exactly {count} specific, "
-        f"non-overlapping subtopics that together provide comprehensive coverage.\n\n"
-        f"Topic: {topic}\n\n"
-        f"Each subtopic should be a focused research angle that a single researcher "
-        f"can deeply investigate. Make them specific to this topic, not generic."
-    )
-
-    data = _planning_backend_json(
-        prompt,
-        "You are a research planning assistant. Return JSON only.",
-        schema,
-        model_hint="cheap",
-        timeout_s=30,
-        backend_id=backend_id,
-        sandbox=sandbox,
-    )
-    if data:
-        subtopics = data.get("subtopics", [])
-        if len(subtopics) >= count:
-            return [f"{topic} — focusing on {st}" for st in subtopics[:count]]
-
-    return _split_subtopics_heuristic(topic, count)
-
-
 # ---------------------------------------------------------------------------
 # Agent planning
 # ---------------------------------------------------------------------------
@@ -339,6 +291,37 @@ def _resolve_role_prompt(
         raise
 
 
+HEURISTIC_PLAN = {
+    "researcher_count": 2,
+    "critic_count": 1,
+    "needs_fact_checker": True,
+    "subtopics": None,
+}
+
+
+def _cap_plan(researcher_count: int, critic_count: int, needs_fc: bool,
+              max_agents: int) -> tuple[int, int, bool]:
+    """Enforce `[swarm] max_agents` (core-loop-07). The quality judge and the
+    synthesizer are always spawned (2 slots); researchers shrink first, then
+    critics, then the fact-checker. Floors: 1 researcher, 1 critic."""
+    fixed = 2
+    while True:
+        total = researcher_count + critic_count + int(needs_fc) + fixed
+        if total <= max_agents:
+            return researcher_count, critic_count, needs_fc
+        if researcher_count > 1:
+            researcher_count -= 1
+        elif critic_count > 1:
+            critic_count -= 1
+        elif needs_fc:
+            needs_fc = False
+        else:
+            raise ValueError(
+                f"[swarm] max_agents = {max_agents} cannot fit the minimum swarm "
+                "(1 researcher + 1 critic + quality_judge + synthesizer = 4)"
+            )
+
+
 def plan_agents(
     topic: str,
     use_llm: bool = True,
@@ -347,19 +330,23 @@ def plan_agents(
     persona_critics: bool | None = None,
     backend_id: str | None = None,
     sandbox: str | None = None,
+    max_agents: int | None = None,
 ) -> list[BlitzAgent]:
     """Plan which agents to spawn for a given topic.
 
     When use_llm=True, invokes an LLM to analyze the topic and determine
-    optimal agent count and subtopic assignments. Falls back to heuristic.
+    optimal agent count and subtopic assignments. Falls back to the heuristic
+    plan with a loud WARNING on stderr (core-loop-08).
 
     `domain` selects which preset under prompts/<domain>/ is used. If None,
     reads from blitz.toml [swarm] domain.
 
     `persona_critics` enables MAR-style persona-typed critic prompts (Phase 1).
     If None, reads from blitz.toml [swarm] persona_critics.
+
+    `max_agents` caps the roster (None -> blitz.toml [swarm] max_agents).
     """
-    if domain is None or persona_critics is None:
+    if domain is None or persona_critics is None or max_agents is None:
         try:
             from config import load_config
             cfg = load_config()
@@ -367,9 +354,12 @@ def plan_agents(
                 domain = cfg.swarm.domain
             if persona_critics is None:
                 persona_critics = cfg.swarm.persona_critics
+            if max_agents is None:
+                max_agents = cfg.swarm.max_agents
         except Exception:
             domain = domain or "general"
             persona_critics = bool(persona_critics)
+            max_agents = max_agents or 12
 
     loader = PromptLoader(domain=domain)
 
@@ -377,18 +367,28 @@ def plan_agents(
 
     if use_llm:
         plan = _llm_plan(topic, backend_id=backend_id, sandbox=sandbox)
+        if plan is None:
+            print(
+                "WARNING: LLM agent planning failed (backend error or unparseable "
+                "plan) — falling back to the heuristic plan: 2 researchers, "
+                "1 critic, fact-checker, generic subtopic angles.",
+                file=sys.stderr,
+            )
 
     if plan is None:
-        plan = {
-            "researcher_count": 2,
-            "critic_count": 1,
-            "needs_fact_checker": True,
-            "subtopics": None,
-        }
+        plan = dict(HEURISTIC_PLAN)
 
-    researcher_count = plan["researcher_count"]
-    critic_count = plan["critic_count"]
-    needs_fc = plan["needs_fact_checker"]
+    researcher_count, critic_count, needs_fc = _cap_plan(
+        int(plan["researcher_count"]), int(plan["critic_count"]),
+        bool(plan["needs_fact_checker"]), int(max_agents),
+    )
+    if (researcher_count, critic_count, needs_fc) != (
+        plan["researcher_count"], plan["critic_count"], plan["needs_fact_checker"]
+    ):
+        print(
+            f"  max_agents={max_agents}: plan trimmed to {researcher_count} researchers, "
+            f"{critic_count} critics, fact_checker={'yes' if needs_fc else 'no'}"
+        )
 
     subtopics = plan.get("subtopics")
     if subtopics and len(subtopics) >= researcher_count:
@@ -484,6 +484,7 @@ def plan_agents(
         prompt_sha256=sha,
     ))
 
+    assert len(agents) <= max_agents, (len(agents), max_agents)
     return agents
 
 
@@ -508,7 +509,6 @@ def _llm_plan(
         prompt,
         "You are a research planning assistant. Return JSON only.",
         json.loads(PLANNING_SCHEMA),
-        model_hint="cheap",
         timeout_s=30,
         backend_id=backend_id,
         sandbox=sandbox,
@@ -526,7 +526,6 @@ def _planning_backend_json(
     system_prompt: str,
     schema: dict,
     *,
-    model_hint: str = "cheap",
     timeout_s: int = 30,
     backend_id: str | None = None,
     sandbox: str | None = None,

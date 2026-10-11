@@ -12,6 +12,7 @@ fallback to defaults for a file that exists but cannot be read.
 
 from __future__ import annotations
 
+import os
 import tomllib
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -96,9 +97,15 @@ class BackendConfig:
         return provider
 
 
+GUARD_MODES: tuple[str, ...] = ("off", "speed", "balanced", "strict", "max")
+
+
 @dataclass
 class GuardConfig:
     enabled: bool = True
+    # off / speed / balanced / strict use the heuristic word-overlap screen.
+    # "max" adds real LLM hooks (claim decomposition + contradiction
+    # adjudication) on the `guard` role tier — see mechanisms/cascade_guard.py.
     mode: str = "balanced"
 
 
@@ -109,6 +116,10 @@ class JudgeEnsembleConfig:
     ks_threshold: float = 0.05
     ks_consecutive: int = 2
     min_rounds: int = 2
+    # Stopping rule: unanimity + holdout override is PRIMARY. With halt =
+    # true the ensemble's KS-stop (ks_stable / unanimous_saturation) also
+    # halts the swarm as an explicit secondary rule (core-loop-03).
+    halt: bool = False
 
 
 @dataclass
@@ -128,7 +139,6 @@ class RedisConfig:
 @dataclass
 class StorageConfig:
     sqlite_path: str = "memory.db"
-    lancedb_path: str = "./memory_vectors"
     output_dir: str = "./output"
 
 
@@ -138,6 +148,17 @@ class EvictionConfig:
     interaction_purge_days: int = 30
     max_archive_per_cycle: int = 50
     cycle_frequency: int = 10
+
+
+@dataclass
+class EvolveConfig:
+    """`[evolve]`: gate for the EXPERIMENTAL, unwired self-improvement
+    layer (evolve/, heterogeneity/, scripts/optimize_prompts.py). Every entry
+    point there refuses with a clear message while `enabled = false`."""
+
+    enabled: bool = False
+    gepa_max_metric_calls: int = 1500   # scripts/optimize_prompts.py budget
+    aflow_max_iters: int = 50           # evolve/aflow_search.aflow_search
 
 
 @dataclass
@@ -152,6 +173,7 @@ class BlitzConfig:
     redis: RedisConfig = field(default_factory=RedisConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
     eviction: EvictionConfig = field(default_factory=EvictionConfig)
+    evolve: EvolveConfig = field(default_factory=EvolveConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -160,7 +182,7 @@ class BlitzConfig:
 
 _SIMPLE_SECTIONS = (
     "swarm", "memory", "guard", "judge_ensemble", "selector",
-    "redis", "storage", "eviction",
+    "redis", "storage", "eviction", "evolve",
 )
 _KNOWN_SECTIONS = _SIMPLE_SECTIONS + ("models", "backend")
 
@@ -279,10 +301,13 @@ def _apply_backend(target: BackendConfig, raw, *, path: Path) -> None:
             )
 
 
-def load_config(path: Path = CONFIG_PATH) -> BlitzConfig:
-    """Load blitz.toml. Missing file -> code defaults; malformed file -> ConfigError."""
+def load_config(path: Path | str | None = None) -> BlitzConfig:
+    """Load blitz.toml. Missing file -> code defaults; malformed file -> ConfigError.
+
+    `path` defaults to env `BLITZ_CONFIG`, then the repo's blitz.toml.
+    """
     config = BlitzConfig()
-    path = Path(path)
+    path = Path(path or os.environ.get("BLITZ_CONFIG") or CONFIG_PATH)
 
     if not path.exists():
         return config
@@ -302,6 +327,11 @@ def load_config(path: Path = CONFIG_PATH) -> BlitzConfig:
     for section in _SIMPLE_SECTIONS:
         if section in raw:
             _apply_section(getattr(config, section), raw[section], path=path, section=section)
+
+    if config.guard.mode not in GUARD_MODES:
+        raise ConfigError(
+            f"{path}: [guard].mode = {config.guard.mode!r}; expected one of {', '.join(GUARD_MODES)}"
+        )
 
     if "models" in raw:
         _apply_models(config.models, raw["models"], path=path)

@@ -1,6 +1,6 @@
 """Mythos Executor — implements one sub-spec.
 
-Sonnet-class agent (per default config). Sees ONE sub-spec and produces
+Runs on the `executor` role tier (fast by default). Sees ONE sub-spec and produces
 a concrete deliverable + self-check. Multiple executors run in parallel
 via asyncio.to_thread.
 """
@@ -23,7 +23,7 @@ class ExecutorOutput:
     acceptance_check: list[dict]
     concerns: list[str]
     confidence: float
-    cost_usd: float = 0.0
+    cost_usd: float | None = None     # None = provider did not report cost
     tokens: int = 0
     elapsed_s: float = 0.0
     raw: dict = field(default_factory=dict)
@@ -36,7 +36,7 @@ class ExecutorOutput:
             "acceptance_check": self.acceptance_check,
             "concerns": self.concerns,
             "confidence": self.confidence,
-            "cost_usd": round(self.cost_usd, 4),
+            "cost_usd": None if self.cost_usd is None else round(self.cost_usd, 4),
             "elapsed_s": round(self.elapsed_s, 1),
         }
         if self.error:
@@ -65,6 +65,7 @@ def run_executor(sub_spec: dict, config: MythosConfig) -> ExecutorOutput:
         model_role="executor",
         tier=config.executor_model,
         timeout_s=config.executor_timeout_s,
+        mode_backend=config.backend or None,
     )
 
     if res.parsed is None:

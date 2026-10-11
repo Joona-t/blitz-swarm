@@ -131,7 +131,8 @@ class FallbackBackend:
     When the primary returns an errored result of the "unavailable" class
     (`backends.core.is_unavailable_error`), the first available fallback
     provider is called exactly once with the model re-resolved for THAT
-    provider through its tier table (global `BLITZ_MODEL` overrides are
+    provider through its tier table, using `call.model_role` (the resolver
+    role) when set, else `call.role` (global `BLITZ_MODEL` overrides are
     ignored for the hop: they name a model on the primary). The fallback
     result carries `fallback_used=True` and `metadata["fallback_from"]`.
     Any other error (timeout, schema failure) is returned as-is.
@@ -156,14 +157,15 @@ class FallbackBackend:
         for fid, backend in self.fallbacks:
             if not backend.is_available():
                 continue
+            model_role = call.model_role or call.role
             try:
-                resolved = resolve_model(call.role, fid, self.cfg, env={})
+                resolved = resolve_model(model_role, fid, self.cfg, env={})
             except ModelResolutionError as exc:
                 self._log(f"[backend] fallback {fid!r} skipped: {exc}")
                 continue
             self._log(
                 f"[backend] {self.backend_id!r} unavailable ({result.error}); "
-                f"falling back once to {fid!r} model={resolved.model} role={call.role}"
+                f"falling back once to {fid!r} model={resolved.model} role={model_role}"
             )
             hop = dataclasses.replace(call, model=resolved.model, reasoning_effort=resolved.effort)
             fb_result = backend.call(hop)

@@ -8,8 +8,15 @@ Provides:
     mann_whitney_u(a, b)             -> (u_stat, p_value)
 
 All functions accept Python lists of floats. They use scipy.stats when
-available; otherwise fall back to a NumPy-only implementation. The
+available; otherwise fall back to a pure-stdlib implementation. The
 fallback is deterministic and seed-able.
+
+scipy-free p-values (bench-03): the Student-t survival function is
+computed exactly through the regularized incomplete beta function for
+df < 30; the normal approximation is used only for df >= 30, where it is
+within ~1e-3 of the t distribution. The old code applied the normal
+approximation at every df, which under-states p for small samples (the
+only sample sizes the bench ever sees).
 
 This module never imports scipy at module load; it lazy-imports inside each
 function so the bench package can be imported on systems without scipy.
@@ -52,9 +59,7 @@ def paired_t_test(a: Iterable[float], b: Iterable[float]) -> tuple[float, float,
 
         p_value = float(scipy_stats.t.sf(abs(t_stat), df) * 2)
     except ImportError:
-        # Approximation: for moderate-to-large df, t distribution ≈ normal
-        # This is acceptable when scipy is not installed and df > 10
-        p_value = 2.0 * (1.0 - _normal_cdf(abs(t_stat)))
+        p_value = t_two_sided_p(t_stat, df)
     return t_stat, p_value, df
 
 
@@ -121,7 +126,7 @@ def welch_t_test(a: Iterable[float], b: Iterable[float]) -> tuple[float, float]:
 
         p_value = float(scipy_stats.t.sf(abs(t_stat), df) * 2)
     except ImportError:
-        p_value = 2.0 * (1.0 - _normal_cdf(abs(t_stat)))
+        p_value = t_two_sided_p(t_stat, df)
     return t_stat, p_value
 
 
@@ -136,6 +141,65 @@ def mann_whitney_u(a: Iterable[float], b: Iterable[float]) -> tuple[float, float
         raise NotImplementedError("mann_whitney_u requires scipy") from e
 
 
+# Below this df the normal approximation is NOT used (bench-03).
+NORMAL_APPROX_MIN_DF = 30
+
+
+def t_two_sided_p(t_stat: float, df: float) -> float:
+    """Two-sided p-value for Student's t without scipy.
+
+    df < NORMAL_APPROX_MIN_DF -> exact t CDF via the regularized incomplete
+    beta function I_x(df/2, 1/2) with x = df / (df + t^2).
+    df >= NORMAL_APPROX_MIN_DF -> normal approximation (error < ~1e-3).
+    """
+    if df <= 0 or math.isnan(t_stat):
+        return 1.0
+    if math.isinf(t_stat):
+        return 0.0
+    if df >= NORMAL_APPROX_MIN_DF:
+        return 2.0 * (1.0 - _normal_cdf(abs(t_stat)))
+    x = df / (df + t_stat * t_stat)
+    p = _regularized_incomplete_beta(df / 2.0, 0.5, x)
+    return min(1.0, max(0.0, p))
+
+
 def _normal_cdf(x: float) -> float:
-    """Standard-normal CDF — scipy-free fallback."""
+    """Standard-normal CDF — scipy-free fallback (df >= 30 only)."""
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _regularized_incomplete_beta(a: float, b: float, x: float) -> float:
+    """I_x(a, b) via Lentz's continued fraction (Numerical Recipes betacf)."""
+    if x <= 0.0:
+        return 0.0
+    if x >= 1.0:
+        return 1.0
+    ln_beta = math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
+    front = math.exp(ln_beta + a * math.log(x) + b * math.log(1.0 - x))
+    if x < (a + 1.0) / (a + b + 2.0):
+        return front * _betacf(a, b, x) / a
+    return 1.0 - front * _betacf(b, a, 1.0 - x) / b
+
+
+def _betacf(a: float, b: float, x: float, *, max_iter: int = 300, eps: float = 3e-14) -> float:
+    tiny = 1e-300
+    qab, qap, qam = a + b, a + 1.0, a - 1.0
+    c, d = 1.0, 1.0 - qab * x / qap
+    d = 1.0 / (d if abs(d) >= tiny else tiny)
+    h = d
+    for m in range(1, max_iter + 1):
+        m2 = 2 * m
+        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+        d = 1.0 + aa * d
+        d = 1.0 / (d if abs(d) >= tiny else tiny)
+        c = 1.0 + aa / (c if abs(c) >= tiny else tiny)
+        h *= d * c
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+        d = 1.0 + aa * d
+        d = 1.0 / (d if abs(d) >= tiny else tiny)
+        c = 1.0 + aa / (c if abs(c) >= tiny else tiny)
+        delta = d * c
+        h *= delta
+        if abs(delta - 1.0) < eps:
+            break
+    return h

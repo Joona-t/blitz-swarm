@@ -6,10 +6,13 @@ tiers to provider-native model strings (`[backend.providers.<id>.tiers]`).
 This module is the single place where the two meet; no `.py` file holds a
 literal model name.
 
-Resolution order for `resolve_model(role, backend_id, cfg, override=None)`:
+Resolution order for `resolve_model(role, backend_id, cfg, override=None, tier=None)`:
 
 1. explicit `override` (CLI `--model`), else env `BLITZ_MODEL`
 2. env `BLITZ_MODEL_<ROLE>` (role upper-cased, non-alphanumerics -> `_`)
+2b. explicit `tier=` (a caller-supplied tier name, e.g. mythos.toml
+   `<role>_model`) -> provider tiers; a tier the provider does not define
+   raises `ModelResolutionError` -- it is never sent as a model string
 3. `[models].<role>` -> tier -> `[backend.providers.<id>.tiers].<tier>`
 4. `[models].default` -> tier -> provider tiers
 5. provider `model` (legacy single-model key)
@@ -18,6 +21,7 @@ Resolution order for `resolve_model(role, backend_id, cfg, override=None)`:
 
 An override that names one of the provider's tiers ("deep") resolves
 through the tier table; anything else is taken verbatim as a model string.
+`tier=` is the strict form: it must name a defined tier.
 The returned `effort` is `[backend.providers.<id>.effort].<tier>` when set,
 else the provider-wide `reasoning_effort`, else None.
 """
@@ -66,9 +70,15 @@ def resolve_model(
     cfg,
     override: str | None = None,
     *,
+    tier: str | None = None,
     env=None,
 ) -> ResolvedModel:
-    """Resolve the model string for `role` on `backend_id` (see module doc)."""
+    """Resolve the model string for `role` on `backend_id` (see module doc).
+
+    `tier` is an explicit tier request (step 2b): it beats `[models]` but
+    loses to the `--model` / env overrides, and raises when the provider
+    does not define it.
+    """
     env = os.environ if env is None else env
     backend_id = backend_id or cfg.backend.default or None
     if not backend_id:
@@ -109,6 +119,17 @@ def resolve_model(
         if role_env in tiers:
             return _done(tiers[role_env], role_env, "env_role")
         return _done(role_env, tier_hint or "override", "env_role")
+
+    # 2b. explicit tier request -- strict: must be a defined tier
+    if tier:
+        if tier in tiers:
+            return _done(tiers[tier], tier, "tier")
+        have = ", ".join(sorted(tiers)) or "none"
+        raise ModelResolutionError(
+            role, backend_id, tier,
+            f"requested tier {tier!r} is not defined in [backend.providers.{backend_id}.tiers] "
+            f"(defined tiers: {have})",
+        )
 
     # 3. role tier
     if role_tier and role_tier in tiers:

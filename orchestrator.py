@@ -10,6 +10,7 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import sys
 import time
 import uuid
@@ -24,16 +25,18 @@ from agents import (
 )
 from backends import AgentBackend, AgentCall, make_provider_backend
 from backends.models import ModelResolutionError, ResolvedModel, format_models_table, resolve_model
-from config import load_config
+from blackboard import Blackboard, InMemoryBlackboard
+from config import ConfigError, load_config
 from consensus import (
     check_consensus,
     extract_dissent,
+    final_votes,
     format_convergence_report,
     format_dissent_section,
     should_override_holdout,
 )
+from context import fence_agent_output
 from mechanisms.cascade_guard import CascadeGuard
-from mechanisms.cascade_guard import GuardConfig as CascadeGuardConfig
 from mechanisms.judge_ensemble import JudgeConfig, JudgeEnsemble, JudgeVote
 from mechanisms.selector_synth import (
     PairwiseVerdict,
@@ -41,13 +44,27 @@ from mechanisms.selector_synth import (
     SelectorSynth,
     Span,
 )
-from metrics import MetricsCollector
+from metrics import METRICS_PATH, MetricsCollector
 
 # ---------------------------------------------------------------------------
 # Constants — loaded from config.py / blitz.toml
 # ---------------------------------------------------------------------------
 
-_config = load_config()
+
+def _load_config_or_die():
+    """Import-time config load. As the CLI entrypoint a malformed blitz.toml
+    is a one-line error + exit 2, never a traceback (core-loop-07); when
+    imported as a module the ConfigError propagates to the caller."""
+    try:
+        return load_config()
+    except ConfigError as exc:
+        if __name__ == "__main__":
+            print(f"blitz-swarm: config error: {exc}", file=sys.stderr)
+            sys.exit(2)
+        raise
+
+
+_config = _load_config_or_die()
 
 DEFAULT_MAX_ROUNDS = _config.swarm.max_rounds
 AGENT_TIMEOUT_SECONDS = _config.swarm.timeout_seconds
@@ -56,6 +73,24 @@ if not OUTPUT_DIR.is_absolute():
     OUTPUT_DIR = Path(__file__).parent / _config.storage.output_dir
 MAX_CONTEXT_TOKENS = _config.memory.max_context_tokens
 MAX_CONTEXT_CHARS = MAX_CONTEXT_TOKENS * 4
+
+# Consensus-mode agents answer from knowledge: no tools, one turn. These are
+# the explicit per-call fields the adapters forward (core-loop-04).
+CONSENSUS_TOOLS: list[str] | None = None
+CONSENSUS_MAX_TURNS = 1
+
+STAGING_BANNER = (
+    "Staging: round 1: researchers → evaluators → judges (data dependency); "
+    "round 2+: single blast"
+)
+
+
+def scratch_cwd(run_id: str | None = None) -> Path:
+    """Working directory for every CLI invocation of a run:
+    `<output_dir>/scratch/<run_id>/` — never the repo root (core-loop-04)."""
+    path = OUTPUT_DIR / "scratch" / (run_id or f"adhoc_{os.getpid()}")
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 JUDGE_VOTE_SCHEMA = {
     "type": "object",
@@ -231,14 +266,17 @@ def invoke_agent(
     backend_id: str | None = None,
     sandbox: str | None = None,
     cfg=None,
+    scratch_dir: Path | None = None,
 ) -> dict:
     """Invoke a single agent through the configured backend layer.
 
     Retries once on parse/schema failure and normalizes telemetry across
-    Codex, Claude, and Gemini adapters.
+    Codex, Claude, and Gemini adapters. Runs with no tools, one turn, in
+    `scratch_dir` (default: an ad-hoc output/scratch/ dir).
     """
     agent_label = f"{agent.role}({agent.id})"
     trace_id = str(uuid.uuid4())
+    scratch_dir = scratch_dir or scratch_cwd()
     cfg, selected_backend, provider, resolved_sandbox = _backend_settings(
         cfg=cfg,
         backend_id=backend_id,
@@ -268,16 +306,19 @@ def invoke_agent(
         try:
             result = active_backend.call(AgentCall(
                 role=agent.role,
+                model_role=agent.role,
                 prompt=user_prompt,
                 system_prompt=agent.system_prompt,
                 schema=AGENT_OUTPUT_SCHEMA,
                 model=model,
                 timeout_s=AGENT_TIMEOUT_SECONDS,
-                cwd=Path(__file__).parent,
+                cwd=scratch_dir,
                 sandbox=resolved_sandbox,
                 approval_policy=provider.approval_policy,
                 reasoning_effort=resolved.effort or provider.reasoning_effort or None,
                 ephemeral=provider.ephemeral,
+                tools=CONSENSUS_TOOLS,
+                max_turns=CONSENSUS_MAX_TURNS,
             ))
             _telemetry = {
                 "_backend_id": result.backend_id,
@@ -507,6 +548,7 @@ async def blast_agents(
     backend_id: str | None = None,
     sandbox: str | None = None,
     cfg=None,
+    scratch_dir: Path | None = None,
 ) -> list[dict]:
     """Invoke all agents in parallel and collect their outputs."""
     coros = [
@@ -519,6 +561,7 @@ async def blast_agents(
             backend_id=backend_id,
             sandbox=sandbox,
             cfg=cfg,
+            scratch_dir=scratch_dir,
         )
         for agent in agents
     ]
@@ -532,6 +575,11 @@ async def blast_agents(
 
 def build_context(outputs: list[dict], for_role: str = "") -> str:
     """Build a role-filtered context string from agent outputs.
+
+    `outputs` is the round snapshot read back from the blackboard
+    (`bb.read_all_outputs()` / `bb.read_round_outputs(n)`), never a
+    separate in-memory list (core-loop-02). Every injected output is
+    wrapped in the untrusted-data fence (context.fence_agent_output).
 
     - Researchers see: prior researcher findings + critic feedback
     - Critics/Fact-checkers/Judges see: all researcher findings + prior critic feedback
@@ -549,18 +597,22 @@ def build_context(outputs: list[dict], for_role: str = "") -> str:
     fc_outputs = by_role.get("fact_checker", [])
     judge_outputs = by_role.get("quality_judge", [])
 
+    def _fenced(o: dict, body: str) -> str:
+        return fence_agent_output(o.get("agent_id", "unknown"), body)
+
     # All roles see researcher findings
     if researcher_outputs:
         sections.append("### Researcher Findings")
         for o in researcher_outputs:
             aid = o.get("agent_id", "unknown")
-            findings = o.get("findings", "")[:800]
-            kps = o.get("key_points", [])
-            conf = o.get("confidence", 0)
-            sections.append(f"**{aid}** (confidence: {conf:.0%}):")
-            sections.append(findings)
+            findings = (o.get("findings", "") or "")[:800]
+            kps = o.get("key_points", []) or []
+            conf = o.get("confidence", 0) or 0
+            body = findings
             if kps:
-                sections.append("Key points: " + "; ".join(kps[:5]))
+                body += "\nKey points: " + "; ".join(str(k) for k in kps[:5])
+            sections.append(f"**{aid}** (confidence: {conf:.0%}):")
+            sections.append(_fenced(o, body))
             sections.append("")
 
     # Evaluators and synthesizer see critic + fact-checker feedback
@@ -568,20 +620,20 @@ def build_context(outputs: list[dict], for_role: str = "") -> str:
         if critic_outputs:
             sections.append("### Critic Feedback")
             for o in critic_outputs:
-                sections.append(o.get("findings", "")[:500])
+                sections.append(_fenced(o, (o.get("findings", "") or "")[:500]))
                 sections.append("")
 
         if fc_outputs:
             sections.append("### Fact-Checker Verification")
             for o in fc_outputs:
-                sections.append(o.get("findings", "")[:500])
+                sections.append(_fenced(o, (o.get("findings", "") or "")[:500]))
                 sections.append("")
 
     # Synthesizer also sees judge feedback
     if for_role == "synthesizer" and judge_outputs:
         sections.append("### Quality Judge Assessment")
         for o in judge_outputs:
-            sections.append(o.get("findings", "")[:500])
+            sections.append(_fenced(o, (o.get("findings", "") or "")[:500]))
             sections.append("")
 
     context = "\n".join(sections)
@@ -623,8 +675,8 @@ def format_final_output(
                 lines.append(o.get("findings", ""))
                 lines.append("")
 
-    all_flat = [o for rnd in all_round_outputs for o in rnd]
-    dissent = extract_dissent(all_flat)
+    # Only unresolved votes: each agent's LAST vote across rounds (core-loop-08).
+    dissent = extract_dissent(final_votes(all_round_outputs))
     dissent_section = format_dissent_section(dissent)
     if dissent_section:
         lines.append(dissent_section)
@@ -649,110 +701,93 @@ def save_output(topic: str, content: str) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def _try_connect_blackboard(use_redis: bool):
-    """Attempt to connect to Redis blackboard. Returns None if disabled or unavailable."""
-    if not use_redis:
-        return None
-    try:
-        from blackboard import Blackboard
-        bb = Blackboard()
-        return bb
-    except Exception as e:
-        print(f"Warning: Redis unavailable ({e}). Running in memory-only mode.\n")
-        return None
+def _open_blackboard(use_redis: bool, cfg=None):
+    """The run's blackboard: Redis-backed (`[redis]` in blitz.toml) when
+    requested and reachable, else the in-memory implementation of the same
+    interface. Never None — every round is written here and read back."""
+    cfg = cfg or _config
+    if use_redis:
+        try:
+            return Blackboard(host=cfg.redis.host, port=cfg.redis.port, db=cfg.redis.db)
+        except Exception as e:
+            print(f"Warning: Redis unavailable ({e}). Using the in-memory blackboard.\n")
+    return InMemoryBlackboard()
 
 
 def _write_to_blackboard(bb, round_n: int, outputs: list[dict]):
-    """Write round outputs to the blackboard if connected."""
-    if bb is None:
-        return
+    """Write round outputs to the blackboard."""
     for o in outputs:
         bb.write_agent_output(round_n, o.get("agent_id", "unknown"), o)
 
 
+def _read_prior_rounds(bb, round_n: int) -> list[dict]:
+    """Snapshot of every round before `round_n`, read back from the blackboard."""
+    outputs: list[dict] = []
+    for r in range(1, round_n):
+        outputs.extend(bb.read_round_outputs(r))
+    return outputs
+
+
+def _judge_ks_halt(round_outputs: list[dict], cfg) -> str | None:
+    """Secondary stopping rule (core-loop-03): with `[judge_ensemble] halt =
+    true`, a judge-ensemble KS-stop (`ks_stable` / `unanimous_saturation`)
+    halts the swarm. Returns the halt reason, or None. Unanimity + holdout
+    override stays the primary rule and is checked first by the caller."""
+    if not cfg.judge_ensemble.halt:
+        return None
+    for o in round_outputs:
+        if not o.get("_judge_ensemble"):
+            continue
+        log = o.get("_judge_state_log") or []
+        if log and log[-1].get("halted") and log[-1].get("halt_reason") in (
+            "ks_stable", "unanimous_saturation",
+        ):
+            return f"judge_ensemble:{log[-1]['halt_reason']}"
+    return None
+
+
 def _try_init_memory():
-    """Try to initialize the memory reader and writer. Returns (reader, writer) or (None, None)."""
+    """Open the G-Memory store at `[storage] sqlite_path` (migrating a legacy
+    memory/-schema file in place). Returns the store, or None when it cannot
+    be opened -- the swarm then runs without memory, never crashes."""
     try:
-        from memory.reader import MemoryReader
-        from memory.writer import MemoryWriter
+        from gmemory.store import MemoryStore
 
-        reader = MemoryReader()
-        reader.initialize()
-
-        writer = MemoryWriter()
-        writer.initialize()
-
-        return reader, writer
+        store = MemoryStore.open_default(_config)
+        st = store.stats()
+        print(f"Memory: {st['queries']} queries, {st['insights']} insights "
+              f"({st['insight_candidates']} candidates) | vectors: {st['vector_side']}")
+        return store
     except Exception as e:
         print(f"Warning: Memory system unavailable ({e})")
-        return None, None
+        return None
 
 
 def _persist_to_memory(
-    mem_writer, bb, topic, consensus_reached, override_applied,
+    mem_store, bb, topic, consensus_reached, override_applied,
     all_round_outputs, agents,
 ):
-    """Persist completed task to G-Memory storage and finalize blackboard."""
-    # Build interaction graph from round outputs
-    utterances = []
-    utterance_edges = []
-    prior_ids_by_round = {}
+    """Persist the completed task to G-Memory (all three tiers, promotion
+    gate, eviction cycle) and finalize the blackboard."""
+    if mem_store:
+        try:
+            report = mem_store.persist_task(
+                topic,
+                "resolved" if consensus_reached else "failed",
+                all_round_outputs,
+                n_agents=len(agents),
+                tags=["swarm:consensus", f"meta:override={'yes' if override_applied else 'no'}"],
+            )
+            print(f"Memory: stored query {report.query_id[:8]} | "
+                  f"{report.n_utterances} utterances, {len(report.candidate_ids)} candidates "
+                  f"({report.distilled_by}), {len(report.promoted_ids)} promoted | "
+                  f"vectors: {report.vector_source}"
+                  + (f" | eviction: {report.eviction}" if report.eviction else ""))
+        finally:
+            mem_store.close()
 
-    for round_n, round_outputs in enumerate(all_round_outputs):
-        current_ids = []
-        for o in round_outputs:
-            import uuid
-            utt_id = str(uuid.uuid4())
-            utterances.append({
-                "id": utt_id,
-                "agent_id": o.get("agent_id", ""),
-                "content": o.get("findings", "")[:500],
-                "epoch": round_n,
-                "timestamp": time.time(),
-            })
-            current_ids.append(utt_id)
-
-            # Link to prior round outputs (temporal causation)
-            for prior_id in prior_ids_by_round.get(round_n - 1, []):
-                utterance_edges.append((prior_id, utt_id))
-
-        prior_ids_by_round[round_n] = current_ids
-
-    # Generate insight from synthesizer output
-    synth_round = all_round_outputs[-1] if all_round_outputs else []
-    synth_output = next((o for o in synth_round if o.get("role") == "synthesizer"), None)
-    insight = ""
-    if synth_output:
-        # Use key points as a compact insight
-        kps = synth_output.get("key_points", [])
-        if kps:
-            insight = f"On '{topic}': " + "; ".join(kps[:3])
-
-    # Write to persistent memory
-    if mem_writer:
-        mem_writer.store_task(
-            topic=topic,
-            status="resolved" if consensus_reached else "failed",
-            utterances=utterances,
-            utterance_edges=utterance_edges,
-            insight=insight,
-        )
-
-    # Write to Redis + finalize blackboard
     if bb:
-        bb.queue_memory_write({
-            "type": "task_complete",
-            "topic": topic,
-            "rounds": len(all_round_outputs) - 1,
-            "consensus": consensus_reached,
-            "override": override_applied,
-            "agent_count": len(agents),
-        })
         bb.finalize()
-
-    # Cleanup
-    if mem_writer:
-        mem_writer.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -767,6 +802,7 @@ def _make_judge_fn(
     backend_id: str,
     provider,
     sandbox: str,
+    scratch_dir: Path | None = None,
 ):
     """Build JudgeEnsemble's pluggable LLM hook on top of AgentBackend.
 
@@ -775,6 +811,7 @@ def _make_judge_fn(
     `_run_judge_ensemble`, so `model_alias` is the resolved model string.
     """
     judge = resolve_model("judge", backend_id, cfg)
+    scratch_dir = scratch_dir or scratch_cwd()
 
     def _judge(
         candidate: str,
@@ -802,11 +839,13 @@ def _make_judge_fn(
             schema=_judge_vote_schema(tuple(rubric_dims)),
             model=model,
             timeout_s=min(AGENT_TIMEOUT_SECONDS, 90),
-            cwd=Path(__file__).parent,
+            cwd=scratch_dir,
             sandbox=sandbox,
             approval_policy=provider.approval_policy,
             reasoning_effort=judge.effort or provider.reasoning_effort or None,
             ephemeral=provider.ephemeral,
+            tools=CONSENSUS_TOOLS,
+            max_turns=CONSENSUS_MAX_TURNS,
         ))
         parsed = result.parsed or {}
         if result.errored and not parsed:
@@ -858,7 +897,7 @@ def _make_judge_fn(
     return _judge
 
 
-def _run_judge_ensemble(
+async def _run_judge_ensemble(
     *,
     topic: str,
     candidate_outputs: list[dict],
@@ -868,7 +907,11 @@ def _run_judge_ensemble(
     backend_id: str,
     provider,
     sandbox: str,
+    scratch_dir: Path | None = None,
 ) -> dict:
+    """Judge-ensemble vote. The N judge calls of every debate round fan out
+    via `asyncio.to_thread` + `gather` (JudgeEnsemble.round_async); awaited
+    on the event loop, never run inline (core-loop-01)."""
     candidate = build_context(candidate_outputs, for_role="quality_judge")
     history = build_context(history_outputs, for_role="quality_judge")
     model = resolve_model("judge", backend_id, cfg).model
@@ -887,12 +930,13 @@ def _run_judge_ensemble(
             backend_id=backend_id,
             provider=provider,
             sandbox=sandbox,
+            scratch_dir=scratch_dir,
         ),
     )
 
     state = None
     while not ensemble.is_stable():
-        state = ensemble.round(candidate, history)
+        state = await ensemble.round_async(candidate, history)
         if state.halted:
             break
 
@@ -944,12 +988,14 @@ def _make_pairwise_judge_fn(
     backend_id: str,
     provider,
     sandbox: str,
+    scratch_dir: Path | None = None,
 ):
     """Build SelectorSynth's pairwise judge hook on top of AgentBackend.
 
     Pairwise judges run on the `judge` role tier (blitz.toml [models].judge).
     """
     judge = resolve_model("judge", backend_id, cfg)
+    scratch_dir = scratch_dir or scratch_cwd()
 
     def _pairwise(span_a: Span, span_b: Span, topic: str, judge_id: str, seed: int) -> PairwiseVerdict:
         model = judge.model
@@ -967,11 +1013,13 @@ def _make_pairwise_judge_fn(
             schema=PAIRWISE_VERDICT_SCHEMA,
             model=model,
             timeout_s=min(AGENT_TIMEOUT_SECONDS, 90),
-            cwd=Path(__file__).parent,
+            cwd=scratch_dir,
             sandbox=sandbox,
             approval_policy=provider.approval_policy,
             reasoning_effort=judge.effort or provider.reasoning_effort or None,
             ephemeral=provider.ephemeral,
+            tools=CONSENSUS_TOOLS,
+            max_turns=CONSENSUS_MAX_TURNS,
         ))
         parsed = result.parsed or {}
         winner = parsed.get("winner", "tie")
@@ -988,7 +1036,7 @@ def _make_pairwise_judge_fn(
     return _pairwise
 
 
-def _run_selector_synthesis(
+async def _run_selector_synthesis(
     *,
     topic: str,
     researcher_outputs: list[dict],
@@ -998,7 +1046,10 @@ def _run_selector_synthesis(
     backend_id: str,
     provider,
     sandbox: str,
+    scratch_dir: Path | None = None,
 ) -> dict:
+    """Selection-bottleneck synthesis. Every pairwise judgement fans out via
+    `asyncio.to_thread` + `gather` (SelectorSynth.synthesize_async)."""
     judge_model = resolve_model("judge", backend_id, cfg).model
     selector_cfg = MechanismSelectorConfig(
         granularity=cfg.selector.granularity,
@@ -1013,9 +1064,10 @@ def _run_selector_synthesis(
             backend_id=backend_id,
             provider=provider,
             sandbox=sandbox,
+            scratch_dir=scratch_dir,
         ),
     )
-    result = selector.synthesize(
+    result = await selector.synthesize_async(
         researcher_outputs,
         topic=topic,
         guard_filter=(lambda outs: _filter_guarded(guard, outs)) if guard else None,
@@ -1111,13 +1163,19 @@ async def run_swarm(
 
     Full lifecycle: SPAWN -> BLAST -> WRITE -> CHECK -> ITERATE -> FINALIZE
 
-    All agents (researchers + evaluators) blast simultaneously each round.
-    After each round, consensus is checked. If not reached, the swarm
-    re-blasts with updated blackboard context. The synthesizer runs once
-    after consensus or max rounds.
+    Round 1 is staged — researchers, then evaluators, then the judge
+    ensemble — because evaluators need findings to evaluate (a real data
+    dependency). Round 2+ blasts every agent at once with the blackboard
+    snapshot. The blackboard (Redis or in-memory, same interface) is the
+    only round store: outputs are written there and read back before any
+    context is built. Consensus = evaluator unanimity, with the holdout
+    override after round 3; the judge-ensemble KS-stop is a secondary halt
+    only when `[judge_ensemble] halt = true`. The synthesizer runs once
+    after consensus, halt, or max rounds.
     """
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     runtime_cfg = load_config()
+    scratch_dir = scratch_cwd(run_id)
     profile = quality_profile or runtime_cfg.swarm.quality_profile
     _, selected_backend, provider, resolved_sandbox = _backend_settings(
         cfg=runtime_cfg,
@@ -1152,12 +1210,9 @@ async def run_swarm(
         # LLM hooks (claim decomposition / adjudication) run on the `guard`
         # role tier when enabled; the model is injected here, never defaulted
         # inside mechanisms/cascade_guard.py.
-        guard_model = resolve_model("guard", selected_backend, runtime_cfg).model
-        guard = CascadeGuard(CascadeGuardConfig(
-            mode=runtime_cfg.guard.mode,
-            decompose_model=guard_model,
-            adjudicate_model=guard_model,
-        ))
+        # `[guard] mode = "max"` -> real LLM hooks; other modes -> the
+        # heuristic screen, announced as such (mechanisms-02).
+        guard = CascadeGuard.from_config(runtime_cfg, selected_backend)
 
     print(f"\n{'='*60}")
     print(f"BLITZ-SWARM — {topic}")
@@ -1169,9 +1224,12 @@ async def run_swarm(
     print(
         "Mechanisms: "
         f"cascade_guard={'on' if guard_enabled else 'off'}, "
-        f"judge_ensemble={'on' if judge_ensemble_enabled else 'off'}, "
+        f"judge_ensemble={'on' if judge_ensemble_enabled else 'off'}"
+        f"{' (halt)' if judge_ensemble_enabled and runtime_cfg.judge_ensemble.halt else ''}, "
         f"selector={'on' if selector_enabled else 'off'}"
     )
+    print(STAGING_BANNER)
+    print(f"Scratch cwd: {scratch_dir} | tools: none | max_turns: {CONSENSUS_MAX_TURNS}")
     print()
 
     # --- METRICS: Initialize ---
@@ -1186,6 +1244,7 @@ async def run_swarm(
         persona_critics=runtime_cfg.swarm.persona_critics,
         backend_id=selected_backend,
         sandbox=resolved_sandbox,
+        max_agents=runtime_cfg.swarm.max_agents,
     )
     researchers = [a for a in agents if a.role == "researcher"]
     if judge_ensemble_enabled:
@@ -1201,38 +1260,37 @@ async def run_swarm(
         print(f"  {a.id:20s} | {a.role:15s} | model={_model_label(a.role, selected_backend, runtime_cfg)}")
     print()
 
-    # Connect blackboard (optional)
-    bb = _try_connect_blackboard(use_redis)
-    if bb:
-        bb.initialize(topic, [a.id for a in agents])
-        print("Blackboard: Redis connected")
-    else:
-        print("Blackboard: in-memory mode")
+    # The blackboard is the round store (Redis or in-memory, same interface).
+    bb = _open_blackboard(use_redis, runtime_cfg)
+    bb.initialize(topic, [a.id for a in agents])
+    print("Blackboard: Redis connected" if isinstance(bb, Blackboard) else "Blackboard: in-memory")
 
-    # --- MEMORY: Retrieve historical context ---
+    # --- MEMORY: Retrieve prior findings (gmemory; FTS5 path needs no extras) ---
+    # The block is fenced as untrusted data and goes to round-1 researchers.
     memory_context = ""
-    mem_reader, mem_writer = _try_init_memory()
-    if mem_reader and mem_reader.is_available():
-        memory = mem_reader.retrieve_memory(topic)
-        memory_context = mem_reader.build_memory_context(memory)
-        n_insights = len(memory.get("insights", []))
-        n_queries = len(memory.get("related_queries", []))
-        print(f"Memory: {n_insights} insights, {n_queries} related queries loaded")
+    mem_writer = _try_init_memory()
+    if mem_writer is not None:
+        try:
+            memory_context, mem_result = mem_writer.context_for(topic)
+            print(f"Memory: {len(mem_result.insights)} insights, "
+                  f"{len(mem_result.related_queries)} related queries loaded"
+                  + (" (LLM-ranked)" if mem_result.used_llm else ""))
+        except Exception as e:
+            print(f"Warning: Memory retrieval failed ({e})")
     else:
-        print("Memory: no historical data yet")
+        print("Memory: off for this run")
     print()
 
-    all_round_outputs = []  # list of lists, one per round
-    accumulated_outputs = []  # flat list of all outputs across rounds
+    all_round_outputs = []  # list of lists, one per round — each read back from the blackboard
     consensus_reached = False
     override_applied = False
+    halt_reason = None
     final_round_n = 0
 
-    # --- BLAST + CHECK loop ---
+    # --- BLAST + WRITE + CHECK loop ---
     for round_n in range(1, max_rounds + 1):
         final_round_n = round_n
-        if bb:
-            bb.advance_round()
+        bb.advance_round()
 
         round_label = f"round_{round_n}"
         mc.start_round(round_label)
@@ -1240,14 +1298,13 @@ async def run_swarm(
         print(f"--- Round {round_n}/{max_rounds}: "
               f"{len(blast_agents_list)} agents blasting ---")
 
-        # Build per-role context from accumulated outputs
-        # Round 1: researchers get no context, evaluators get no context
-        # Round 2+: everyone gets prior round outputs
+        # Context is always the blackboard snapshot of the rounds before this one.
+        prior_outputs = _filter_guarded(guard, _read_prior_rounds(bb, round_n))
         task_prompt = f"Research and analyze: {topic}"
 
         if round_n == 1:
-            # First round: blast researchers only (evaluators need findings first)
-            # Inject historical memory context if available
+            # Staged: researchers -> evaluators -> judges (data dependency).
+            # Round-1 researchers get the fenced memory block, if any.
             initial_context = memory_context if memory_context else ""
             print(f"  Phase A: {len(researchers)} researchers...")
             start = time.monotonic()
@@ -1259,13 +1316,16 @@ async def run_swarm(
                 backend_id=selected_backend,
                 sandbox=resolved_sandbox,
                 cfg=runtime_cfg,
+                scratch_dir=scratch_dir,
             )
-            r_outputs = _apply_guard(guard, r_outputs, round_n)
+            _write_to_blackboard(bb, round_n, _apply_guard(guard, r_outputs, round_n))
             elapsed = time.monotonic() - start
             print(f"  Researchers done [{elapsed:.1f}s]")
 
-            # Now blast evaluators with researcher context
-            r_context = build_context(_filter_guarded(guard, r_outputs), for_role="critic")
+            # Evaluators read the researcher snapshot back from the blackboard.
+            r_context = build_context(
+                _filter_guarded(guard, bb.read_round_outputs(round_n)), for_role="critic",
+            )
             eval_task = (
                 f"Evaluate the research findings on: {topic}\n\n"
                 "Review the researcher outputs. Identify gaps, contradictions, "
@@ -1281,37 +1341,18 @@ async def run_swarm(
                 backend_id=selected_backend,
                 sandbox=resolved_sandbox,
                 cfg=runtime_cfg,
+                scratch_dir=scratch_dir,
             )
-            e_outputs = _apply_guard(guard, e_outputs, round_n)
+            _write_to_blackboard(bb, round_n, _apply_guard(guard, e_outputs, round_n))
             elapsed = time.monotonic() - start
             print(f"  Evaluators done [{elapsed:.1f}s]")
-
             if judge_ensemble_enabled:
                 print("  Phase C: judge ensemble...")
-                judge_output = _run_judge_ensemble(
-                    topic=topic,
-                    candidate_outputs=_filter_guarded(guard, r_outputs + e_outputs),
-                    history_outputs=_filter_guarded(guard, accumulated_outputs),
-                    backend=backend,
-                    cfg=runtime_cfg,
-                    backend_id=selected_backend,
-                    provider=provider,
-                    sandbox=resolved_sandbox,
-                )
-                e_outputs.extend(_apply_guard(guard, [judge_output], round_n))
-
-            round_outputs = r_outputs + e_outputs
         else:
-            # Round 2+: all agents blast simultaneously with full context
-            # Each agent gets role-appropriate context
-            round_outputs = []
+            # Round 2+: single blast, every agent with role-appropriate context
             coros = []
-
             for agent in blast_agents_list:
-                ctx = build_context(
-                    _filter_guarded(guard, accumulated_outputs),
-                    for_role=agent.role,
-                )
+                ctx = build_context(prior_outputs, for_role=agent.role)
                 if agent.role == "researcher":
                     task = (
                         f"Continue researching: {topic}\n\n"
@@ -1333,30 +1374,34 @@ async def run_swarm(
                     backend_id=selected_backend,
                     sandbox=resolved_sandbox,
                     cfg=runtime_cfg,
+                    scratch_dir=scratch_dir,
                 ))
 
             start = time.monotonic()
-            round_outputs = list(await asyncio.gather(*coros))
-            round_outputs = _apply_guard(guard, round_outputs, round_n)
-            if judge_ensemble_enabled:
-                judge_output = _run_judge_ensemble(
-                    topic=topic,
-                    candidate_outputs=_filter_guarded(guard, round_outputs),
-                    history_outputs=_filter_guarded(guard, accumulated_outputs),
-                    backend=backend,
-                    cfg=runtime_cfg,
-                    backend_id=selected_backend,
-                    provider=provider,
-                    sandbox=resolved_sandbox,
-                )
-                round_outputs.extend(_apply_guard(guard, [judge_output], round_n))
+            blast_outputs = list(await asyncio.gather(*coros))
+            _write_to_blackboard(bb, round_n, _apply_guard(guard, blast_outputs, round_n))
             elapsed = time.monotonic() - start
             print(f"  All agents done [{elapsed:.1f}s]")
 
-        # --- WRITE ---
-        _write_to_blackboard(bb, round_n, round_outputs)
+        if judge_ensemble_enabled:
+            start = time.monotonic()
+            judge_output = await _run_judge_ensemble(
+                topic=topic,
+                candidate_outputs=_filter_guarded(guard, bb.read_round_outputs(round_n)),
+                history_outputs=prior_outputs,
+                backend=backend,
+                cfg=runtime_cfg,
+                backend_id=selected_backend,
+                provider=provider,
+                sandbox=resolved_sandbox,
+                scratch_dir=scratch_dir,
+            )
+            _write_to_blackboard(bb, round_n, _apply_guard(guard, [judge_output], round_n))
+            print(f"  Judge ensemble done [{time.monotonic() - start:.1f}s]")
+
+        # --- READ BACK: the round as the blackboard holds it ---
+        round_outputs = bb.read_round_outputs(round_n)
         all_round_outputs.append(round_outputs)
-        accumulated_outputs = [o for rnd in all_round_outputs for o in rnd]
 
         # --- METRICS: End round ---
         mc.end_round(round_label, round_outputs)
@@ -1401,6 +1446,13 @@ async def run_swarm(
             consensus_reached = True
             break
 
+        # Secondary halt: judge-ensemble KS-stop, only with [judge_ensemble] halt = true
+        halt_reason = _judge_ks_halt(guarded_round_outputs, runtime_cfg)
+        if halt_reason:
+            print(f"  HALT ({halt_reason}): judge scores are stable after round {round_n}; "
+                  "stopping without evaluator consensus. Dissent preserved.\n")
+            break
+
         if round_n < max_rounds:
             dissent = extract_dissent(eval_votes)
             print(f"  {len(dissent)} dissenting vote(s) — iterating...")
@@ -1413,7 +1465,7 @@ async def run_swarm(
         if round_n < max_rounds and not consensus_reached:
             blast_agents_list = _prune_low_contribution_agents(
                 blast_agents_list,
-                _filter_guarded(guard, accumulated_outputs),
+                _filter_guarded(guard, bb.read_all_outputs()),
                 selector_enabled=selector_enabled,
             )
             researchers = [a for a in blast_agents_list if a.role == "researcher"]
@@ -1425,7 +1477,7 @@ async def run_swarm(
     # --- FINALIZE: Synthesizer ---
     mc.start_round("synthesis")
 
-    guarded_accumulated = _filter_guarded(guard, accumulated_outputs)
+    guarded_accumulated = _filter_guarded(guard, bb.read_all_outputs())
     synth_context = build_context(guarded_accumulated, for_role="synthesizer")
     synth_task = (
         f"Synthesize all findings on: {topic}\n\n"
@@ -1436,8 +1488,9 @@ async def run_swarm(
 
     if not consensus_reached:
         synth_task += (
-            "\n\nNote: The swarm did not reach full consensus. Include a "
-            "quality warning noting unresolved issues."
+            "\n\nNote: The swarm did not reach full consensus"
+            + (f" (halted: {halt_reason})" if halt_reason else "")
+            + ". Include a quality warning noting unresolved issues."
         )
 
     print(f"--- Final: Synthesizer ---")
@@ -1446,7 +1499,7 @@ async def run_swarm(
         researcher_outputs = [
             o for o in guarded_accumulated if o.get("role") == "researcher"
         ]
-        synth_output = _run_selector_synthesis(
+        synth_output = await _run_selector_synthesis(
             topic=topic,
             researcher_outputs=researcher_outputs,
             guard=guard,
@@ -1455,6 +1508,7 @@ async def run_swarm(
             backend_id=selected_backend,
             provider=provider,
             sandbox=resolved_sandbox,
+            scratch_dir=scratch_dir,
         )
         synth_outputs = _apply_guard(guard, [synth_output], final_round_n + 1)
     else:
@@ -1466,6 +1520,7 @@ async def run_swarm(
             backend_id=selected_backend,
             sandbox=resolved_sandbox,
             cfg=runtime_cfg,
+            scratch_dir=scratch_dir,
         )
         synth_outputs = _apply_guard(guard, synth_outputs, final_round_n + 1)
     elapsed = time.monotonic() - start
@@ -1493,6 +1548,13 @@ async def run_swarm(
     # --- Output ---
     final_doc = format_final_output(topic, all_round_outputs, synth_output)
     filepath = save_output(topic, final_doc)
+    # bench-01: per-agent round outputs next to the markdown so the bench's
+    # MAST detectors (bench/runner._load_round_outputs) run on real runs.
+    try:
+        filepath.with_suffix(".rounds.json").write_text(
+            json.dumps(all_round_outputs, default=str), encoding="utf-8")
+    except (OSError, TypeError) as e:
+        print(f"Warning: could not write rounds.json ({e})")
 
     total_agents_invoked = sum(len(rnd) for rnd in all_round_outputs)
     _total_cost = metrics_record.get("total_cost_usd")
@@ -1504,7 +1566,8 @@ async def run_swarm(
     print(f"Rounds: {final_round_n} + synthesis")
     print(f"Total agent invocations: {total_agents_invoked}")
     print(f"Consensus: {'yes' if consensus_reached else 'no'}"
-          f"{' (override)' if override_applied else ''}")
+          f"{' (override)' if override_applied else ''}"
+          f"{f' (halted: {halt_reason})' if halt_reason else ''}")
     print(f"Cost: {cost_str} | Tokens: {tokens_str}")
     print(f"Quality: avg={metrics_record.get('avg_quality', 0)} "
           f"(cov={metrics_record.get('coverage', 0)} "
@@ -1512,9 +1575,10 @@ async def run_swarm(
           f"clar={metrics_record.get('clarity', 0)} "
           f"dep={metrics_record.get('depth', 0)})")
     print(f"Wall clock: {metrics_record.get('total_wall_clock_s', 0):.1f}s")
-    print(f"Metrics saved to: metrics.jsonl")
+    print(f"Metrics saved to: {METRICS_PATH}")
     print(f"{'='*60}\n")
 
+    shutil.rmtree(scratch_dir, ignore_errors=True)
     return filepath
 
 
@@ -1548,6 +1612,7 @@ def _dry_run(
         f"| adapter={provider.adapter} | profile={profile} | sandbox={resolved_sandbox}"
     )
     print("Per-role models: --list-models prints the full role -> tier -> model table.")
+    print(STAGING_BANNER)
     print()
 
     agents = plan_agents(
@@ -1557,6 +1622,7 @@ def _dry_run(
         persona_critics=cfg.swarm.persona_critics,
         backend_id=selected_backend,
         sandbox=resolved_sandbox,
+        max_agents=cfg.swarm.max_agents,
     )
     researchers = [a for a in agents if a.role == "researcher"]
     evaluators = [a for a in agents if a.role in ("critic", "fact_checker", "quality_judge")]
@@ -1581,6 +1647,14 @@ def _dry_run(
 
 
 def main():
+    try:
+        _main()
+    except ConfigError as exc:
+        print(f"blitz-swarm: config error: {exc}", file=sys.stderr)
+        sys.exit(2)
+
+
+def _main():
     import argparse
 
     parser = argparse.ArgumentParser(
@@ -1736,7 +1810,7 @@ def _run_mythos_mode(args) -> None:
         print(f"  cost_ceiling_usd  = {cfg.cost_ceiling_usd}")
         print(f"  token_ceiling     = {cfg.token_ceiling}")
         print(f"  output_dir        = {cfg.output_dir}")
-        print(f"  backend           = {os.environ.get('BLITZ_BACKEND') or load_config().backend.default}")
+        print(f"  backend           = {os.environ.get('BLITZ_BACKEND') or cfg.backend or load_config().backend.default}")
         loaded = load_config()
         default_provider = loaded.backend.get_provider(loaded.backend.default)
         print(f"  sandbox           = {os.environ.get('BLITZ_SANDBOX') or default_provider.sandbox}")

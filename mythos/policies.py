@@ -62,6 +62,8 @@ class CostBudget:
 class MythosConfig:
     # Per-role TIER override (mythos.toml [models]). Empty = use blitz.toml
     # [models].<role>. Env BLITZ_MODEL / BLITZ_MODEL_<ROLE> beat both.
+    backend: str = ""              # mythos.toml [models] backend: provider id used by --mode mythos
+                                   # unless --backend / BLITZ_BACKEND is given ("" = blitz.toml default)
     planner_model: str = ""
     executor_model: str = ""
     verifier_model: str = ""
@@ -78,6 +80,15 @@ class MythosConfig:
     planner_timeout_s: int = 600   # extended-thinking can take a while
     executor_timeout_s: int = 300
     verifier_timeout_s: int = 600
+
+    # Verifier gates (backends-04). The LLM verdict alone never passes a round:
+    #  - mechanical check: when a deliverable contains a test file, the
+    #    artifact's own tests run in a subprocess and must pass;
+    #  - confidence gate: a "pass" below `verifier_min_confidence` is demoted
+    #    to needs_work.
+    verifier_run_tests: bool = True
+    verifier_test_timeout_s: int = 120
+    verifier_min_confidence: float = 0.6
 
     # Output
     output_dir: str = "./output/mythos"
@@ -108,7 +119,7 @@ def load_mythos_config(path: Path | None = None) -> MythosConfig:
         return cfg
 
     models = raw.get("models", {}) or {}
-    for k in ("planner_model", "executor_model", "verifier_model"):
+    for k in ("backend", "planner_model", "executor_model", "verifier_model"):
         if k in models:
             setattr(cfg, k, str(models[k]))
 
@@ -116,6 +127,7 @@ def load_mythos_config(path: Path | None = None) -> MythosConfig:
     for k in (
         "max_replans", "max_executors", "cost_ceiling_usd", "token_ceiling",
         "planner_timeout_s", "executor_timeout_s", "verifier_timeout_s",
+        "verifier_run_tests", "verifier_test_timeout_s", "verifier_min_confidence",
         "output_dir", "use_redis", "use_memory",
     ):
         if k in policies:

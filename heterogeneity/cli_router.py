@@ -171,6 +171,9 @@ class CLIRouter:
         fallback_cli: str = "claude",
         cfg=None,
     ):
+        from evolve import require_enabled  # gate shared with evolve/ (mechanisms-01)
+
+        require_enabled(cfg, what="heterogeneity.CLIRouter")
         self.routing_table = routing_table or []
         if adapters is None:
             adapters = [ClaudeCLI(), CodexCLI(), GeminiCLI()]

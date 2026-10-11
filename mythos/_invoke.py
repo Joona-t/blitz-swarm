@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from backends import AgentCall, make_provider_backend
-from backends.models import ENV_OVERRIDE, ResolvedModel, resolve_model, role_env_var
+from backends.models import ResolvedModel, resolve_model
 from config import load_config
 
 # Path to prompts/ relative to this file
@@ -34,7 +34,7 @@ PROMPTS_DIR = Path(__file__).parent / "prompts"
 class InvokeResult:
     parsed: dict | None         # parsed JSON output (None on failure)
     raw_stdout: str             # full stdout for debugging
-    cost_usd: float             # from the provider envelope; 0.0 when unknown
+    cost_usd: float | None      # from the provider envelope; None when unknown (never 0)
     input_tokens: int
     output_tokens: int
     elapsed_s: float
@@ -52,19 +52,22 @@ def load_prompt(name: str) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def resolve_role_model(model_role: str, tier: str | None, cfg, backend_id: str | None = None) -> ResolvedModel:
+def resolve_role_model(model_role: str, tier: str | None, cfg, mode_backend: str | None = None) -> ResolvedModel:
     """Resolve `model_role` honouring the mythos.toml tier override.
 
     `tier` (mythos.toml `<role>_model`) wins over blitz.toml `[models]` but
     loses to the explicit `--model` / BLITZ_MODEL / BLITZ_MODEL_<ROLE>
     overrides, so the documented precedence holds.
+
+    Backend precedence: `--backend` / BLITZ_BACKEND (explicit) > `mode_backend`
+    (mythos.toml `[models] backend`, the Mythos-mode default) > blitz.toml
+    `[backend] default`.
     """
-    backend_id = backend_id or os.environ.get("BLITZ_BACKEND") or cfg.backend.default or None
-    var = role_env_var(model_role)
-    env_override = os.environ.get(ENV_OVERRIDE) or (os.environ.get(var) if var else None)
-    if env_override:
-        return resolve_model(model_role, backend_id, cfg)
-    return resolve_model(model_role, backend_id, cfg, override=tier or None)
+    backend_id = os.environ.get("BLITZ_BACKEND") or mode_backend or cfg.backend.default or None
+    # `tier=` is the strict slot (resolver step 2b): overrides still win, and
+    # a tier the provider does not define raises instead of being sent
+    # verbatim as a model string.
+    return resolve_model(model_role, backend_id, cfg, tier=tier or None)
 
 
 def invoke(
@@ -77,6 +80,7 @@ def invoke(
     tier: str | None = None,
     timeout_s: int,
     max_turns: int = 4,
+    mode_backend: str | None = None,
 ) -> InvokeResult:
     """Invoke a single Mythos role through the configured local backend.
 
@@ -91,7 +95,7 @@ def invoke(
     start = time.monotonic()
     try:
         cfg = load_config()
-        resolved = resolve_role_model(model_role, tier, cfg)
+        resolved = resolve_role_model(model_role, tier, cfg, mode_backend=mode_backend)
         provider = cfg.backend.get_provider(resolved.backend_id)
         sandbox = os.environ.get("BLITZ_SANDBOX") or provider.sandbox
         backend = make_provider_backend(resolved.backend_id, cfg, sandbox=sandbox)
@@ -100,7 +104,7 @@ def invoke(
         return InvokeResult(
             parsed=None,
             raw_stdout="",
-            cost_usd=0.0,
+            cost_usd=None,
             input_tokens=0,
             output_tokens=0,
             elapsed_s=time.monotonic() - start,
@@ -109,6 +113,7 @@ def invoke(
 
     res = backend.call(AgentCall(
         role=role,
+        model_role=model_role,
         prompt=user_prompt,
         system_prompt=system_prompt,
         schema=schema,
@@ -128,7 +133,7 @@ def invoke(
     return InvokeResult(
         parsed=parsed,
         raw_stdout=res.raw_stdout,
-        cost_usd=float(res.cost_usd or 0.0),
+        cost_usd=None if res.cost_usd is None else float(res.cost_usd),
         input_tokens=res.input_tokens,
         output_tokens=res.output_tokens,
         elapsed_s=res.elapsed_s,

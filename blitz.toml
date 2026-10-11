@@ -139,7 +139,17 @@ deep = "mycli-large"
 
 [guard]
 enabled = true
+# off / speed / balanced / strict: heuristic word-overlap screen (logged as
+# "heuristic screen" — it is NOT LLM adjudication). "max": real LLM claim
+# decomposition + contradiction adjudication on the `guard` role tier.
 mode = "balanced"
+
+[evolve]
+# EXPERIMENTAL, unwired: evolve/ (GEPA, AFlow, meta-loop), heterogeneity/
+# and scripts/optimize_prompts.py refuse to run while this is false.
+enabled = false
+gepa_max_metric_calls = 1500
+aflow_max_iters = 50
 
 [judge_ensemble]
 enabled = true
@@ -147,6 +157,9 @@ n_judges = 3
 ks_threshold = 0.05
 ks_consecutive = 2
 min_rounds = 2
+# Stopping rule: evaluator unanimity + holdout override is PRIMARY. Set
+# halt = true to let the ensemble's KS-stop also halt the swarm (secondary).
+halt = false
 
 [selector]
 enabled = true
@@ -169,8 +182,7 @@ db = 0
 
 [storage]
 sqlite_path = "memory.db"
-lancedb_path = "./memory_vectors"
-output_dir = "./output"
+output_dir = "./output"     # also holds metrics.jsonl and scratch/<run_id>/ cwds
 
 [eviction]
 query_archive_days = 90

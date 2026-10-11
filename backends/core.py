@@ -63,6 +63,9 @@ class AgentCall:
     system_prompt: str = ""
     schema: dict | None = None
     model: str | None = None
+    # Resolver role ("planner", "researcher", ...) when `role` is only a log
+    # label (e.g. "executor[spec-3]"); FallbackBackend re-resolves with it.
+    model_role: str = ""
     # Measured live claude calls run 150-240s; 120 starved them (C5b).
     timeout_s: int = 600
     cwd: Path | None = None
@@ -70,6 +73,13 @@ class AgentCall:
     approval_policy: str = DEFAULT_APPROVAL
     reasoning_effort: str | None = None
     ephemeral: bool = True
+    # Tool access is explicit per call. None (the default) = NO tools: the
+    # consensus roles answer from knowledge only, so the Claude adapter sends
+    # `--tools ""`. A list names the allowed built-in tools (core-loop-04).
+    tools: list[str] | None = None
+    # Agentic turn cap forwarded when the CLI supports it; consensus roles
+    # run with max_turns=1 (one answer, no tool loop).
+    max_turns: int | None = None
     metadata: dict = field(default_factory=dict)
 
     @property

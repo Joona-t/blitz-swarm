@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
+
+import pytest
 
 from agents import BlitzAgent
 from backends import AgentCall, AgentResult, resolve_model
@@ -18,6 +21,13 @@ from orchestrator import (
     build_context,
     invoke_agent,
 )
+
+
+@pytest.fixture(autouse=True)
+def _scratch_under_tmp(monkeypatch, tmp_path):
+    """Keep ad-hoc scratch cwds (output/scratch/adhoc_<pid>) out of the repo."""
+    import orchestrator
+    monkeypatch.setattr(orchestrator, "OUTPUT_DIR", tmp_path / "output")
 
 
 class FakeBackend:
@@ -131,7 +141,7 @@ def test_judge_ensemble_produces_quality_judge_vote_with_fake_backend():
     cfg.judge_ensemble.min_rounds = 1
     fake = FakeBackend()
 
-    output = _run_judge_ensemble(
+    output = asyncio.run(_run_judge_ensemble(
         topic="SQLite WAL",
         candidate_outputs=[
             {
@@ -148,7 +158,7 @@ def test_judge_ensemble_produces_quality_judge_vote_with_fake_backend():
         backend_id="codex",
         provider=cfg.backend.get_provider("codex"),
         sandbox="read-only",
-    )
+    ))
 
     assert output["role"] == "quality_judge"
     assert output["_judge_ensemble"] is True
@@ -161,7 +171,7 @@ def test_selector_synthesis_replaces_final_blended_synth_with_fake_backend():
     cfg.selector.n_judges = 1
     fake = FakeBackend()
 
-    output = _run_selector_synthesis(
+    output = asyncio.run(_run_selector_synthesis(
         topic="SQLite WAL",
         researcher_outputs=[
             {
@@ -178,7 +188,7 @@ def test_selector_synthesis_replaces_final_blended_synth_with_fake_backend():
         backend_id="codex",
         provider=cfg.backend.get_provider("codex"),
         sandbox="read-only",
-    )
+    ))
 
     assert output["role"] == "synthesizer"
     assert output["_selector_synth"] is True

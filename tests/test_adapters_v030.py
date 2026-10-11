@@ -92,14 +92,18 @@ def test_claude_omits_effort_when_cli_does_not_support_it(monkeypatch):
     assert "--effort" not in cmd
 
 
-def test_claude_no_effort_means_no_probe_and_no_flag(monkeypatch):
+def _model_calls(calls: list) -> list:
+    """Drop the one-time `claude --help` probe (WP3: it always runs, for --tools)."""
+    return [(c, kw) for c, kw in calls if c[:2] != ["claude", "--help"]]
+
+
+def test_claude_no_effort_means_no_effort_flag(monkeypatch):
     calls: list = []
     _fake_claude(monkeypatch, help_text="--effort", calls=calls)
 
     backends.ClaudeCLIBackend().call(AgentCall(role="r", prompt="p", model="m"))
 
-    assert all(c[:2] != ["claude", "--help"] for c, _ in calls)
-    assert "--effort" not in calls[0][0]
+    assert "--effort" not in _model_calls(calls)[0][0]
 
 
 def test_claude_small_prompt_goes_on_argv_with_devnull_stdin(monkeypatch):
@@ -108,7 +112,7 @@ def test_claude_small_prompt_goes_on_argv_with_devnull_stdin(monkeypatch):
 
     r = backends.ClaudeCLIBackend().call(AgentCall(role="r", prompt="short prompt", model="m"))
 
-    cmd, kwargs = calls[0]
+    cmd, kwargs = _model_calls(calls)[0]
     assert cmd[:3] == ["claude", "-p", "short prompt"]
     assert kwargs.get("stdin") is subprocess.DEVNULL and "input" not in kwargs
     assert r.metadata["prompt_via"] == "argv"
@@ -121,7 +125,7 @@ def test_claude_large_prompt_goes_via_stdin(monkeypatch):
 
     r = backends.ClaudeCLIBackend().call(AgentCall(role="r", prompt=big, model="m", system_prompt="sys"))
 
-    cmd, kwargs = calls[0]
+    cmd, kwargs = _model_calls(calls)[0]
     assert big not in cmd
     assert cmd[:2] == ["claude", "-p"] and cmd[2] == "--output-format"
     assert kwargs["input"] == big and "stdin" not in kwargs
@@ -478,6 +482,21 @@ def test_fallback_uses_tier_effort_of_fallback_provider(cfg):
 
     assert r.backend_id == "second" and second.calls[0].model == "s-deep"
     assert second.calls[0].reasoning_effort == "max"
+
+
+def test_fallback_re_resolves_with_model_role_not_the_log_label(cfg):
+    """`role` may be a log label ("planner[spec-3]"); the hop must resolve
+    the resolver role carried in `model_role`, not the label."""
+    primary = _Fake("primary", error="codex CLI not found on PATH")
+    second = _Fake("second")
+    fb = FallbackBackend(primary, [("second", second)], cfg, log=lambda m: None)
+
+    r = fb.call(AgentCall(role="planner[spec-3]", model_role="planner", prompt="p", model="p-deep"))
+    assert r.backend_id == "second" and second.calls[0].model == "s-deep"     # planner -> deep
+
+    # without model_role the label is all there is: unlisted role -> default tier
+    r = fb.call(AgentCall(role="planner[spec-3]", prompt="p", model="p-deep"))
+    assert second.calls[1].model == "s-std"
 
 
 def test_fallback_not_taken_for_timeouts_or_schema_errors(cfg):

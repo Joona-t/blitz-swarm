@@ -32,6 +32,8 @@ from gmemory.promotion import (
 )
 from gmemory.query_graph import QueryGraph, initialize_schema
 from gmemory.retrieval import (
+    FENCE_CLOSE,
+    FENCE_OPEN,
     LLM_OPS_THRESHOLD,
     RetrievalResult,
     format_context,
@@ -127,8 +129,36 @@ def test_add_task_with_neighbors_creates_edges(qg, db):
     edges = db.execute(
         "SELECT source_id, target_id FROM query_edges"
     ).fetchall()
-    # Identical text → cosine similarity 1.0 → edge formed
+    # No embedder -> lexical neighbours via FTS5: identical text -> Jaccard 1.0 -> edge
     assert any(("q1", "q2") == e or ("q2", "q1") == e for e in edges)
+
+
+def test_no_embedder_means_no_vector_side(qg):
+    """Without an embedder nothing fabricates a vector: kNN is empty and the
+    BM25/lexical path carries retrieval (memory-02)."""
+    assert qg._embed("anything") is None
+    qg.add_task("Bitcoin SegWit BIP141 throughput", "resolved", query_id="q1")
+    assert qg.nearest_neighbors("Bitcoin SegWit BIP141 throughput") == []
+    assert qg.lexical_neighbors("Bitcoin SegWit BIP141 throughput") == [("q1", 1.0)]
+    assert qg._vectors == []
+
+
+def test_embedder_vectors_drive_knn_edges(db):
+    class _Emb:
+        def encode(self, text):
+            return [1.0, 0.0] if "cat" in text else [0.0, 1.0]
+    g = QueryGraph(db, embedder=_Emb())
+    g.add_task("cat facts", "resolved", query_id="c1")
+    g.add_task("cat lore", "resolved", query_id="c2")
+    g.add_task("dog facts", "resolved", query_id="d1")
+    assert g.nearest_neighbors("cat things", exclude_ids=()) == [("c1", 1.0), ("c2", 1.0)]
+    edges = {(s, t) for s, t in db.execute("SELECT source_id, target_id FROM query_edges")}
+    assert ("c2", "c1") in edges and ("d1", "c1") not in edges
+    # Vectors persist in SQLite: a fresh graph on the same DB still has them.
+    g2 = QueryGraph(db, embedder=_Emb())
+    assert sorted(q for q, _ in g2._vectors) == ["c1", "c2", "d1"]
+    assert g2.nearest_neighbors("dog things") == [("d1", 1.0)]
+    assert db.execute("SELECT COUNT(*) FROM queries WHERE embedding IS NULL").fetchone()[0] == 0
 
 
 def test_query_count(qg, db):
@@ -213,6 +243,24 @@ def test_promotion_at_threshold_promotes(db, qg, ig):
     assert len(rows) == 1
     supporting = json.loads(rows[0][0])
     assert set(supporting) == {"qa", "qb", "qc"}
+
+
+def test_promotion_without_vectors_clusters_on_exact_content(db, qg, ig):
+    """Candidates stored without a vector (no embedder) still promote when
+    the same lesson recurs across N distinct queries; a different lesson
+    does not join the cluster."""
+    for qid in ["qa", "qb", "qc"]:
+        qg.add_task(qid, "resolved", query_id=qid)
+        ig.extract_insights(qid, "topic", [
+            {"key_points": ["  Walk-forward CV beats fixed split "]},
+            {"key_points": [f"a lesson only {qid} learned"]},
+            {"key_points": []},
+        ], "resolved")
+    assert db.execute("SELECT DISTINCT vector_source FROM insight_candidates").fetchall() == [("none",)]
+    promoted = evaluate_candidates(db)
+    assert len(promoted) == 1
+    row = db.execute("SELECT content, embedding, vector_source FROM insights").fetchone()
+    assert "Walk-forward" in row[0] and row[1] == b"" and row[2] == "none"
 
 
 def test_promotion_three_in_one_query_does_not_promote(db, qg, ig):
@@ -337,6 +385,19 @@ def test_format_context_includes_insights():
     text = format_context(out)
     assert "lesson X" in text
     assert "Insights" in text
+
+
+def test_retrieve_populates_tier1_utterances_and_touches(db, qg, ig):
+    qg.add_task("SQLite WAL mode", "resolved", query_id="q")
+    db.execute("INSERT INTO utterances VALUES ('u1','q','researcher_1','WAL appends frames',0,1.0)")
+    db.commit()
+    out = retrieve("SQLite WAL", qg, ig)
+    assert out.seeds == ["q"]
+    assert out.interactions[0]["utterances"][0]["content"] == "WAL appends frames"
+    assert db.execute("SELECT access_count FROM queries WHERE id='q'").fetchone()[0] == 1
+    text = format_context(out)
+    assert text.startswith(FENCE_OPEN) and text.rstrip().endswith(FENCE_CLOSE)
+    assert "[researcher_1] WAL appends frames" in text
 
 
 def test_heuristic_relevance_jaccard():

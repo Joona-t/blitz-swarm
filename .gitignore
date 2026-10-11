@@ -3,7 +3,11 @@ __pycache__/
 *.pyo
 .DS_Store
 output/
+metrics.jsonl
+.pytest_cache/
 *.db
+*.db-shm
+*.db-wal
 memory_vectors/
 jobs/state/
 .venv/

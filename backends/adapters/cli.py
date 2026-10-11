@@ -145,8 +145,8 @@ class CodexLocalBackend:
                 # Codex effort vocabulary comes from the provider config
                 # (`reasoning_effort` / `[effort]`), forwarded verbatim.
                 cmd.extend(["-c", f"model_reasoning_effort={json.dumps(effort)}"])
-            if call.cwd:
-                cmd.extend(["--cd", str(call.cwd)])
+            cwd = _scratch_cwd(call, tmp)
+            cmd.extend(["--cd", str(cwd)])
             if call.ephemeral and self.ephemeral:
                 cmd.append("--ephemeral")
             if schema_path is not None:
@@ -161,7 +161,7 @@ class CodexLocalBackend:
                     capture_output=True,
                     text=True,
                     timeout=call.timeout_s,
-                    cwd=str(call.cwd) if call.cwd else None,
+                    cwd=str(cwd),
                 )
             except subprocess.TimeoutExpired as exc:
                 return _error_result(
@@ -202,30 +202,52 @@ class CodexLocalBackend:
 # Claude
 # ---------------------------------------------------------------------------
 
-_CLAUDE_EFFORT_SUPPORT: bool | None = None
+_CLAUDE_HELP_TEXT: str | None = None
 
 
-def claude_supports_effort() -> bool:
-    """Probe `claude --help` once for `--effort`; cached for the process.
+def _claude_help_text() -> str:
+    """`claude --help` output, probed once per process (not a model call).
 
     Tests reset the cache with `reset_claude_probe_cache()` and mock
-    `subprocess.run`. The probe is not a model invocation.
+    `subprocess.run`.
     """
-    global _CLAUDE_EFFORT_SUPPORT
-    if _CLAUDE_EFFORT_SUPPORT is None:
+    global _CLAUDE_HELP_TEXT
+    if _CLAUDE_HELP_TEXT is None:
         try:
             proc = subprocess.run(
                 ["claude", "--help"], capture_output=True, text=True, timeout=20,
             )
-            _CLAUDE_EFFORT_SUPPORT = "--effort" in f"{proc.stdout or ''}{proc.stderr or ''}"
+            _CLAUDE_HELP_TEXT = f"{proc.stdout or ''}{proc.stderr or ''}"
         except Exception:
-            _CLAUDE_EFFORT_SUPPORT = False
-    return _CLAUDE_EFFORT_SUPPORT
+            _CLAUDE_HELP_TEXT = ""
+    return _CLAUDE_HELP_TEXT
+
+
+def claude_supports_flag(flag: str) -> bool:
+    """True when `claude --help` advertises `flag` (e.g. "--effort",
+    "--max-turns"). A flag the installed CLI does not list is never sent."""
+    return flag in _claude_help_text()
+
+
+def claude_supports_effort() -> bool:
+    return claude_supports_flag("--effort")
 
 
 def reset_claude_probe_cache() -> None:
-    global _CLAUDE_EFFORT_SUPPORT
-    _CLAUDE_EFFORT_SUPPORT = None
+    global _CLAUDE_HELP_TEXT
+    _CLAUDE_HELP_TEXT = None
+
+
+def _scratch_cwd(call: AgentCall, tmp: Path) -> Path:
+    """Working directory for a CLI invocation: the call's explicit cwd (the
+    orchestrator passes output/scratch/<run_id>/) or a throwaway temp dir.
+    Never the inherited process cwd, which is usually the repo root
+    (core-loop-04, critic gap A)."""
+    if call.cwd:
+        cwd = Path(call.cwd)
+        cwd.mkdir(parents=True, exist_ok=True)
+        return cwd
+    return tmp
 
 
 @dataclass
@@ -261,25 +283,32 @@ class ClaudeCLIBackend:
         effort = call.reasoning_effort or self.reasoning_effort
         if effort and claude_supports_effort():
             cmd.extend(["--effort", effort])
+        # Tool access is explicit: `--tools ""` disables every built-in tool
+        # (the CLI documents "" as "disable all tools"); a list is forwarded
+        # comma-joined. `--max-turns` only when this CLI build advertises it.
+        if claude_supports_flag("--tools"):
+            cmd.extend(["--tools", ",".join(call.tools) if call.tools else ""])
+        if call.max_turns is not None and claude_supports_flag("--max-turns"):
+            cmd.extend(["--max-turns", str(call.max_turns)])
         if call.system_prompt:
             cmd.extend(["--system-prompt", call.system_prompt])
         if call.schema:
             cmd.extend(["--json-schema", json.dumps(call.schema)])
 
-        run_kwargs: dict = {
-            "capture_output": True,
-            "text": True,
-            "timeout": call.timeout_s,
-            "cwd": str(call.cwd) if call.cwd else None,
-        }
-        if use_stdin:
-            run_kwargs["input"] = prompt
-        else:
-            run_kwargs["stdin"] = subprocess.DEVNULL
-
         start = time.monotonic()
         try:
-            proc = subprocess.run(cmd, **run_kwargs)
+            with tempfile.TemporaryDirectory(prefix="blitz-claude-") as td:
+                run_kwargs: dict = {
+                    "capture_output": True,
+                    "text": True,
+                    "timeout": call.timeout_s,
+                    "cwd": str(_scratch_cwd(call, Path(td))),
+                }
+                if use_stdin:
+                    run_kwargs["input"] = prompt
+                else:
+                    run_kwargs["stdin"] = subprocess.DEVNULL
+                proc = subprocess.run(cmd, **run_kwargs)
         except subprocess.TimeoutExpired:
             return _error_result(
                 self, model, f"claude timed out after {call.timeout_s}s",
@@ -314,19 +343,29 @@ class ClaudeCLIBackend:
                 parsed = parse_json_loose(text)
         if parsed is None:
             parsed = parse_json_loose(text)
+        # The JSON envelope flags failures (max turns, refusals, API errors)
+        # with `is_error: true` even when the process exits 0.
+        is_error = bool(envelope.get("is_error")) if envelope else False
+        if is_error:
+            parsed = None
         validation_errors = validate_json_schema(parsed, call.schema)
         error = None
         if proc.returncode != 0:
             error = f"claude exit {proc.returncode}: {(proc.stderr or '')[:500]}"
+        elif is_error:
+            detail = envelope.get("result") if isinstance(envelope.get("result"), str) else ""
+            error = f"claude is_error: {detail[:500] or envelope.get('subtype') or 'unspecified'}"
         elif validation_errors:
             error = "; ".join(validation_errors[:3])
         return AgentResult(
             backend_id=self.backend_id, adapter_kind=self.adapter_kind,
             model=model, text=text, raw_stdout=proc.stdout, parsed=parsed,
-            elapsed_s=elapsed, errored=proc.returncode != 0 or bool(validation_errors),
+            elapsed_s=elapsed,
+            errored=proc.returncode != 0 or is_error or bool(validation_errors),
             error=error, cost_usd=cost, input_tokens=in_tok,
             output_tokens=out_tok, validation_errors=validation_errors,
-            metadata={"effort": effort, "prompt_via": "stdin" if use_stdin else "argv"},
+            metadata={"effort": effort, "prompt_via": "stdin" if use_stdin else "argv",
+                      "tools": list(call.tools or []), "max_turns": call.max_turns},
         )
 
 

@@ -1,14 +1,13 @@
--- G-Memory Tier 2/3 schema additions
--- Idempotent migration on top of memory/schema.sql; existing rows survive.
+-- G-Memory canonical schema (Tier 1 traces, Tier 2 query graph, Tier 3 insights).
+-- Idempotent: every statement is CREATE ... IF NOT EXISTS. Legacy memory/-schema
+-- databases are rebuilt by gmemory/migrate.py (scripts/migrate_memory_db.py).
 
 PRAGMA journal_mode = WAL;
 PRAGMA busy_timeout = 30000;
 PRAGMA synchronous = NORMAL;
 PRAGMA foreign_keys = ON;
 
--- Tier 2 — Query graph (extends existing `queries`, additive columns guarded
--- by their absence in the legacy schema; if they already exist, ALTER TABLE
--- is skipped by the migrate.py runner).
+-- Tier 2 — Query graph
 CREATE TABLE IF NOT EXISTS queries (
     id              TEXT PRIMARY KEY,
     query_text      TEXT NOT NULL,
@@ -18,10 +17,11 @@ CREATE TABLE IF NOT EXISTS queries (
     last_accessed   REAL NOT NULL,
     n_agents        INTEGER NOT NULL DEFAULT 0,
     n_rounds        INTEGER NOT NULL DEFAULT 0,
-    cost_usd        REAL    NOT NULL DEFAULT 0.0,
+    cost_usd        REAL,                     -- NULL = not reported (never 0)
     wall_clock_s    REAL    NOT NULL DEFAULT 0.0,
     quality_score   REAL,
-    tags_json       TEXT NOT NULL DEFAULT '[]'
+    tags_json       TEXT NOT NULL DEFAULT '[]',
+    embedding       BLOB                      -- raw f32 LE; NULL when no embedder was present
 );
 
 CREATE TABLE IF NOT EXISTS query_edges (
@@ -31,6 +31,34 @@ CREATE TABLE IF NOT EXISTS query_edges (
     created_at  REAL NOT NULL,
     PRIMARY KEY (source_id, target_id),
     CHECK (source_id <> target_id)
+);
+
+-- Tier 1 — Interaction graph (raw agent outputs per query)
+CREATE TABLE IF NOT EXISTS utterances (
+    id          TEXT PRIMARY KEY,
+    query_id    TEXT NOT NULL REFERENCES queries(id) ON DELETE CASCADE,
+    agent_id    TEXT NOT NULL,
+    content     TEXT NOT NULL,
+    epoch       INTEGER NOT NULL,
+    timestamp   REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS utterance_edges (
+    source_id   TEXT NOT NULL REFERENCES utterances(id) ON DELETE CASCADE,
+    target_id   TEXT NOT NULL REFERENCES utterances(id) ON DELETE CASCADE,
+    query_id    TEXT NOT NULL REFERENCES queries(id)    ON DELETE CASCADE,
+    PRIMARY KEY (source_id, target_id)
+);
+
+-- Eviction archive: query rows moved out of the live graph (insights never evict).
+CREATE TABLE IF NOT EXISTS queries_archive (
+    id              TEXT PRIMARY KEY,
+    query_text      TEXT NOT NULL,
+    status          TEXT NOT NULL,
+    created_at      REAL NOT NULL,
+    access_count    INTEGER NOT NULL DEFAULT 0,
+    last_accessed   REAL NOT NULL,
+    archived_at     REAL NOT NULL
 );
 
 -- FTS5 mirror for hybrid retrieval. Triggers keep it in sync with `queries`.
@@ -59,7 +87,8 @@ CREATE TABLE IF NOT EXISTS insight_candidates (
     id              TEXT PRIMARY KEY,
     content         TEXT NOT NULL,
     query_id        TEXT NOT NULL REFERENCES queries(id) ON DELETE CASCADE,
-    embedding       BLOB NOT NULL,           -- raw f32 little-endian, 384*4 B
+    embedding       BLOB NOT NULL,           -- raw f32 little-endian; b'' when no embedder
+    vector_source   TEXT NOT NULL DEFAULT 'model',  -- 'model' | 'none' (stored without a vector)
     confidence      REAL NOT NULL DEFAULT 0.5,
     tags_json       TEXT NOT NULL DEFAULT '[]',
     created_at      REAL NOT NULL,
@@ -77,7 +106,8 @@ CREATE TABLE IF NOT EXISTS insights (
     last_validated_at   REAL NOT NULL,
     access_count        INTEGER NOT NULL DEFAULT 0,
     confidence          REAL NOT NULL DEFAULT 0.6,
-    embedding           BLOB NOT NULL
+    embedding           BLOB NOT NULL,           -- b'' when promoted from vector-less candidates
+    vector_source       TEXT NOT NULL DEFAULT 'model'
 );
 
 CREATE TABLE IF NOT EXISTS insight_edges (
@@ -143,3 +173,4 @@ CREATE INDEX IF NOT EXISTS idx_cand_query            ON insight_candidates(query
 CREATE INDEX IF NOT EXISTS idx_iqi_query             ON insight_query_index(query_id);
 CREATE INDEX IF NOT EXISTS idx_insights_validated    ON insights(last_validated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_insights_conf         ON insights(confidence DESC);
+CREATE INDEX IF NOT EXISTS idx_utterances_query      ON utterances(query_id);

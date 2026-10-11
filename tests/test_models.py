@@ -168,6 +168,33 @@ def test_override_naming_a_tier_resolves_through_tiers(cfg, monkeypatch):
     assert resolve_model("executor", "alpha", cfg).model == "alpha-std"
 
 
+# ---------------------------------------------------------------------------
+# Step 2b: explicit tier= (strict; mythos.toml <role>_model goes through here)
+# ---------------------------------------------------------------------------
+
+
+def test_tier_kwarg_resolves_through_provider_tiers_and_beats_role_tier(cfg):
+    r = resolve_model("executor", "alpha", cfg, tier="deep")     # [models].executor = fast
+    assert (r.model, r.tier, r.effort, r.source) == ("alpha-deep", "deep", "max", "tier")
+
+
+def test_tier_kwarg_unknown_tier_raises_instead_of_being_sent_verbatim(cfg):
+    with pytest.raises(ModelResolutionError) as ei:
+        resolve_model("planner", "alpha", cfg, tier="ultra")
+    assert ei.value.tier == "ultra" and ei.value.backend_id == "alpha" and ei.value.role == "planner"
+    assert "ultra" in str(ei.value) and "alpha.tiers" in str(ei.value)
+    # the verbatim contract is reserved for --model / env overrides, not tier=
+    assert resolve_model("planner", "alpha", cfg, override="ultra").model == "ultra"
+
+
+def test_tier_kwarg_loses_to_explicit_and_env_overrides(cfg, monkeypatch):
+    assert resolve_model("planner", "alpha", cfg, override="cli-model", tier="fast").model == "cli-model"
+    monkeypatch.setenv("BLITZ_MODEL_PLANNER", "env-planner")
+    assert resolve_model("planner", "alpha", cfg, tier="fast").model == "env-planner"
+    monkeypatch.setenv("BLITZ_MODEL", "standard")        # a tier name as override -> via tiers
+    assert resolve_model("planner", "alpha", cfg, tier="fast").model == "alpha-std"
+
+
 def test_env_dict_injection_is_isolated_from_os_environ(cfg, monkeypatch):
     monkeypatch.setenv("BLITZ_MODEL", "env-global")
     assert resolve_model("planner", "alpha", cfg, env={}).model == "alpha-deep"
@@ -238,6 +265,7 @@ def test_shipped_mythos_toml_uses_tiers_not_model_names():
     import tomllib
     raw = tomllib.loads((ROOT / "mythos.toml").read_text(encoding="utf-8"))
     assert raw["models"] == {
+        "backend": "claude",   # Mythos-mode default provider (overridable by --backend)
         "planner_model": "deep", "executor_model": "fast", "verifier_model": "deep",
     }
     assert raw["policies"]["token_ceiling"] == 2_000_000

@@ -1,6 +1,7 @@
 """Blitz-Swarm — Per-run metrics collection and analysis.
 
-Every run produces a structured metrics record appended to metrics.jsonl.
+Every run produces a structured metrics record appended to output/metrics.jsonl
+(gitignored; the tracked 2026-03..06 history is archived under docs/data/).
 Adapted from research-swarm's phase-based metrics for blitz-swarm's
 round-based iterative consensus model.
 
@@ -21,7 +22,7 @@ from pathlib import Path
 
 from backends.models import pricing_for
 
-METRICS_PATH = Path(__file__).parent / "metrics.jsonl"
+METRICS_PATH = Path(__file__).parent / "output" / "metrics.jsonl"
 
 
 def cost_from_pricing(cfg, backend_id: str | None, model: str | None,
@@ -229,6 +230,7 @@ class MetricsCollector:
         """Append metrics record to JSONL file."""
         record = asdict(self.run)
         record["_agent_timings"] = self._agent_timings
+        METRICS_PATH.parent.mkdir(parents=True, exist_ok=True)
         with open(METRICS_PATH, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, separators=(",", ":")) + "\n")
         return record

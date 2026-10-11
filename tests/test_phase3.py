@@ -1,4 +1,10 @@
-"""Tests for Phase 3: evolve / heterogeneity / managed_agents."""
+"""Tests for Phase 3: evolve / heterogeneity (EXPERIMENTAL, gated by [evolve]).
+
+The managed_agents tests moved to tests/contrib/test_managed_agents.py with
+the package (contrib/managed_agents). An autouse fixture here enables the
+[evolve] gate so the unit tests exercise the real code paths; the gate itself
+is tested explicitly below (test_evolve_gate_*).
+"""
 
 from __future__ import annotations
 
@@ -51,19 +57,85 @@ from heterogeneity.cli_router import (
     CLIRouter,
     RouteEntry,
 )
-from managed_agents.adapter import (
-    AgentSpec,
-    BETA_HEADER,
-    COORDINATOR_DEPTH_LIMIT,
-    CoordinatorDepthExceeded,
-    ManagedAgentsAdapter,
-    ManagedAgentsConfig,
-    SpendCapExceeded,
-    SpendTracker,
-    TooManySpecialists,
-    check_coordinator_depth,
-    validate_spec,
-)
+
+import evolve
+from config import BlitzConfig, EvolveConfig, load_config
+from evolve import EvolveDisabled, require_enabled
+from evolve.aflow_search import OPERATOR_REGISTRY as _REGISTRY
+import evolve.aflow_search as _aflow_mod
+
+
+_ENABLED = BlitzConfig(evolve=EvolveConfig(enabled=True))
+
+
+@pytest.fixture(autouse=True)
+def _enable_evolve(monkeypatch):
+    """Unit tests below exercise the gated code; flip the gate on for them."""
+    monkeypatch.setattr(evolve, "load_config", lambda *a, **k: _ENABLED)
+
+
+# ---------------------------------------------------------------------------
+# [evolve] gate (mechanisms-01) — the shipped default refuses
+# ---------------------------------------------------------------------------
+
+
+def test_evolve_gate_default_config_is_disabled():
+    assert BlitzConfig().evolve.enabled is False
+    assert load_config().evolve.enabled is False, "blitz.toml must ship [evolve] enabled = false"
+
+
+def test_evolve_gate_refuses_with_clear_message(monkeypatch):
+    monkeypatch.setattr(evolve, "load_config", lambda *a, **k: BlitzConfig())
+    with pytest.raises(EvolveDisabled, match=r"\[evolve\] enabled = true"):
+        require_enabled(what="x")
+    with pytest.raises(EvolveDisabled):
+        aflow_search(default_seed_graph(), evaluator=lambda g: 1.0, max_iters=1)
+    with pytest.raises(EvolveDisabled):
+        evaluate_patch(_patch("swarm.max_agents", 4),
+                       baseline_score={"aggregate": 1.0}, candidate_score={"aggregate": 2.0})
+    with pytest.raises(EvolveDisabled):
+        propose_patches_from_insights([])
+    with pytest.raises(EvolveDisabled):
+        BlitzGEPAAdapter(run_fn=lambda t, c: None, score_fn=lambda t, r: 0.0).evaluate({}, [])
+    with pytest.raises(EvolveDisabled):
+        CLIRouter([], adapters=[])
+
+
+def test_evolve_gate_explicit_cfg_wins_over_file(monkeypatch):
+    monkeypatch.setattr(evolve, "load_config", lambda *a, **k: BlitzConfig())
+    require_enabled(_ENABLED)                      # explicit enabled cfg passes
+    with pytest.raises(EvolveDisabled):
+        require_enabled(BlitzConfig())             # explicit disabled cfg refuses
+
+
+def test_aflow_docstring_operator_count_matches_registry():
+    """bench-04: the docstring must name exactly the shipped operators."""
+    doc = _aflow_mod.__doc__
+    assert "Six operators ship" in doc
+    assert len(_REGISTRY) == 6
+    for op in _REGISTRY:
+        assert op.name in doc, op.name
+    assert "FuseRoles and SwapCLI are NOT implemented" in doc
+
+
+def test_allowed_key_paths_name_real_config_fields():
+    """evolve-01: every ALLOWED_KEY_PATHS entry is <section>.<field> of BlitzConfig."""
+    from dataclasses import fields
+
+    cfg = BlitzConfig()
+    for key_path, (expected_type, _allowed, _risk) in ALLOWED_KEY_PATHS.items():
+        section, _, field_name = key_path.partition(".")
+        assert "." not in field_name, f"{key_path}: nested paths do not exist in config.py"
+        assert section in {f.name for f in fields(cfg)}, f"{key_path}: no [{section}] in BlitzConfig"
+        sub = getattr(cfg, section)
+        assert field_name in {f.name for f in fields(sub)}, f"{key_path}: no field {field_name!r}"
+        assert isinstance(getattr(sub, field_name), expected_type), key_path
+    # The guard-mode set must match config.GUARD_MODES exactly.
+    from config import GUARD_MODES
+
+    assert ALLOWED_KEY_PATHS["guard.mode"][1] == set(GUARD_MODES)
+    for hr in MetaLoopConfig().high_risk_paths:
+        assert hr in ALLOWED_KEY_PATHS
 
 
 # ---------------------------------------------------------------------------
@@ -171,7 +243,7 @@ def _patch(key: str, new: object, old: object = 1, risk: str = "low") -> ConfigP
 
 
 def test_validate_patch_accepts_known_int_path():
-    validate_patch(_patch("consensus.judge_ensemble.n", 3))
+    validate_patch(_patch("judge_ensemble.n_judges", 3))
 
 
 def test_validate_patch_rejects_unknown_path():
@@ -186,7 +258,7 @@ def test_validate_patch_rejects_out_of_range_int():
 
 def test_validate_patch_rejects_wrong_type():
     with pytest.raises(SchemaValidationError):
-        validate_patch(_patch("consensus.judge_ensemble.n", "three"))
+        validate_patch(_patch("judge_ensemble.n_judges", "three"))
 
 
 def test_validate_patch_accepts_str_set():
@@ -199,11 +271,11 @@ def test_validate_patch_rejects_str_not_in_set():
 
 
 def test_validate_patch_accepts_float_range():
-    validate_patch(_patch("consensus.judge_ensemble.ks_threshold", 0.05))
+    validate_patch(_patch("judge_ensemble.ks_threshold", 0.05))
 
 
 def test_evaluate_patch_merges_when_d_above_threshold():
-    patch = _patch("consensus.judge_ensemble.n", 3)
+    patch = _patch("judge_ensemble.n_judges", 3)
     result = evaluate_patch(
         patch,
         baseline_score={
@@ -224,7 +296,7 @@ def test_evaluate_patch_merges_when_d_above_threshold():
 
 
 def test_evaluate_patch_rejects_per_dim_regression():
-    patch = _patch("consensus.judge_ensemble.n", 3)
+    patch = _patch("judge_ensemble.n_judges", 3)
     result = evaluate_patch(
         patch,
         baseline_score={
@@ -243,7 +315,7 @@ def test_evaluate_patch_rejects_per_dim_regression():
 
 
 def test_evaluate_patch_rejects_cost_blowup():
-    patch = _patch("consensus.judge_ensemble.n", 3)
+    patch = _patch("judge_ensemble.n_judges", 3)
     result = evaluate_patch(
         patch,
         baseline_score={"aggregate": 7.0, "per_dim": {}, "stddev": 0.5, "cost": 1.0},
@@ -269,7 +341,7 @@ def test_propose_patches_from_judge_variance_insight():
     ]
     patches = propose_patches_from_insights(insights)
     assert len(patches) == 1
-    assert patches[0].key_path == "consensus.judge_ensemble.n"
+    assert patches[0].key_path == "judge_ensemble.n_judges"
 
 
 def test_assert_level_enforced():
@@ -412,80 +484,3 @@ def test_available_clis_filtered_by_availability():
     router = CLIRouter([], adapters=[claude, codex])
     assert "claude" in router.available_clis()
     assert "codex" not in router.available_clis()
-
-
-# ---------------------------------------------------------------------------
-# Managed Agents adapter
-# ---------------------------------------------------------------------------
-
-
-def test_validate_spec_caps_specialists():
-    cfg = ManagedAgentsConfig(max_specialists=3)
-    specs = [AgentSpec(role=f"r{i}", model="claude", system_prompt="x") for i in range(5)]
-    with pytest.raises(TooManySpecialists):
-        validate_spec(specs, cfg)
-
-
-def test_check_coordinator_depth_blocks_more_than_one():
-    specs = [
-        AgentSpec("coordinator", "model-a", "x"),
-        AgentSpec("coordinator", "model-a", "y"),
-    ]
-    with pytest.raises(CoordinatorDepthExceeded):
-        check_coordinator_depth(specs)
-
-
-def test_spend_tracker_caps_per_run():
-    tracker = SpendTracker(cap_per_run=1.0, cap_per_day=10.0)
-    tracker.assert_ok(0.5)
-    tracker.record(0.5)
-    with pytest.raises(SpendCapExceeded):
-        tracker.assert_ok(1.0)
-
-
-def test_spend_tracker_caps_per_day():
-    tracker = SpendTracker(cap_per_run=10.0, cap_per_day=1.0)
-    with pytest.raises(SpendCapExceeded):
-        tracker.assert_ok(2.0)
-
-
-def test_managed_agents_bootstrap_requires_api_key(monkeypatch):
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    cfg = ManagedAgentsConfig()
-    with pytest.raises(EnvironmentError):
-        ManagedAgentsAdapter.bootstrap(cfg, [], client_factory=None)
-
-
-def test_managed_agents_bootstrap_succeeds_with_api_key(monkeypatch):
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
-    cfg = ManagedAgentsConfig()
-    adapter = ManagedAgentsAdapter.bootstrap(
-        cfg, [AgentSpec("researcher", "model-b", "x")],
-    )
-    assert isinstance(adapter, ManagedAgentsAdapter)
-    assert adapter.spend.cap_per_run == cfg.spend_cap_usd_per_run
-
-
-def test_managed_agents_run_task_dryruns_without_client(monkeypatch):
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
-    cfg = ManagedAgentsConfig()
-    adapter = ManagedAgentsAdapter.bootstrap(cfg, [])
-    out = adapter.run_task("topic x", n_specialists=3, n_rounds=2)
-    assert out["status"] == "stub"
-    assert out["topic"] == "topic x"
-
-
-def test_managed_agents_run_task_enforces_spend_cap(monkeypatch):
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
-    cfg = ManagedAgentsConfig(spend_cap_usd_per_run=0.01)
-    adapter = ManagedAgentsAdapter.bootstrap(cfg, [])
-    with pytest.raises(SpendCapExceeded):
-        adapter.run_task("x", n_specialists=10, n_rounds=10)
-
-
-def test_beta_header_constant():
-    assert BETA_HEADER == "managed-agents-2026-04-01"
-
-
-def test_coordinator_depth_constant():
-    assert COORDINATOR_DEPTH_LIMIT == 1

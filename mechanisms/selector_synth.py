@@ -26,6 +26,7 @@ with the configured backend on the `judge` role tier.
 
 from __future__ import annotations
 
+import asyncio
 import itertools
 import re
 import uuid
@@ -99,7 +100,7 @@ def mock_pairwise_judge(
 ) -> PairwiseVerdict:
     """Deterministic mock that picks the longer span as the winner.
 
-    A real Sonnet judge picks based on factual accuracy, specificity,
+    A real `judge`-tier LLM judge picks based on factual accuracy, specificity,
     coverage, and clarity — see prompts/general/quality_judge.md or the
     pairwise prompt in the deep dive.
     """
@@ -333,7 +334,55 @@ class SelectorSynth:
         *,
         guard_filter: Callable[[list[dict]], list[dict]] | None = None,
     ) -> SelectionResult:
-        """Run selection over researcher outputs and return final document."""
+        """Run selection over researcher outputs and return final document.
+        Pairwise judge calls run sequentially; see `synthesize_async`."""
+        prep = self._prepare(researcher_outputs, guard_filter)
+        if isinstance(prep, SelectionResult):
+            return prep
+        outputs, all_spans, clusters = prep
+        verdicts = {
+            key: self._judge_cluster(cluster, topic)
+            for key, cluster in clusters.items() if len(cluster) > 1
+        }
+        return self._finish(outputs, all_spans, clusters, verdicts, topic)
+
+    async def synthesize_async(
+        self,
+        researcher_outputs: list[dict],
+        topic: str,
+        *,
+        guard_filter: Callable[[list[dict]], list[dict]] | None = None,
+    ) -> SelectionResult:
+        """`synthesize` with every pairwise judgement (all clusters x pairs x
+        judges) fanned out via `asyncio.to_thread` + `gather` (core-loop-01).
+        Verdicts are grouped back per cluster in the same order the
+        sequential path produces, so BT scores are identical."""
+        prep = self._prepare(researcher_outputs, guard_filter)
+        if isinstance(prep, SelectionResult):
+            return prep
+        outputs, all_spans, clusters = prep
+        jobs = [
+            (key, span_a, span_b, j)
+            for key, cluster in clusters.items() if len(cluster) > 1
+            for span_a, span_b in itertools.combinations(cluster, 2)
+            for j in range(self.cfg.n_judges)
+        ]
+        results = await asyncio.gather(*(
+            asyncio.to_thread(self._judge_pair, span_a, span_b, j, topic)
+            for _, span_a, span_b, j in jobs
+        ))
+        verdicts: dict[str, list[PairwiseVerdict]] = {}
+        for (key, _, _, _), v in zip(jobs, results):
+            verdicts.setdefault(key, []).append(v)
+        return self._finish(outputs, all_spans, clusters, verdicts, topic)
+
+    def _prepare(
+        self,
+        researcher_outputs: list[dict],
+        guard_filter: Callable[[list[dict]], list[dict]] | None,
+    ) -> SelectionResult | tuple[list[dict], list[Span], dict[str, list[Span]]]:
+        """Filter, split into spans, cluster. Returns an early SelectionResult
+        when there is nothing to judge."""
         outputs = list(researcher_outputs)
         if guard_filter is not None:
             outputs = guard_filter(outputs)
@@ -362,9 +411,17 @@ class SelectorSynth:
             )
 
         # 2. Cluster spans (by heading for "section", whole-set for "whole")
-        clusters = self._cluster_spans(all_spans)
+        return outputs, all_spans, self._cluster_spans(all_spans)
 
-        # 3. For each cluster, run pairwise selection + BT
+    def _finish(
+        self,
+        outputs: list[dict],
+        all_spans: list[Span],
+        clusters: dict[str, list[Span]],
+        verdicts_by_cluster: dict[str, list[PairwiseVerdict]],
+        topic: str,
+    ) -> SelectionResult:
+        """3. BT per cluster from the collected verdicts; 4. assemble."""
         selected: list[Span] = []
         bt_scores_all: dict[str, float] = {}
         diagnostics = {
@@ -379,7 +436,7 @@ class SelectorSynth:
                 selected.append(cluster[0])
                 bt_scores_all[cluster[0].id] = 1.0
                 continue
-            verdicts = self._judge_cluster(cluster, topic)
+            verdicts = verdicts_by_cluster.get(cluster_key, [])
             diagnostics["judge_calls"] += len(verdicts)
             wins = _aggregate_pairwise_verdicts(
                 [s.id for s in cluster], verdicts,
@@ -429,48 +486,42 @@ class SelectorSynth:
     def _judge_cluster(
         self, cluster: list[Span], topic: str
     ) -> list[PairwiseVerdict]:
-        """Pairwise comparisons across all pairs × n_judges."""
-        verdicts: list[PairwiseVerdict] = []
-        pairs = list(itertools.combinations(cluster, 2))
-        for span_a, span_b in pairs:
-            for j in range(self.cfg.n_judges):
-                # Optionally swap order to control position bias
-                if self.cfg.pairwise_random_order and (j + hash(span_a.id)) % 2:
-                    a, b = span_b, span_a
-                else:
-                    a, b = span_a, span_b
-                judge_id = f"judge_{j:02d}"
-                seed = j
-                v = self.pairwise_judge_fn(a, b, topic, judge_id, seed)
-                # Normalize: store with original ordering (span_a, span_b)
-                if (a, b) != (span_a, span_b):
-                    if v.winner == "a":
-                        v = PairwiseVerdict(judge_id=v.judge_id,
-                                            span_a_id=span_a.id,
-                                            span_b_id=span_b.id,
-                                            winner="b",
-                                            rationale=v.rationale)
-                    elif v.winner == "b":
-                        v = PairwiseVerdict(judge_id=v.judge_id,
-                                            span_a_id=span_a.id,
-                                            span_b_id=span_b.id,
-                                            winner="a",
-                                            rationale=v.rationale)
-                    else:
-                        v = PairwiseVerdict(judge_id=v.judge_id,
-                                            span_a_id=span_a.id,
-                                            span_b_id=span_b.id,
-                                            winner="tie",
-                                            rationale=v.rationale)
-                verdicts.append(v)
-        return verdicts
+        """Pairwise comparisons across all pairs × n_judges, sequentially."""
+        return [
+            self._judge_pair(span_a, span_b, j, topic)
+            for span_a, span_b in itertools.combinations(cluster, 2)
+            for j in range(self.cfg.n_judges)
+        ]
+
+    def _judge_pair(
+        self, span_a: Span, span_b: Span, j: int, topic: str
+    ) -> PairwiseVerdict:
+        """One judge's verdict on one pair, normalised to (span_a, span_b)
+        ordering. Thread-safe: touches only its arguments and `self.cfg`."""
+        # Optionally swap order to control position bias
+        if self.cfg.pairwise_random_order and (j + hash(span_a.id)) % 2:
+            a, b = span_b, span_a
+        else:
+            a, b = span_a, span_b
+        judge_id = f"judge_{j:02d}"
+        seed = j
+        v = self.pairwise_judge_fn(a, b, topic, judge_id, seed)
+        # Normalize: store with original ordering (span_a, span_b)
+        if (a, b) != (span_a, span_b):
+            flipped = {"a": "b", "b": "a"}.get(v.winner, "tie")
+            v = PairwiseVerdict(judge_id=v.judge_id,
+                                span_a_id=span_a.id,
+                                span_b_id=span_b.id,
+                                winner=flipped,
+                                rationale=v.rationale)
+        return v
 
     def _assemble(self, ordered_spans: list[Span], topic: str) -> str:
         if not ordered_spans:
             return "[no spans selected]"
         if self.cfg.transition_strategy == "concat":
             return self._concat_assemble(ordered_spans)
-        # smooth — placeholder; orchestrator integration calls Haiku
+        # smooth — placeholder; orchestrator integration calls the `fast` tier
         return self._concat_assemble(ordered_spans)
 
     def _concat_assemble(self, spans: list[Span]) -> str:

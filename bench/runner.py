@@ -15,6 +15,12 @@ Lifecycle:
 
 Design notes:
 - `swarm_fn` is injected so tests can mock without spending $.
+- `swarm_fn` contract (bench-01): returns the output Path, or
+  `(Path, rounds)` where `rounds` is the per-round list of per-agent output
+  dicts. The MAST detectors (`bench.detectors.detect_all`) run only on real
+  per-agent outputs — never on aggregates. A plain Path still works: the
+  runner looks for a sibling `<output>.rounds.json` (the orchestrator writes
+  one) and otherwise records that the detectors did not run.
 - Per-prompt rows are appended to results.jsonl with fsync; the runner
   is resumable: re-running skips prompt_ids already present in the file.
 - Cost tracking uses `total_cost_usd` from `metrics.jsonl` (CLI envelope).
@@ -47,7 +53,7 @@ from bench.stats import bootstrap_ci, paired_t_test, cohens_d
 
 BENCH_ROOT = Path(__file__).resolve().parent
 RUNS_DIR = BENCH_ROOT / "runs"
-METRICS_PATH = _REPO_ROOT / "metrics.jsonl"
+METRICS_PATH = _REPO_ROOT / "output" / "metrics.jsonl"   # metrics.py writes here (WP3)
 
 
 # ---------------------------------------------------------------------------
@@ -107,10 +113,32 @@ class PromptResult:
     timeout: bool
     error: str | None
     mast_flags: list[str]
+    # bench-01: True only when detect_all actually ran on per-agent outputs.
+    # An empty mast_flags with this False means "not checked", not "clean".
+    mast_detectors_ran: bool = False
 
 
-# Type alias for the swarm function (injected for testing)
-SwarmFn = Callable[..., Awaitable[Path]]
+# Type alias for the swarm function (injected for testing). Returns either
+# the output Path or (Path, rounds) — see the module docstring.
+SwarmFn = Callable[..., Awaitable["Path | tuple[Path, list[list[dict]]]"]]
+
+
+def _split_swarm_result(result: Any) -> tuple[Any, list[list[dict]]]:
+    """Normalise a swarm_fn return value into (out_path, rounds)."""
+    if isinstance(result, tuple) and len(result) == 2:
+        out_path, rounds = result
+        if _valid_rounds(rounds):
+            return out_path, rounds
+        return out_path, []
+    return result, []
+
+
+def _valid_rounds(data: Any) -> bool:
+    return (
+        isinstance(data, list)
+        and all(isinstance(rnd, list) for rnd in data)
+        and all(isinstance(o, dict) for rnd in data for o in rnd)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +157,27 @@ def _git_sha() -> str:
         return sha[:12] if sha else "nogit"
     except Exception:
         return "nogit"
+
+
+def _blitz_swarm_version() -> str:
+    """Package version from installed metadata, else pyproject.toml, else 'unknown'.
+
+    bench-04: the old hard-coded "0.2.0-alpha" string went stale the first
+    time the version bumped and was written into every summary.json.
+    """
+    try:
+        from importlib.metadata import version as _pkg_version
+
+        return _pkg_version("blitz-swarm")
+    except Exception:
+        pass
+    try:
+        import tomllib
+
+        with open(_REPO_ROOT / "pyproject.toml", "rb") as f:
+            return str(tomllib.load(f)["project"]["version"])
+    except Exception:
+        return "unknown"
 
 
 def _run_id(cfg: BenchConfig, slate: BenchSlate) -> str:
@@ -300,11 +349,7 @@ def _load_round_outputs(out_path: Any) -> list[list[dict]]:
         except (OSError, json.JSONDecodeError):
             continue
         # Validate shape: list of rounds, each a list of agent-output dicts.
-        if (
-            isinstance(data, list)
-            and all(isinstance(rnd, list) for rnd in data)
-            and all(isinstance(o, dict) for rnd in data for o in rnd)
-        ):
+        if _valid_rounds(data):
             return data
     return []
 
@@ -334,7 +379,7 @@ async def run_one_prompt(
     pre_run_timestamp = time.time()
 
     try:
-        out_path = await asyncio.wait_for(
+        swarm_result = await asyncio.wait_for(
             swarm_fn(
                 prompt.text,
                 max_rounds=cfg.max_rounds,
@@ -350,6 +395,7 @@ async def run_one_prompt(
     except Exception as e:
         return _error_result(prompt, run_dir, started, started_utc_iso, repr(e))
 
+    out_path, returned_rounds = _split_swarm_result(swarm_result)
     elapsed = round(time.monotonic() - started, 1)
 
     record = _find_metrics_record_for_topic(
@@ -374,23 +420,22 @@ async def run_one_prompt(
         except OSError:
             md = ""
 
-    # ---- G6: MAST failure-mode detectors (rule-based, no LLM) ------------
-    # detect_all() needs per-agent round outputs (the list[list[dict]] of every
-    # agent's structured output per round). metrics.jsonl only carries aggregate
-    # signals, so the detectors cannot fire from it. If a future run writes the
-    # full per-agent transcript into the run dir (rounds.json next to the output
-    # markdown), load it and run detect_all; otherwise leave flags=[] — we do NOT
-    # fabricate failure modes from aggregates.
-    rounds_list = _load_round_outputs(out_path)
-    if rounds_list:
+    # ---- G6 / bench-01: MAST failure-mode detectors (rule-based, no LLM) --
+    # detect_all() needs per-agent round outputs (list[list[dict]]). They come
+    # from the swarm_fn return value `(Path, rounds)` or from the sibling
+    # `<output>.rounds.json` the orchestrator writes. metrics.jsonl only
+    # carries aggregates, so without either the detectors do NOT run and the
+    # row says so (mast_detectors_ran=False) — we never fabricate "clean".
+    rounds_list = returned_rounds or _load_round_outputs(out_path)
+    detectors_ran = bool(rounds_list)
+    if detectors_ran:
         flags = detect_all(rounds_list, output_md_chars=len(md))
     else:
-        # TODO(G6): wire per-agent round outputs through run_swarm so detect_all
-        # can run on real runs. Until metrics.jsonl (or a sibling rounds.json) is
-        # extended with the per-round, per-agent structured outputs, flags stay
-        # empty on real runs — the regression suite (bench/mast_regression.py)
-        # exercises the detectors directly with injected transcripts.
         flags = []
+        print(
+            f"[bench] MAST detectors not run for {prompt.id} (no per-agent outputs)",
+            flush=True,
+        )
 
     quality = _build_quality_dict(record)
     coverage_hits = _coverage_count(md, prompt.expected_coverage)
@@ -418,6 +463,7 @@ async def run_one_prompt(
         timeout=False,
         error=None,
         mast_flags=flags,
+        mast_detectors_ran=detectors_ran,
     )
 
 
@@ -526,11 +572,12 @@ def aggregate(run_dir: Path, slate: BenchSlate, cfg: BenchConfig) -> dict:
         else:
             by_tier[tier] = {"n": 0, "avg_quality": 0, "avg_cost": 0}
 
-    # MAST flag summary
+    # MAST flag summary (+ how many rows the detectors actually ran on)
     flag_counts: dict[str, int] = {}
     for r in rows:
         for fm in r.get("mast_flags", []) or []:
             flag_counts[fm] = flag_counts.get(fm, 0) + 1
+    mast_detectors_ran = sum(1 for r in rows if r.get("mast_detectors_ran"))
 
     # PRIMARY signal — functional research-quality composite (deterministic).
     # CONTRACT (read by the driver's _bench_avg_quality):
@@ -575,7 +622,7 @@ def aggregate(run_dir: Path, slate: BenchSlate, cfg: BenchConfig) -> dict:
         "ended_utc": _utc(),
         "code": {
             "git_sha": cfg.git_sha,
-            "blitz_swarm_version": "0.2.0-alpha",
+            "blitz_swarm_version": _blitz_swarm_version(),
             "python_version": sys.version.split()[0],
         },
         "config": {
@@ -618,6 +665,8 @@ def aggregate(run_dir: Path, slate: BenchSlate, cfg: BenchConfig) -> dict:
             "output_tokens_total": sum(r.get("output_tokens", 0) for r in rows),
         },
         "mast_flags_summary": flag_counts,
+        # bench-01: rows on which detect_all actually ran. 0 => "not checked".
+        "mast_detectors_ran": mast_detectors_ran,
     }
 
     summary_path = run_dir / "summary.json"
@@ -625,7 +674,66 @@ def aggregate(run_dir: Path, slate: BenchSlate, cfg: BenchConfig) -> dict:
     return summary
 
 
-def write_stats_md(run_dir: Path, summary: dict) -> Path:
+def paired_comparison(summary: dict, baseline: dict) -> dict:
+    """Paired stats of this run vs a baseline run over the prompts both scored.
+
+    Pairs on `functional_composite.per_prompt` (the PRIMARY signal). Returns
+    n, mean delta, paired t, p, df, Cohen's d_z and the p-value method; with
+    n < 2 the test is not computable and `reason` says why (bench-03: no
+    fabricated p from one pair, no normal approximation at tiny n — see
+    bench/stats.t_two_sided_p).
+    """
+    mine = (summary.get("functional_composite") or {}).get("per_prompt") or {}
+    base = (baseline.get("functional_composite") or {}).get("per_prompt") or {}
+    common = sorted(set(mine) & set(base))
+    out: dict[str, Any] = {
+        "baseline_run_id": baseline.get("run_id", ""),
+        "n_pairs": len(common),
+        "prompt_ids": common,
+    }
+    if len(common) < 2:
+        out.update({"t_stat": None, "p_value": None, "df": None, "cohens_d": None,
+                    "mean_delta": None,
+                    "reason": "fewer than 2 prompts scored in both runs"})
+        return out
+    a = [float(mine[pid]) for pid in common]
+    b = [float(base[pid]) for pid in common]
+    t, p, df = paired_t_test(a, b)
+    out.update({
+        "mean_delta": round(statistics.mean(x - y for x, y in zip(a, b)), 4),
+        "t_stat": round(t, 4), "p_value": round(p, 6), "df": df,
+        "cohens_d": round(cohens_d(a, b), 4),
+        "p_method": _p_method(df),
+    })
+    return out
+
+
+def _p_method(df: int) -> str:
+    try:
+        import scipy  # noqa: F401
+
+        return "scipy.stats.t"
+    except ImportError:
+        from bench.stats import NORMAL_APPROX_MIN_DF
+
+        return "student-t (incomplete beta)" if df < NORMAL_APPROX_MIN_DF else "normal approx (df>=30)"
+
+
+def _paired_comparison_lines(summary: dict, baseline: dict) -> list[str]:
+    cmp = paired_comparison(summary, baseline)
+    lines = [f"## Paired comparison vs baseline `{cmp['baseline_run_id']}`", ""]
+    if cmp.get("p_value") is None:
+        lines.append(f"_Not computable: {cmp.get('reason')} (n={cmp['n_pairs']})._")
+    else:
+        lines.append(f"- Pairs: {cmp['n_pairs']} (functional composite, PRIMARY)")
+        lines.append(f"- Mean delta (this - baseline): {cmp['mean_delta']}")
+        lines.append(f"- Paired t = {cmp['t_stat']}, df = {cmp['df']}, p = {cmp['p_value']} ({cmp['p_method']})")
+        lines.append(f"- Cohen's d_z = {cmp['cohens_d']}")
+    lines.append("")
+    return lines
+
+
+def write_stats_md(run_dir: Path, summary: dict, *, baseline_summary: dict | None = None) -> Path:
     """Write a one-page stats.md report."""
     lines = [
         f"# Bench run {run_dir.name}",
@@ -689,9 +797,16 @@ def write_stats_md(run_dir: Path, summary: dict) -> Path:
         lines.append("|---|---|")
         for fm in sorted(summary["mast_flags_summary"]):
             lines.append(f"| {fm} | {summary['mast_flags_summary'][fm]} |")
+    elif summary.get("mast_detectors_ran", 0) > 0:
+        lines.append(
+            f"_No MAST flags raised (detectors ran on "
+            f"{summary['mast_detectors_ran']} prompt(s))._"
+        )
     else:
-        lines.append("_No MAST flags raised._")
+        lines.append("_MAST detectors not run (no per-agent outputs)._")
     lines.append("")
+    if baseline_summary is not None:
+        lines.extend(_paired_comparison_lines(summary, baseline_summary))
     lines.append("## Cost")
     lines.append("")
     cost = summary["cost"]
@@ -714,8 +829,13 @@ async def run_bench(
     *,
     swarm_fn: SwarmFn | None = None,
     metrics_path: Path = METRICS_PATH,
+    baseline_run_dir: Path | None = None,
 ) -> Path:
-    """Top-level: load slate, run prompts, aggregate. Returns the run dir."""
+    """Top-level: load slate, run prompts, aggregate. Returns the run dir.
+
+    `baseline_run_dir`: an earlier run dir; its summary.json is paired against
+    this run's per-prompt composites in stats.md (+ comparison.json).
+    """
     if swarm_fn is None:
         # Lazy import: only require orchestrator when actually running.
         from orchestrator import run_swarm
@@ -801,7 +921,14 @@ async def run_bench(
                   f"{'TIMEOUT' if row.timeout else ('ERR' if row.error else 'ok')}")
 
     summary = aggregate(run_dir, slate, cfg)
-    write_stats_md(run_dir, summary)
+    baseline_summary = None
+    if baseline_run_dir is not None:
+        base_path = Path(baseline_run_dir) / "summary.json"
+        baseline_summary = json.loads(base_path.read_text(encoding="utf-8"))
+        (run_dir / "comparison.json").write_text(
+            json.dumps(paired_comparison(summary, baseline_summary), indent=2)
+        )
+    write_stats_md(run_dir, summary, baseline_summary=baseline_summary)
     return run_dir
 
 
@@ -825,6 +952,8 @@ def main():
     ap.add_argument("--per-prompt-timeout", type=int, default=3600)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--use-redis", action="store_true")
+    ap.add_argument("--baseline", default=None,
+                    help="earlier bench run dir to pair against (paired t / Cohen's d in stats.md)")
     args = ap.parse_args()
 
     cfg = BenchConfig(
@@ -839,7 +968,9 @@ def main():
         use_redis=args.use_redis,
         seed=args.seed,
     )
-    run_dir = asyncio.run(run_bench(cfg))
+    run_dir = asyncio.run(run_bench(
+        cfg, baseline_run_dir=Path(args.baseline) if args.baseline else None,
+    ))
     print(f"\nrun complete: {run_dir}")
 
 

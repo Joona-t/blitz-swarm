@@ -21,6 +21,17 @@ from .policies import MYTHOS_ROLES, CostBudget, MythosConfig
 from .verifier import Verification
 
 
+def _fmt_cost(cost: float | None) -> str:
+    """`$0.0123` for a known cost, `n/a` when the provider did not report one."""
+    return "n/a" if cost is None else f"${cost:.4f}"
+
+
+def _sum_known(costs) -> float | None:
+    """Sum of the costs that are known; None when none of them is."""
+    known = [c for c in costs if c is not None]
+    return sum(known) if known else None
+
+
 @dataclass
 class MythosResult:
     task: str
@@ -62,21 +73,101 @@ def describe_models(cfg: MythosConfig) -> str:
     parts = []
     for role in MYTHOS_ROLES:
         try:
-            r = resolve_role_model(role, cfg.tier_for(role), blitz_cfg)
+            r = resolve_role_model(role, cfg.tier_for(role), blitz_cfg, mode_backend=cfg.backend or None)
             parts.append(f"{role}={r.model} ({r.backend_id}:{r.tier}, effort={r.effort or '-'})")
         except ModelResolutionError as exc:
             parts.append(f"{role}=! {exc}")
     return " | ".join(parts)
 
+# ---------------------------------------------------------------------------
+# G-Memory (use_memory): prior findings in, verified-artifact summary out
+# ---------------------------------------------------------------------------
+
+
+def _memory_open(cfg: MythosConfig):
+    """The shared G-Memory store (blitz.toml [storage] sqlite_path), or None."""
+    if not cfg.use_memory:
+        return None
+    try:
+        from gmemory.store import MemoryStore  # noqa: PLC0415
+        return MemoryStore.open_default()
+    except Exception as exc:  # memory is optional; the run must not die here
+        print(f"  Memory: unavailable ({exc}); running without prior findings")
+        return None
+
+
+def _memory_retrieve(store, task: str) -> str:
+    """Fenced `## Relevant prior findings` block for the planner ("" when none)."""
+    if store is None:
+        return ""
+    try:
+        context, result = store.context_for(task)
+        print(f"  Memory: {len(result.insights)} insights, "
+              f"{len(result.related_queries)} related queries for the planner")
+        return context
+    except Exception as exc:
+        print(f"  Memory: retrieval failed ({exc})")
+        return ""
+
+
+def _memory_persist(store, result: MythosResult) -> None:
+    """Store the run as a query node (status-tagged) and, when the verifier
+    passed, the verified-artifact summary as an insight CANDIDATE -- the
+    N=3 distinct-query promotion gate decides if it ever becomes an insight."""
+    if store is None:
+        return
+    try:
+        verification = result.final_verification
+        executors = [{
+            "agent_id": f"executor[{o.spec_id}]",
+            "findings": o.deliverable,
+            "key_points": [],               # deliverables are traces, not lessons
+            "confidence": o.confidence,
+        } for o in result.final_executor_outputs]
+        verifier = {
+            "agent_id": "verifier",
+            "findings": verification.summary,
+            "confidence": verification.confidence,
+            # Only a PASSED artifact's summary may become a lesson.
+            "key_points": [verification.summary] if result.status == "passed" and verification.summary else [],
+        }
+        report = store.persist_task(
+            result.task,
+            "resolved" if result.status == "passed" else "failed",
+            [executors, [verifier]],
+            n_agents=len(executors) + 2,
+            cost_usd=result.cost_usd if result.cost_usd else None,
+            wall_clock_s=result.wall_clock_s,
+            quality_score=verification.confidence if result.status == "passed" else None,
+            tags=["swarm:mythos", f"meta:status={result.status}"],
+        )
+        print(f"  Memory: stored query {report.query_id[:8]} | "
+              f"{len(report.candidate_ids)} candidates, {len(report.promoted_ids)} promoted | "
+              f"vectors: {report.vector_source}")
+    except Exception as exc:
+        print(f"  Memory: persistence failed ({exc})")
+    finally:
+        store.close()
+
+
 async def run_mythos(task: str, config: MythosConfig | None = None) -> MythosResult:
     """Run the full Mythos loop on a task.
 
     Lifecycle:
-        plan → execute → verify
+        [memory: prior findings] → plan → execute → verify
         if needs_work and budget allows → replan → execute → verify (up to max_replans)
-        else → finalize
+        else → finalize → [memory: verified summary as insight candidate]
     """
     cfg = config or MythosConfig()
+    store = _memory_open(cfg)
+    prior_findings = _memory_retrieve(store, task)
+    result = await _run_mythos_loop(task, cfg, prior_findings)
+    _memory_persist(store, result)
+    return result
+
+
+async def _run_mythos_loop(task: str, cfg: MythosConfig, prior_findings: str = "") -> MythosResult:
+    """plan → execute → verify → maybe replan; memory-free."""
     budget = CostBudget(ceiling_usd=cfg.cost_ceiling_usd, token_ceiling=cfg.token_ceiling)
 
     run_dir = artifact_mod.make_run_dir(task, cfg.output_dir)
@@ -96,10 +187,10 @@ async def run_mythos(task: str, config: MythosConfig | None = None) -> MythosRes
     # --- Initial planning round ---
     print(f"--- Round 0: Planner ---")
     t0 = time.monotonic()
-    plan = planner_mod.decompose(task, cfg)
+    plan = planner_mod.decompose(task, cfg, prior_findings=prior_findings)
     budget.charge(plan.cost_usd, tokens=plan.tokens)
     print(f"  Planner done [{time.monotonic()-t0:.1f}s] "
-          f"cost=${plan.cost_usd:.4f} budget=${budget.spent_usd:.2f}/${budget.ceiling_usd:.2f}")
+          f"cost={_fmt_cost(plan.cost_usd)} budget=${budget.spent_usd:.2f}/${budget.ceiling_usd:.2f}")
 
     if plan.error or not plan.sub_specs:
         # Couldn't even produce an initial plan
@@ -156,8 +247,8 @@ async def run_mythos(task: str, config: MythosConfig | None = None) -> MythosRes
         for o in executor_outputs:
             budget.charge(o.cost_usd, tokens=o.tokens)
         elapsed = time.monotonic() - t0
-        round_exec_cost = sum(o.cost_usd for o in executor_outputs)
-        print(f"  Executors done [{elapsed:.1f}s] cost=${round_exec_cost:.4f} "
+        round_exec_cost = _sum_known(o.cost_usd for o in executor_outputs)
+        print(f"  Executors done [{elapsed:.1f}s] cost={_fmt_cost(round_exec_cost)} "
               f"budget=${budget.spent_usd:.2f}/${budget.ceiling_usd:.2f}")
         artifact_mod.write_executors(run_dir, executor_outputs, round_n=round_n)
 
@@ -173,15 +264,17 @@ async def run_mythos(task: str, config: MythosConfig | None = None) -> MythosRes
         verification = verifier_mod.verify(task, plan, executor_outputs, cfg)
         budget.charge(verification.cost_usd, tokens=verification.tokens)
         print(f"  Verifier done [{time.monotonic()-t0:.1f}s] "
-              f"verdict={verification.verdict} cost=${verification.cost_usd:.4f} "
+              f"verdict={verification.verdict} cost={_fmt_cost(verification.cost_usd)} "
               f"budget=${budget.spent_usd:.2f}/${budget.ceiling_usd:.2f}")
+        for note in verification.gate_notes:
+            print(f"  Verifier gate: {note}")
         artifact_mod.write_verification(run_dir, verification, round_n=round_n)
 
         history.append({
             "round": round_n,
             "verdict": verification.verdict,
-            "exec_cost_usd": round(round_exec_cost, 4),
-            "verifier_cost_usd": round(verification.cost_usd, 4),
+            "exec_cost_usd": None if round_exec_cost is None else round(round_exec_cost, 4),
+            "verifier_cost_usd": None if verification.cost_usd is None else round(verification.cost_usd, 4),
             "cumulative_cost_usd": round(budget.spent_usd, 4),
         })
 
@@ -214,7 +307,7 @@ async def run_mythos(task: str, config: MythosConfig | None = None) -> MythosRes
         )
         budget.charge(plan.cost_usd, tokens=plan.tokens)
         print(f"  Replan done [{time.monotonic()-t0:.1f}s] "
-              f"cost=${plan.cost_usd:.4f} budget=${budget.spent_usd:.2f}/${budget.ceiling_usd:.2f}")
+              f"cost={_fmt_cost(plan.cost_usd)} budget=${budget.spent_usd:.2f}/${budget.ceiling_usd:.2f}")
         artifact_mod.write_plan(run_dir, plan, round_n=round_n + 1)
 
         if plan.error or not plan.sub_specs:
@@ -335,7 +428,7 @@ def _print_summary(result: MythosResult) -> None:
     print(f"\n{'='*60}")
     print(f"MYTHOS RUN COMPLETE — status: {result.status}")
     print(f"  rounds: {result.rounds}")
-    print(f"  cost:   ${result.cost_usd:.4f} (ceiling: ${result.final_plan.cost_usd + result.cost_usd:.2f})")
+    print(f"  cost:   ${result.cost_usd:.4f} (provider-reported cost only; unknown cost is n/a, never 0)")
     print(f"  wall:   {result.wall_clock_s:.1f}s")
     print(f"  output: {result.run_dir}")
     print(f"{'='*60}\n")

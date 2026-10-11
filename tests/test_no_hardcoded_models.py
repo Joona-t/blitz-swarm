@@ -4,7 +4,8 @@ The only files allowed to name a model are the two config files
 (blitz.toml, mythos.toml). Everything else names roles and tiers and
 resolves through backends.models.resolve_model.
 
-The scan skips pure comment lines; docstrings and string literals count.
+The scan skips pure comment lines; docstrings and string literals count,
+case-insensitively ("Sonnet-class agent" in prose is a hit).
 Run artifacts (output/, mythos-bench/artifacts/) are data, not code.
 """
 
@@ -30,7 +31,8 @@ MODEL_LITERAL = re.compile(
     r"|\bgemini-[0-9]"
     r"|\bqwen[0-9]"
     r"|\bllama[0-9]"
-    r"|\bo[1-9]-(?:mini|pro)\b"
+    r"|\bo[1-9]-(?:mini|pro)\b",
+    re.IGNORECASE,                           # "Sonnet-class" in prose counts too
 )
 
 
@@ -72,11 +74,13 @@ def scan(root: Path = ROOT) -> list[str]:
 
 def test_scanner_detects_a_planted_literal(tmp_path):
     (tmp_path / "x.py").write_text('MODEL = "sonnet"  # bad\n# opus in a comment is fine\n', encoding="utf-8")
+    (tmp_path / "z.py").write_text('"""A Haiku-class helper (prose counts)."""\n', encoding="utf-8")
     (tmp_path / "blitz.toml").write_text('m = "opus"\n', encoding="utf-8")
     (tmp_path / "y.toml").write_text('m = "gpt-5.5"\n', encoding="utf-8")
     hits = scan(tmp_path)
-    assert len(hits) == 2, hits
+    assert len(hits) == 3, hits
     assert any("x.py:1" in h for h in hits)
+    assert any("z.py:1" in h for h in hits)
     assert any("y.toml:1" in h for h in hits)
 
 
