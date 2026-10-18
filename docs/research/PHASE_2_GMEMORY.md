@@ -1,5 +1,7 @@
 # Phase 2 G-Memory Tier 2/3 — Implementation Deep Dive
 
+> **Superseded 2026-10-11 (v0.3.0).** Frozen 2026-05-09 design output; kept as history. What actually shipped is in `README.md`, `docs/IMPLEMENTATION_STATUS.md` and `docs/CLAIMS_AND_EVIDENCE.md`. Paths below that do not exist in the tree are marked `[never created]`. Dollar figures below assumed paid Anthropic API pricing; every default path runs on the user's own CLI subscription (rule #10), so read them as **token budgets**, not spend — see the note in each budget section.
+
 **Status:** Frozen research output from background-task agent run 2026-05-09.
 **Source:** Phase 2 G-Memory deep-dive subagent.
 **Consumed by:** `gmemory/` implementation.
@@ -698,7 +700,7 @@ ig.promote_to_insight()
 ### 7.2 Nightly aggregation
 
 ```bash
-# scripts/nightly-gmemory-aggregate.sh
+# scripts/nightly-gmemory-aggregate.sh   (exists; never scheduled — docs/IMPLEMENTATION_STATUS.md)
 python -c "from gmemory.insight_graph import InsightGraph
 from gmemory.query_graph import QueryGraph
 qg = QueryGraph(); qg.initialize()
@@ -747,7 +749,7 @@ Total: ~1100 lines Python, ~150 lines SQL, ~150 lines test fixtures.
 2. **Promotion gate's N=3 isn't strictly GAM-style.** GAM uses LLM-discrimination at session boundaries. Our N=3 + cluster-cosine is structural adaptation. Documented in `gmemory/promotion.py` docstring.
 3. **Tags are 5 fixed axes, not free-form.** Opinionated for queryability vs flexibility.
 4. **`QueryGraph` shares `_db` with `InsightGraph`** — couples at connection level for atomic transactions. Atomicity wins.
-5. **Existing `memory/writer.py:_find_related_queries` has distance-type bug** (treats `_distance` as L2 with normalized vectors). New code fixes with explicit `distance_type("cosine")`. One-shot migration: `scripts/migrate-distance-type.py`. Logged as `BUG-001`.
+5. **Existing `memory/writer.py:_find_related_queries` has distance-type bug** (treats `_distance` as L2 with normalized vectors). New code fixes with explicit `distance_type("cosine")`. One-shot migration: `scripts/migrate-distance-type.py` `[never created — the LanceDB path was removed in v0.3.0 (research-docs-08); the migration that exists is `scripts/migrate_memory_db.py`]`. Logged as `BUG-001`.
 
 ---
 

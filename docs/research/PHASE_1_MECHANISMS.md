@@ -1,5 +1,7 @@
 # Phase 1 Mechanism Upgrades — Implementation Deep Dive
 
+> **Superseded 2026-10-11 (v0.3.0).** Frozen 2026-05-09 design output; kept as history. What actually shipped is in `README.md`, `docs/IMPLEMENTATION_STATUS.md` and `docs/CLAIMS_AND_EVIDENCE.md`. Paths below that do not exist in the tree are marked `[never created]`. Dollar figures below assumed paid Anthropic API pricing; every default path runs on the user's own CLI subscription (rule #10), so read them as **token budgets**, not spend — see the note in each budget section.
+
 **Status:** Frozen research output from background-task agent run 2026-05-09.
 **Source:** Phase 1 mechanism deep-dive subagent.
 **Consumed by:** `mechanisms/`, `prompts/`, `agents.py`, `consensus.py`, `orchestrator.py` implementation.

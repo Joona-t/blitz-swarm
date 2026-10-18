@@ -1,5 +1,7 @@
 # mythos-bench — comparison
 
+> **STALE — 2026-10-11.** These 4 rows were produced on 2026-05-10 on the pre-v0.3 Claude `claude -p` path (planner/verifier on the then-`opus` alias). v0.3.0 replaced that path with the config-driven backend layer (planner/verifier = `fable` on claude by default; Codex optional) and these results were **not regenerated** — doing so needs live LLM runs and is deferred (`docs/ROADMAP.md` item 2). Do not cite for v0.3.0.
+
 _Generated 2026-05-10 20:27 from mythos-bench/results/runs.jsonl (4 run(s))._
 
 ## All runs

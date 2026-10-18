@@ -1,18 +1,170 @@
 # Blitz-Swarm Configuration
+#
+# This file is the ONLY place model names live. Code names roles and tiers;
+# `[models]` maps roles to tiers, `[backend.providers.<id>.tiers]` maps tiers
+# to provider-native model strings. Resolution: backends/models.py
+# (override --model / BLITZ_MODEL -> BLITZ_MODEL_<ROLE> -> role tier ->
+# default tier -> provider legacy `model` -> error). `--list-models` prints
+# the resolved table for a backend without calling anything.
 
 [swarm]
 max_rounds = 4
-default_model = "sonnet"
 timeout_seconds = 300
 max_agents = 10
+quality_profile = "max"
 # Domain preset for role prompts. Loads from prompts/<domain>/.
 # Built-in: "general" (default), "crypto" (v0.1.x trading-research preset).
 # Custom domains: drop a folder in prompts/ with the same role files.
-domain = "crypto"
+domain = "general"
 # MAR-style persona-typed critics (factual / logical / counterfactual).
 # Off by default — flip to true to use the persona registry from
 # prompts/loader.py::assign_personas. Phase 1 mechanism (arXiv 2512.20845).
 persona_critics = false
+
+[models]
+# Role -> tier. Tiers are abstract; providers map them to real model strings below.
+default       = "standard"
+researcher    = "standard"
+critic        = "standard"
+fact_checker  = "standard"
+quality_judge = "standard"
+synthesizer   = "deep"
+judge         = "standard"     # judge_ensemble + selector pairwise judges
+planner       = "deep"         # mythos (also agents.py LLM planning)
+executor      = "fast"         # mythos
+verifier      = "deep"         # mythos
+memory_ops    = "fast"         # gmemory LLM helpers
+guard         = "fast"         # cascade_guard LLM hooks (when enabled)
+
+[backend]
+default = "codex"
+# Leave empty to fail clearly when the default provider is unavailable. Add
+# provider ids like ["claude", "ollama"] to retry ONCE on the next provider
+# when a call errors for an "unavailable"-class reason (CLI missing, server
+# down, rate-limited). Timeouts and schema failures never fall back.
+fallback = []
+
+# ---------------------------------------------------------------------------
+# Claude Code CLI. Model strings are whatever `claude --model` accepts:
+# aliases (fable / opus / sonnet / haiku) or full ids (claude-fable-5-1).
+# `deep` = Fable 5.1 with effort "max" — this is what Mythos mode runs on.
+# ---------------------------------------------------------------------------
+[backend.providers.claude]
+adapter = "claude_cli"
+reasoning_effort = "high"        # provider-wide default; [effort] overrides per tier
+sandbox = "read-only"
+approval_policy = "never"
+ephemeral = true
+[backend.providers.claude.tiers]
+fast = "haiku"
+standard = "sonnet"
+deep = "fable"                   # Fable 5.1 (alias accepted by claude --model); or "claude-fable-5-1"
+[backend.providers.claude.effort]
+deep = "max"                     # claude --effort {low, medium, high, xhigh, max}
+
+# ---------------------------------------------------------------------------
+# Codex CLI (default backend).
+# ---------------------------------------------------------------------------
+[backend.providers.codex]
+adapter = "codex_cli"
+reasoning_effort = "high"        # codex model_reasoning_effort {minimal, low, medium, high, xhigh}
+sandbox = "read-only"
+approval_policy = "never"
+ephemeral = true
+[backend.providers.codex.tiers]
+fast = "gpt-5.5"
+standard = "gpt-5.5"
+deep = "gpt-5.5"
+
+# ---------------------------------------------------------------------------
+# Gemini CLI. Not installed on the reference machine; model ids unverified —
+# adjust to what `gemini -m` accepts for you.
+# ---------------------------------------------------------------------------
+[backend.providers.gemini]
+adapter = "gemini_cli"
+[backend.providers.gemini.tiers]
+fast = "gemini-2.5-flash"
+standard = "gemini-2.5-pro"
+deep = "gemini-2.5-pro"
+
+# ---------------------------------------------------------------------------
+# Ollama native API (/api/generate).
+# ---------------------------------------------------------------------------
+[backend.providers.ollama]
+adapter = "ollama_http"
+base_url = "http://localhost:11434"
+sandbox = "read-only"
+approval_policy = "never"
+ephemeral = true
+[backend.providers.ollama.tiers]
+fast = "qwen2.5:7b"
+standard = "qwen2.5:7b"
+deep = "qwen2.5:7b"
+
+# ---------------------------------------------------------------------------
+# Any OpenAI-compatible LOCAL endpoint (sparkd, LM Studio, llama.cpp server,
+# vLLM, ollama /v1) — no code change. `api_key_env` is optional: the NAME of
+# an env var holding a bearer token for local servers that require one.
+# Model ids are whatever the server lists under GET /models.
+# ---------------------------------------------------------------------------
+[backend.providers.local]
+adapter = "openai_http"
+base_url = "http://localhost:8080/v1"
+# api_key_env = "LOCAL_LLM_TOKEN"
+[backend.providers.local.tiers]
+fast = "local-model"
+standard = "local-model"
+deep = "local-model"
+
+# ---------------------------------------------------------------------------
+# Any other CLI — argv template, no code change. Placeholders: {model}
+# {prompt} {prompt_file} {system_prompt} {schema_file} {output_file} {effort}
+# {cwd}. Without {prompt}/{prompt_file} the prompt is piped on stdin. An
+# element whose placeholder has no value (no schema, no effort) is dropped
+# together with the flag before it. See backends/adapters/templates.py.
+# ---------------------------------------------------------------------------
+[backend.providers.mycli]
+adapter = "generic_cli"
+command = ["mycli", "--model", "{model}", "--prompt-file", "{prompt_file}", "--schema", "{schema_file}"]
+[backend.providers.mycli.tiers]
+fast = "mycli-small"
+standard = "mycli-default"
+deep = "mycli-large"
+
+# Optional per-provider pricing, consumed by metrics.py for cost reporting.
+# Absent -> cost is reported as n/a (never 0). USD per million tokens.
+# [backend.providers.claude.pricing."claude-fable-5-1"]
+# input_per_mtok = 15.0
+# output_per_mtok = 75.0
+
+[guard]
+enabled = true
+# off / speed / balanced / strict: heuristic word-overlap screen (logged as
+# "heuristic screen" — it is NOT LLM adjudication). "max": real LLM claim
+# decomposition + contradiction adjudication on the `guard` role tier.
+mode = "balanced"
+
+[evolve]
+# EXPERIMENTAL, unwired: evolve/ (GEPA, AFlow, meta-loop), heterogeneity/
+# and scripts/optimize_prompts.py refuse to run while this is false.
+enabled = false
+gepa_max_metric_calls = 1500
+aflow_max_iters = 50
+
+[judge_ensemble]
+enabled = true
+n_judges = 3
+ks_threshold = 0.05
+ks_consecutive = 2
+min_rounds = 2
+# Stopping rule: evaluator unanimity + holdout override is PRIMARY. Set
+# halt = true to let the ensemble's KS-stop also halt the swarm (secondary).
+halt = false
+
+[selector]
+enabled = true
+granularity = "section"
+n_judges = 3
 
 [memory]
 max_context_tokens = 2000
@@ -21,6 +173,7 @@ hop_expansion = 1
 insight_dedup_threshold = 0.85
 query_link_threshold = 0.7
 llm_ops_threshold = 10  # activate LLM memory ops after this many queries
+gmemory_tier = 3
 
 [redis]
 host = "localhost"
@@ -29,8 +182,7 @@ db = 0
 
 [storage]
 sqlite_path = "memory.db"
-lancedb_path = "./memory_vectors"
-output_dir = "./output"
+output_dir = "./output"     # also holds metrics.jsonl and scratch/<run_id>/ cwds
 
 [eviction]
 query_archive_days = 90

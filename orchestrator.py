@@ -8,34 +8,63 @@ Usage:
 
 import asyncio
 import json
+import os
 import re
-import subprocess
+import shutil
 import sys
 import time
 import uuid
 from datetime import datetime
 from pathlib import Path
+from typing import Literal
 
 from agents import (
-    AGENT_OUTPUT_SCHEMA_JSON,
+    AGENT_OUTPUT_SCHEMA,
     BlitzAgent,
     plan_agents,
 )
-from config import load_config
+from backends import AgentBackend, AgentCall, make_provider_backend
+from backends.models import ModelResolutionError, ResolvedModel, format_models_table, resolve_model
+from blackboard import Blackboard, InMemoryBlackboard
+from config import ConfigError, load_config
 from consensus import (
     check_consensus,
     extract_dissent,
+    final_votes,
     format_convergence_report,
     format_dissent_section,
     should_override_holdout,
 )
-from metrics import MetricsCollector
+from context import fence_agent_output
+from mechanisms.cascade_guard import CascadeGuard
+from mechanisms.judge_ensemble import JudgeConfig, JudgeEnsemble, JudgeVote
+from mechanisms.selector_synth import (
+    PairwiseVerdict,
+    SelectorConfig as MechanismSelectorConfig,
+    SelectorSynth,
+    Span,
+)
+from metrics import METRICS_PATH, MetricsCollector
 
 # ---------------------------------------------------------------------------
 # Constants — loaded from config.py / blitz.toml
 # ---------------------------------------------------------------------------
 
-_config = load_config()
+
+def _load_config_or_die():
+    """Import-time config load. As the CLI entrypoint a malformed blitz.toml
+    is a one-line error + exit 2, never a traceback (core-loop-07); when
+    imported as a module the ConfigError propagates to the caller."""
+    try:
+        return load_config()
+    except ConfigError as exc:
+        if __name__ == "__main__":
+            print(f"blitz-swarm: config error: {exc}", file=sys.stderr)
+            sys.exit(2)
+        raise
+
+
+_config = _load_config_or_die()
 
 DEFAULT_MAX_ROUNDS = _config.swarm.max_rounds
 AGENT_TIMEOUT_SECONDS = _config.swarm.timeout_seconds
@@ -45,27 +74,228 @@ if not OUTPUT_DIR.is_absolute():
 MAX_CONTEXT_TOKENS = _config.memory.max_context_tokens
 MAX_CONTEXT_CHARS = MAX_CONTEXT_TOKENS * 4
 
+# Consensus-mode agents answer from knowledge: no tools, one turn. These are
+# the explicit per-call fields the adapters forward (core-loop-04).
+CONSENSUS_TOOLS: list[str] | None = None
+CONSENSUS_MAX_TURNS = 1
+
+STAGING_BANNER = (
+    "Staging: round 1: researchers → evaluators → judges (data dependency); "
+    "round 2+: single blast"
+)
+
+
+def scratch_cwd(run_id: str | None = None) -> Path:
+    """Working directory for every CLI invocation of a run:
+    `<output_dir>/scratch/<run_id>/` — never the repo root (core-loop-04)."""
+    path = OUTPUT_DIR / "scratch" / (run_id or f"adhoc_{os.getpid()}")
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+JUDGE_VOTE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "rubric_scores": {"type": "object"},
+        "aggregate_score": {"type": "number", "minimum": 0, "maximum": 10},
+        "rationale": {"type": "string"},
+    },
+    "required": ["aggregate_score", "rationale"],
+}
+
+def _judge_vote_schema(rubric_dims: tuple[str, ...]) -> dict:
+    """JUDGE_VOTE_SCHEMA with rubric_scores keyed by the actual rubric dims.
+
+    A free-form `{"type": "object"}` cannot be expressed in Codex's strict
+    structured-output mode, so the scores would be forced to `{}`. Naming
+    the dimensions keeps per-dimension scores on every backend (BUG-002).
+    """
+    schema = json.loads(json.dumps(JUDGE_VOTE_SCHEMA))
+    schema["properties"]["rubric_scores"] = {
+        "type": "object",
+        "properties": {
+            dim: {"type": "number", "minimum": 0, "maximum": 10}
+            for dim in rubric_dims
+        },
+        "required": list(rubric_dims),
+    }
+    return schema
+
+
+PAIRWISE_VERDICT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "winner": {"type": "string", "enum": ["a", "b", "tie"]},
+        "rationale": {"type": "string"},
+    },
+    "required": ["winner", "rationale"],
+}
+
+# ---------------------------------------------------------------------------
+# Backend/runtime helpers
+# ---------------------------------------------------------------------------
+
+
+FeatureOverride = Literal[True, False, None]
+
+
+def _backend_settings(
+    *,
+    cfg=None,
+    backend_id: str | None = None,
+    sandbox: str | None = None,
+):
+    """Resolve backend/provider settings without mutating loaded config."""
+    cfg = cfg or load_config()
+    selected = backend_id or cfg.backend.default or "codex"
+    try:
+        provider = cfg.backend.get_provider(selected)
+    except KeyError:
+        raise ValueError(f"Unknown backend '{selected}'")
+    resolved_sandbox = sandbox or provider.sandbox or "read-only"
+    return cfg, selected, provider, resolved_sandbox
+
+
+def _resolved_for_agent(agent: BlitzAgent, backend_id: str, cfg) -> ResolvedModel:
+    """Resolve the agent's model+effort through [models] role tiers -> provider tiers.
+
+    `agent.model` is not consulted: the role tier, `--model` / `BLITZ_MODEL` /
+    `BLITZ_MODEL_<ROLE>` are the contract (backends/models.py). Raises
+    ModelResolutionError, never a silent default.
+    """
+    return resolve_model(agent.role, backend_id, cfg)
+
+
+def _model_for_agent(agent: BlitzAgent, backend_id: str, provider, cfg) -> str:
+    """Model string for `agent` (see `_resolved_for_agent`)."""
+    return _resolved_for_agent(agent, backend_id, cfg).model
+
+
+def _model_label(role: str, backend_id: str, cfg) -> str:
+    """`<model> (<tier>, effort=<e>)` for dry-run / banner prints; a resolution
+    error is shown inline instead of raised so dry runs stay informative."""
+    try:
+        r = resolve_model(role, backend_id, cfg)
+    except ModelResolutionError as exc:
+        return f"! {exc}"
+    return f"{r.model} ({r.tier}, effort={r.effort or '-'})"
+
+
+def _make_runtime_backend(
+    *,
+    cfg=None,
+    backend_id: str | None = None,
+    sandbox: str | None = None,
+) -> AgentBackend:
+    cfg, selected, provider, resolved_sandbox = _backend_settings(
+        cfg=cfg,
+        backend_id=backend_id,
+        sandbox=sandbox,
+    )
+    # Data-driven by provider.adapter; wraps the [backend] fallback chain so
+    # an "unavailable"-class error is retried once on the next provider.
+    return make_provider_backend(selected, cfg, sandbox=resolved_sandbox)
+
+
+def _feature_enabled(
+    *,
+    profile: str,
+    configured: bool,
+    override: FeatureOverride,
+    enabled_in_max: bool = True,
+    name: str | None = None,
+) -> bool:
+    # Highest precedence: BLITZ_FEATURE_OVERRIDES env var — a JSON object
+    # mapping feature name -> bool, e.g. '{"judge_ensemble": false}'.
+    # Lets jobs/CI force-toggle a mechanism without touching profile or
+    # config. Malformed JSON or a non-dict payload is ignored (fall through
+    # to the normal precedence chain) so a bad env var can never break a run.
+    if name:
+        raw = os.environ.get("BLITZ_FEATURE_OVERRIDES")
+        if raw:
+            try:
+                env_overrides = json.loads(raw)
+            except (json.JSONDecodeError, ValueError):
+                env_overrides = None
+            if isinstance(env_overrides, dict) and name in env_overrides:
+                return bool(env_overrides[name])
+    if override is not None:
+        return override
+    profile = (profile or "balanced").lower()
+    if profile == "max" and enabled_in_max:
+        return True
+    if profile == "cheap":
+        return False
+    return bool(configured)
+
+
+def _apply_guard(
+    guard: CascadeGuard | None,
+    outputs: list[dict],
+    round_n: int,
+) -> list[dict]:
+    if guard is None:
+        for output in outputs:
+            output.setdefault("_round", round_n)
+        return outputs
+    guarded = [guard.on_agent_output(output, round_n) for output in outputs]
+    summary = guard.round_summary(round_n)
+    if summary.blocked_outputs or summary.tainted_descendants:
+        print(
+            f"  Cascade guard: blocked={summary.blocked_outputs} "
+            f"tainted_descendants={summary.tainted_descendants}"
+        )
+    return guarded
+
+
+def _filter_guarded(guard: CascadeGuard | None, outputs: list[dict]) -> list[dict]:
+    return guard.filter_context(outputs) if guard is not None else list(outputs)
+
+
 # ---------------------------------------------------------------------------
 # Agent invocation
 # ---------------------------------------------------------------------------
 
 
-def invoke_agent(agent: BlitzAgent, context: str, task: str,
-                  max_retries: int = 1) -> dict:
-    """Invoke a single agent as a subprocess via the Claude CLI.
+def invoke_agent(
+    agent: BlitzAgent,
+    context: str,
+    task: str,
+    max_retries: int = 1,
+    *,
+    backend: AgentBackend | None = None,
+    backend_id: str | None = None,
+    sandbox: str | None = None,
+    cfg=None,
+    scratch_dir: Path | None = None,
+) -> dict:
+    """Invoke a single agent through the configured backend layer.
 
-    Retries once on parse failure. Extracts cost data from the CLI envelope.
-    Attempts partial output recovery on timeout.
+    Retries once on parse/schema failure and normalizes telemetry across
+    Codex, Claude, and Gemini adapters. Runs with no tools, one turn, in
+    `scratch_dir` (default: an ad-hoc output/scratch/ dir).
     """
     agent_label = f"{agent.role}({agent.id})"
     trace_id = str(uuid.uuid4())
-    _envelope_cost = {}  # cost data extracted from CLI envelope
+    scratch_dir = scratch_dir or scratch_cwd()
+    cfg, selected_backend, provider, resolved_sandbox = _backend_settings(
+        cfg=cfg,
+        backend_id=backend_id,
+        sandbox=sandbox,
+    )
+    active_backend = backend or _make_runtime_backend(
+        cfg=cfg,
+        backend_id=selected_backend,
+        sandbox=resolved_sandbox,
+    )
+    resolved = _resolved_for_agent(agent, selected_backend, cfg)
+    model = resolved.model
+    _telemetry = {}
 
     def _tag(output: dict) -> dict:
-        """Inject trace metadata and cost data into every output."""
+        """Inject trace metadata and backend telemetry into every output."""
         output["_trace_id"] = trace_id
         output["_wall_clock_s"] = round(time.monotonic() - _invoke_start, 1)
-        output.update(_envelope_cost)
+        output.update(_telemetry)
         return output
 
     _invoke_start = time.monotonic()
@@ -73,82 +303,82 @@ def invoke_agent(agent: BlitzAgent, context: str, task: str,
     for attempt in range(1 + max_retries):
         user_prompt = _build_user_prompt(agent, context, task)
 
-        cmd = [
-            "claude",
-            "-p", user_prompt,
-            "--system-prompt", agent.system_prompt,
-            "--output-format", "json",
-            "--model", agent.model,
-            "--max-turns", "3",
-            "--dangerously-skip-permissions",
-        ]
-
-        start = time.monotonic()
-
         try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=AGENT_TIMEOUT_SECONDS,
-            )
-            elapsed = time.monotonic() - start
+            result = active_backend.call(AgentCall(
+                role=agent.role,
+                model_role=agent.role,
+                prompt=user_prompt,
+                system_prompt=agent.system_prompt,
+                schema=AGENT_OUTPUT_SCHEMA,
+                model=model,
+                timeout_s=AGENT_TIMEOUT_SECONDS,
+                cwd=scratch_dir,
+                sandbox=resolved_sandbox,
+                approval_policy=provider.approval_policy,
+                reasoning_effort=resolved.effort or provider.reasoning_effort or None,
+                ephemeral=provider.ephemeral,
+                tools=CONSENSUS_TOOLS,
+                max_turns=CONSENSUS_MAX_TURNS,
+            ))
+            _telemetry = {
+                "_backend_id": result.backend_id,
+                "_model": result.model or model,
+                "_elapsed_s": round(result.elapsed_s, 1),
+                "_cost_usd": result.cost_usd,
+                "_input_tokens": result.input_tokens,
+                "_output_tokens": result.output_tokens,
+                "_validation_errors": result.validation_errors,
+                "backend_id": result.backend_id,
+                "model": result.model or model,
+                "elapsed_s": round(result.elapsed_s, 1),
+                "errored": result.errored,
+                "raw_stdout": result.raw_stdout[-4000:],
+                "parsed": result.parsed,
+                "cost_usd": result.cost_usd,
+                "input_tokens": result.input_tokens,
+                "output_tokens": result.output_tokens,
+            }
 
-            # Extract cost data from CLI envelope before parsing
-            try:
-                _env = json.loads(result.stdout)
-                if isinstance(_env, dict):
-                    _envelope_cost["_cost_usd"] = _env.get("total_cost_usd", 0)
-                    _usage = _env.get("usage", {})
-                    _envelope_cost["_input_tokens"] = _usage.get("input_tokens", 0)
-                    _envelope_cost["_output_tokens"] = _usage.get("output_tokens", 0)
-            except (json.JSONDecodeError, TypeError):
-                pass
+            if result.errored and result.parsed is None:
+                print(f"  {agent_label} ERROR: {result.error or 'backend failure'}")
+                return _tag(_error_output(agent, result.error or "backend failure"))
 
-            if result.returncode != 0:
-                stderr = (result.stderr or "")[:300]
-                stdout_preview = (result.stdout or "")[:300]
-                print(f"  {agent_label} ERROR: exit {result.returncode}")
-                if stderr:
-                    print(f"    stderr: {stderr}")
-                if stdout_preview:
-                    print(f"    stdout: {stdout_preview}")
-                return _tag(_error_output(agent, f"Exit code {result.returncode}"))
-
-            output = _parse_agent_output(agent, result.stdout)
+            if result.parsed:
+                output = dict(result.parsed)
+                output["agent_id"] = agent.id
+                output["role"] = agent.role
+            else:
+                output = _parse_agent_output(agent, result.text or result.raw_stdout)
 
             # Retry on malformed output (raw text, not structured JSON)
-            if output.get("_raw") and attempt < max_retries:
-                print(f"  {agent_label} malformed output, retrying [{elapsed:.1f}s]")
+            if (output.get("_raw") or result.validation_errors) and attempt < max_retries:
+                print(
+                    f"  {agent_label} malformed output, retrying "
+                    f"[{result.elapsed_s:.1f}s]"
+                )
                 task = (
                     f"{task}\n\n"
-                    f"IMPORTANT: Your previous response was not valid JSON. "
-                    f"Respond with ONLY a JSON object, no other text."
+                    "IMPORTANT: Your previous response did not satisfy the "
+                    "required JSON schema. Respond with ONLY a JSON object, "
+                    "no other text."
                 )
                 continue
 
+            if result.validation_errors:
+                output["_raw"] = True
+                output["gaps_identified"] = output.get("gaps_identified", []) + [
+                    "Backend result failed schema validation"
+                ]
+                output["quality_vote"] = output.get("quality_vote") or "needs_work"
+                output["quality_notes"] = (
+                    output.get("quality_notes", "")
+                    or "; ".join(result.validation_errors[:3])
+                )
+
             if not output.get("_error"):
                 retry_note = f" (retry {attempt})" if attempt > 0 else ""
-                print(f"  {agent_label} done [{elapsed:.1f}s]{retry_note}")
+                print(f"  {agent_label} done [{result.elapsed_s:.1f}s]{retry_note}")
             return _tag(output)
-
-        except subprocess.TimeoutExpired as e:
-            elapsed = time.monotonic() - start
-            # Try to recover partial output from the timed-out process
-            partial_stdout = ""
-            if e.stdout:
-                partial_stdout = (
-                    e.stdout if isinstance(e.stdout, str)
-                    else e.stdout.decode("utf-8", errors="replace")
-                )
-            if partial_stdout.strip():
-                output = _parse_agent_output(agent, partial_stdout)
-                if not output.get("_raw") and not output.get("_error"):
-                    output["_partial"] = True
-                    print(f"  {agent_label} TIMEOUT [{elapsed:.1f}s] (recovered partial output)")
-                    return _tag(output)
-            print(f"  {agent_label} TIMEOUT [{elapsed:.1f}s]")
-            return _tag(_error_output(agent, f"Timed out after {AGENT_TIMEOUT_SECONDS}s"))
 
         except Exception as e:
             print(f"  {agent_label} EXCEPTION: {e}")
@@ -300,6 +530,7 @@ def _error_output(agent: BlitzAgent, error_msg: str) -> dict:
         "quality_notes": f"Agent error: {error_msg}",
         "dissent": "",
         "_error": True,
+        "_error_msg": error_msg,
     }
 
 
@@ -308,10 +539,30 @@ def _error_output(agent: BlitzAgent, error_msg: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
-async def blast_agents(agents: list[BlitzAgent], context: str, task: str) -> list[dict]:
+async def blast_agents(
+    agents: list[BlitzAgent],
+    context: str,
+    task: str,
+    *,
+    backend: AgentBackend | None = None,
+    backend_id: str | None = None,
+    sandbox: str | None = None,
+    cfg=None,
+    scratch_dir: Path | None = None,
+) -> list[dict]:
     """Invoke all agents in parallel and collect their outputs."""
     coros = [
-        asyncio.to_thread(invoke_agent, agent, context, task)
+        asyncio.to_thread(
+            invoke_agent,
+            agent,
+            context,
+            task,
+            backend=backend,
+            backend_id=backend_id,
+            sandbox=sandbox,
+            cfg=cfg,
+            scratch_dir=scratch_dir,
+        )
         for agent in agents
     ]
     return list(await asyncio.gather(*coros))
@@ -324,6 +575,11 @@ async def blast_agents(agents: list[BlitzAgent], context: str, task: str) -> lis
 
 def build_context(outputs: list[dict], for_role: str = "") -> str:
     """Build a role-filtered context string from agent outputs.
+
+    `outputs` is the round snapshot read back from the blackboard
+    (`bb.read_all_outputs()` / `bb.read_round_outputs(n)`), never a
+    separate in-memory list (core-loop-02). Every injected output is
+    wrapped in the untrusted-data fence (context.fence_agent_output).
 
     - Researchers see: prior researcher findings + critic feedback
     - Critics/Fact-checkers/Judges see: all researcher findings + prior critic feedback
@@ -341,18 +597,22 @@ def build_context(outputs: list[dict], for_role: str = "") -> str:
     fc_outputs = by_role.get("fact_checker", [])
     judge_outputs = by_role.get("quality_judge", [])
 
+    def _fenced(o: dict, body: str) -> str:
+        return fence_agent_output(o.get("agent_id", "unknown"), body)
+
     # All roles see researcher findings
     if researcher_outputs:
         sections.append("### Researcher Findings")
         for o in researcher_outputs:
             aid = o.get("agent_id", "unknown")
-            findings = o.get("findings", "")[:800]
-            kps = o.get("key_points", [])
-            conf = o.get("confidence", 0)
-            sections.append(f"**{aid}** (confidence: {conf:.0%}):")
-            sections.append(findings)
+            findings = (o.get("findings", "") or "")[:800]
+            kps = o.get("key_points", []) or []
+            conf = o.get("confidence", 0) or 0
+            body = findings
             if kps:
-                sections.append("Key points: " + "; ".join(kps[:5]))
+                body += "\nKey points: " + "; ".join(str(k) for k in kps[:5])
+            sections.append(f"**{aid}** (confidence: {conf:.0%}):")
+            sections.append(_fenced(o, body))
             sections.append("")
 
     # Evaluators and synthesizer see critic + fact-checker feedback
@@ -360,20 +620,20 @@ def build_context(outputs: list[dict], for_role: str = "") -> str:
         if critic_outputs:
             sections.append("### Critic Feedback")
             for o in critic_outputs:
-                sections.append(o.get("findings", "")[:500])
+                sections.append(_fenced(o, (o.get("findings", "") or "")[:500]))
                 sections.append("")
 
         if fc_outputs:
             sections.append("### Fact-Checker Verification")
             for o in fc_outputs:
-                sections.append(o.get("findings", "")[:500])
+                sections.append(_fenced(o, (o.get("findings", "") or "")[:500]))
                 sections.append("")
 
     # Synthesizer also sees judge feedback
     if for_role == "synthesizer" and judge_outputs:
         sections.append("### Quality Judge Assessment")
         for o in judge_outputs:
-            sections.append(o.get("findings", "")[:500])
+            sections.append(_fenced(o, (o.get("findings", "") or "")[:500]))
             sections.append("")
 
     context = "\n".join(sections)
@@ -415,8 +675,8 @@ def format_final_output(
                 lines.append(o.get("findings", ""))
                 lines.append("")
 
-    all_flat = [o for rnd in all_round_outputs for o in rnd]
-    dissent = extract_dissent(all_flat)
+    # Only unresolved votes: each agent's LAST vote across rounds (core-loop-08).
+    dissent = extract_dissent(final_votes(all_round_outputs))
     dissent_section = format_dissent_section(dissent)
     if dissent_section:
         lines.append(dissent_section)
@@ -441,110 +701,444 @@ def save_output(topic: str, content: str) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def _try_connect_blackboard(use_redis: bool):
-    """Attempt to connect to Redis blackboard. Returns None if disabled or unavailable."""
-    if not use_redis:
-        return None
-    try:
-        from blackboard import Blackboard
-        bb = Blackboard()
-        return bb
-    except Exception as e:
-        print(f"Warning: Redis unavailable ({e}). Running in memory-only mode.\n")
-        return None
+def _open_blackboard(use_redis: bool, cfg=None):
+    """The run's blackboard: Redis-backed (`[redis]` in blitz.toml) when
+    requested and reachable, else the in-memory implementation of the same
+    interface. Never None — every round is written here and read back."""
+    cfg = cfg or _config
+    if use_redis:
+        try:
+            return Blackboard(host=cfg.redis.host, port=cfg.redis.port, db=cfg.redis.db)
+        except Exception as e:
+            print(f"Warning: Redis unavailable ({e}). Using the in-memory blackboard.\n")
+    return InMemoryBlackboard()
 
 
 def _write_to_blackboard(bb, round_n: int, outputs: list[dict]):
-    """Write round outputs to the blackboard if connected."""
-    if bb is None:
-        return
+    """Write round outputs to the blackboard."""
     for o in outputs:
         bb.write_agent_output(round_n, o.get("agent_id", "unknown"), o)
 
 
+def _read_prior_rounds(bb, round_n: int) -> list[dict]:
+    """Snapshot of every round before `round_n`, read back from the blackboard."""
+    outputs: list[dict] = []
+    for r in range(1, round_n):
+        outputs.extend(bb.read_round_outputs(r))
+    return outputs
+
+
+def _judge_ks_halt(round_outputs: list[dict], cfg) -> str | None:
+    """Secondary stopping rule (core-loop-03): with `[judge_ensemble] halt =
+    true`, a judge-ensemble KS-stop (`ks_stable` / `unanimous_saturation`)
+    halts the swarm. Returns the halt reason, or None. Unanimity + holdout
+    override stays the primary rule and is checked first by the caller."""
+    if not cfg.judge_ensemble.halt:
+        return None
+    for o in round_outputs:
+        if not o.get("_judge_ensemble"):
+            continue
+        log = o.get("_judge_state_log") or []
+        if log and log[-1].get("halted") and log[-1].get("halt_reason") in (
+            "ks_stable", "unanimous_saturation",
+        ):
+            return f"judge_ensemble:{log[-1]['halt_reason']}"
+    return None
+
+
 def _try_init_memory():
-    """Try to initialize the memory reader and writer. Returns (reader, writer) or (None, None)."""
+    """Open the G-Memory store at `[storage] sqlite_path` (migrating a legacy
+    memory/-schema file in place). Returns the store, or None when it cannot
+    be opened -- the swarm then runs without memory, never crashes."""
     try:
-        from memory.reader import MemoryReader
-        from memory.writer import MemoryWriter
+        from gmemory.store import MemoryStore
 
-        reader = MemoryReader()
-        reader.initialize()
-
-        writer = MemoryWriter()
-        writer.initialize()
-
-        return reader, writer
+        store = MemoryStore.open_default(_config)
+        st = store.stats()
+        print(f"Memory: {st['queries']} queries, {st['insights']} insights "
+              f"({st['insight_candidates']} candidates) | vectors: {st['vector_side']}")
+        return store
     except Exception as e:
         print(f"Warning: Memory system unavailable ({e})")
-        return None, None
+        return None
 
 
 def _persist_to_memory(
-    mem_writer, bb, topic, consensus_reached, override_applied,
+    mem_store, bb, topic, consensus_reached, override_applied,
     all_round_outputs, agents,
 ):
-    """Persist completed task to G-Memory storage and finalize blackboard."""
-    # Build interaction graph from round outputs
-    utterances = []
-    utterance_edges = []
-    prior_ids_by_round = {}
+    """Persist the completed task to G-Memory (all three tiers, promotion
+    gate, eviction cycle) and finalize the blackboard."""
+    if mem_store:
+        try:
+            report = mem_store.persist_task(
+                topic,
+                "resolved" if consensus_reached else "failed",
+                all_round_outputs,
+                n_agents=len(agents),
+                tags=["swarm:consensus", f"meta:override={'yes' if override_applied else 'no'}"],
+            )
+            print(f"Memory: stored query {report.query_id[:8]} | "
+                  f"{report.n_utterances} utterances, {len(report.candidate_ids)} candidates "
+                  f"({report.distilled_by}), {len(report.promoted_ids)} promoted | "
+                  f"vectors: {report.vector_source}"
+                  + (f" | eviction: {report.eviction}" if report.eviction else ""))
+        finally:
+            mem_store.close()
 
-    for round_n, round_outputs in enumerate(all_round_outputs):
-        current_ids = []
-        for o in round_outputs:
-            import uuid
-            utt_id = str(uuid.uuid4())
-            utterances.append({
-                "id": utt_id,
-                "agent_id": o.get("agent_id", ""),
-                "content": o.get("findings", "")[:500],
-                "epoch": round_n,
-                "timestamp": time.time(),
-            })
-            current_ids.append(utt_id)
-
-            # Link to prior round outputs (temporal causation)
-            for prior_id in prior_ids_by_round.get(round_n - 1, []):
-                utterance_edges.append((prior_id, utt_id))
-
-        prior_ids_by_round[round_n] = current_ids
-
-    # Generate insight from synthesizer output
-    synth_round = all_round_outputs[-1] if all_round_outputs else []
-    synth_output = next((o for o in synth_round if o.get("role") == "synthesizer"), None)
-    insight = ""
-    if synth_output:
-        # Use key points as a compact insight
-        kps = synth_output.get("key_points", [])
-        if kps:
-            insight = f"On '{topic}': " + "; ".join(kps[:3])
-
-    # Write to persistent memory
-    if mem_writer:
-        mem_writer.store_task(
-            topic=topic,
-            status="resolved" if consensus_reached else "failed",
-            utterances=utterances,
-            utterance_edges=utterance_edges,
-            insight=insight,
-        )
-
-    # Write to Redis + finalize blackboard
     if bb:
-        bb.queue_memory_write({
-            "type": "task_complete",
-            "topic": topic,
-            "rounds": len(all_round_outputs) - 1,
-            "consensus": consensus_reached,
-            "override": override_applied,
-            "agent_count": len(agents),
-        })
         bb.finalize()
 
-    # Cleanup
-    if mem_writer:
-        mem_writer.stop()
+
+# ---------------------------------------------------------------------------
+# Max-quality mechanisms
+# ---------------------------------------------------------------------------
+
+
+def _make_judge_fn(
+    *,
+    backend: AgentBackend,
+    cfg,
+    backend_id: str,
+    provider,
+    sandbox: str,
+    scratch_dir: Path | None = None,
+):
+    """Build JudgeEnsemble's pluggable LLM hook on top of AgentBackend.
+
+    The judge model is the `judge` role tier (blitz.toml [models].judge);
+    JudgeConfig.judge_models is filled from the same resolution by
+    `_run_judge_ensemble`, so `model_alias` is the resolved model string.
+    """
+    judge = resolve_model("judge", backend_id, cfg)
+    scratch_dir = scratch_dir or scratch_cwd()
+
+    def _judge(
+        candidate: str,
+        history: str,
+        judge_id: str,
+        model_alias: str,
+        seed: int,
+        rubric_dims: tuple[str, ...],
+    ) -> JudgeVote:
+        model = model_alias or judge.model
+        prompt = (
+            f"You are {judge_id}, an independent quality judge.\n\n"
+            f"Evaluate this candidate research output for the task.\n"
+            f"Rubric dimensions: {', '.join(rubric_dims)}.\n"
+            f"Score each dimension and provide an aggregate_score from 0 to 10.\n\n"
+            f"Prior debate history:\n{history or '[none]'}\n\n"
+            f"Candidate:\n{candidate}\n\n"
+            "Return JSON with aggregate_score, rationale, and optional "
+            "rubric_scores object."
+        )
+        result = backend.call(AgentCall(
+            role="judge_ensemble",
+            prompt=prompt,
+            system_prompt="Return JSON only. Be strict, independent, and concise.",
+            schema=_judge_vote_schema(tuple(rubric_dims)),
+            model=model,
+            timeout_s=min(AGENT_TIMEOUT_SECONDS, 90),
+            cwd=scratch_dir,
+            sandbox=sandbox,
+            approval_policy=provider.approval_policy,
+            reasoning_effort=judge.effort or provider.reasoning_effort or None,
+            ephemeral=provider.ephemeral,
+            tools=CONSENSUS_TOOLS,
+            max_turns=CONSENSUS_MAX_TURNS,
+        ))
+        parsed = result.parsed or {}
+        if result.errored and not parsed:
+            return JudgeVote(
+                judge_id=judge_id,
+                round_n=0,
+                rubric_scores={dim: 0.0 for dim in rubric_dims},
+                aggregate_score=0.0,
+                score_bucket=0,
+                rationale=result.error or "judge backend error",
+                model=model or "",
+                seed=seed,
+                errored=True,
+            )
+
+        raw_rubric = parsed.get("rubric_scores", {})
+        rubric: dict[str, float] = {}
+        for dim in rubric_dims:
+            value = 0.0
+            if isinstance(raw_rubric, dict) and raw_rubric.get(dim) is not None:
+                value = raw_rubric.get(dim, 0.0)
+            elif parsed.get(f"{dim}_score") is not None:
+                value = parsed.get(f"{dim}_score", 0.0)
+            elif parsed.get("aggregate_score") is not None:
+                value = parsed.get("aggregate_score", 0.0)
+            try:
+                rubric[dim] = max(0.0, min(10.0, float(value)))
+            except (TypeError, ValueError):
+                rubric[dim] = 0.0
+
+        aggregate = parsed.get("aggregate_score")
+        try:
+            aggregate_score = max(0.0, min(10.0, float(aggregate)))
+        except (TypeError, ValueError):
+            aggregate_score = sum(rubric.values()) / max(len(rubric), 1)
+
+        return JudgeVote(
+            judge_id=judge_id,
+            round_n=0,
+            rubric_scores=rubric,
+            aggregate_score=aggregate_score,
+            score_bucket=int(round(aggregate_score)),
+            rationale=str(parsed.get("rationale", "")),
+            model=model or "",
+            seed=seed,
+            errored=bool(result.validation_errors),
+        )
+
+    return _judge
+
+
+async def _run_judge_ensemble(
+    *,
+    topic: str,
+    candidate_outputs: list[dict],
+    history_outputs: list[dict],
+    backend: AgentBackend,
+    cfg,
+    backend_id: str,
+    provider,
+    sandbox: str,
+    scratch_dir: Path | None = None,
+) -> dict:
+    """Judge-ensemble vote. The N judge calls of every debate round fan out
+    via `asyncio.to_thread` + `gather` (JudgeEnsemble.round_async); awaited
+    on the event loop, never run inline (core-loop-01)."""
+    candidate = build_context(candidate_outputs, for_role="quality_judge")
+    history = build_context(history_outputs, for_role="quality_judge")
+    model = resolve_model("judge", backend_id, cfg).model
+    judge_cfg = JudgeConfig(
+        n_judges=cfg.judge_ensemble.n_judges,
+        ks_threshold=cfg.judge_ensemble.ks_threshold,
+        ks_consecutive=cfg.judge_ensemble.ks_consecutive,
+        min_rounds=cfg.judge_ensemble.min_rounds,
+        judge_models=tuple(model for _ in range(cfg.judge_ensemble.n_judges)),
+    )
+    ensemble = JudgeEnsemble(
+        judge_cfg,
+        judge_fn=_make_judge_fn(
+            backend=backend,
+            cfg=cfg,
+            backend_id=backend_id,
+            provider=provider,
+            sandbox=sandbox,
+            scratch_dir=scratch_dir,
+        ),
+    )
+
+    state = None
+    while not ensemble.is_stable():
+        state = await ensemble.round_async(candidate, history)
+        if state.halted:
+            break
+
+    score = ensemble.final_score()
+    if score is None and state is not None:
+        score = state.mean_score
+    score = score or 0.0
+    breakdown = ensemble.aggregate_breakdown()
+    halt_reason = state.halt_reason if state is not None else "not_started"
+    notes = f"Judge ensemble score {score:.1f}/10; halt_reason={halt_reason}"
+    return {
+        "agent_id": "judge_ensemble",
+        "role": "quality_judge",
+        "findings": (
+            f"## Judge Ensemble Assessment\n\n{notes}\n\n"
+            f"Topic: {topic}"
+        ),
+        "key_points": [
+            notes,
+            f"majority_bucket={ensemble.majority_vote()}",
+        ],
+        "confidence": max(0.0, min(1.0, score / 10.0)),
+        "gaps_identified": [] if score >= 7.0 else ["Quality score below readiness threshold"],
+        "quality_vote": "ready" if score >= 7.0 else "needs_work",
+        "quality_notes": notes,
+        "dissent": "" if score >= 7.0 else "Judge ensemble requested another iteration.",
+        "coverage_score": breakdown.get("coverage", 0.0),
+        "accuracy_score": breakdown.get("accuracy", 0.0),
+        "clarity_score": breakdown.get("clarity", 0.0),
+        "depth_score": breakdown.get("depth", 0.0),
+        "_judge_ensemble": True,
+        "_judge_state_log": [
+            {
+                "round_n": s.round_n,
+                "mean_score": s.mean_score,
+                "ks_stat": s.ks_stat,
+                "halted": s.halted,
+                "halt_reason": s.halt_reason,
+            }
+            for s in ensemble.state_log
+        ],
+    }
+
+
+def _make_pairwise_judge_fn(
+    *,
+    backend: AgentBackend,
+    cfg,
+    backend_id: str,
+    provider,
+    sandbox: str,
+    scratch_dir: Path | None = None,
+):
+    """Build SelectorSynth's pairwise judge hook on top of AgentBackend.
+
+    Pairwise judges run on the `judge` role tier (blitz.toml [models].judge).
+    """
+    judge = resolve_model("judge", backend_id, cfg)
+    scratch_dir = scratch_dir or scratch_cwd()
+
+    def _pairwise(span_a: Span, span_b: Span, topic: str, judge_id: str, seed: int) -> PairwiseVerdict:
+        model = judge.model
+        prompt = (
+            f"You are {judge_id}, judging two candidate research spans for: {topic}\n\n"
+            "Choose the span that is more accurate, specific, complete, and clear. "
+            "Return winner='a', winner='b', or winner='tie'.\n\n"
+            f"Span A:\n{span_a.text}\n\n"
+            f"Span B:\n{span_b.text}\n"
+        )
+        result = backend.call(AgentCall(
+            role="selector",
+            prompt=prompt,
+            system_prompt="Return JSON only with winner and rationale.",
+            schema=PAIRWISE_VERDICT_SCHEMA,
+            model=model,
+            timeout_s=min(AGENT_TIMEOUT_SECONDS, 90),
+            cwd=scratch_dir,
+            sandbox=sandbox,
+            approval_policy=provider.approval_policy,
+            reasoning_effort=judge.effort or provider.reasoning_effort or None,
+            ephemeral=provider.ephemeral,
+            tools=CONSENSUS_TOOLS,
+            max_turns=CONSENSUS_MAX_TURNS,
+        ))
+        parsed = result.parsed or {}
+        winner = parsed.get("winner", "tie")
+        if winner not in ("a", "b", "tie"):
+            winner = "tie"
+        return PairwiseVerdict(
+            judge_id=judge_id,
+            span_a_id=span_a.id,
+            span_b_id=span_b.id,
+            winner=winner,
+            rationale=str(parsed.get("rationale", result.error or "")),
+        )
+
+    return _pairwise
+
+
+async def _run_selector_synthesis(
+    *,
+    topic: str,
+    researcher_outputs: list[dict],
+    guard: CascadeGuard | None,
+    backend: AgentBackend,
+    cfg,
+    backend_id: str,
+    provider,
+    sandbox: str,
+    scratch_dir: Path | None = None,
+) -> dict:
+    """Selection-bottleneck synthesis. Every pairwise judgement fans out via
+    `asyncio.to_thread` + `gather` (SelectorSynth.synthesize_async)."""
+    judge_model = resolve_model("judge", backend_id, cfg).model
+    selector_cfg = MechanismSelectorConfig(
+        granularity=cfg.selector.granularity,
+        n_judges=cfg.selector.n_judges,
+        judge_models=tuple(judge_model for _ in range(cfg.selector.n_judges)),
+    )
+    selector = SelectorSynth(
+        selector_cfg,
+        pairwise_judge_fn=_make_pairwise_judge_fn(
+            backend=backend,
+            cfg=cfg,
+            backend_id=backend_id,
+            provider=provider,
+            sandbox=sandbox,
+            scratch_dir=scratch_dir,
+        ),
+    )
+    result = await selector.synthesize_async(
+        researcher_outputs,
+        topic=topic,
+        guard_filter=(lambda outs: _filter_guarded(guard, outs)) if guard else None,
+    )
+    ready = not result.final_text.startswith("[no ")
+    return {
+        "agent_id": "selector_synth",
+        "role": "synthesizer",
+        "findings": result.final_text,
+        "key_points": [
+            f"selected_spans={len(result.selected_span_ids)}",
+            f"judge_calls={result.diagnostics.get('judge_calls', 0)}",
+        ],
+        "confidence": 0.85 if ready else 0.0,
+        "gaps_identified": [] if ready else ["Selector synthesis had no usable inputs"],
+        "quality_vote": "ready" if ready else "needs_work",
+        "quality_notes": "Selection-bottleneck synthesis completed." if ready else result.final_text,
+        "dissent": "",
+        "_selector_synth": True,
+        "_selector_diagnostics": result.diagnostics,
+    }
+
+
+def _contribution_scores(outputs: list[dict]) -> dict[str, float]:
+    scores: dict[str, float] = {}
+    counts: dict[str, int] = {}
+    for output in outputs:
+        aid = output.get("agent_id")
+        if not aid:
+            continue
+        score = 0.0
+        if not output.get("_error") and not output.get("_raw") and not output.get("_blocked"):
+            score += 0.4
+        score += max(0.0, min(0.3, float(output.get("confidence", 0.0) or 0.0) * 0.3))
+        score += min(0.2, len(output.get("findings", "") or "") / 4000)
+        score += min(0.1, len(output.get("key_points", []) or []) / 50)
+        scores[aid] = scores.get(aid, 0.0) + score
+        counts[aid] = counts.get(aid, 0) + 1
+    return {aid: scores[aid] / max(counts.get(aid, 1), 1) for aid in scores}
+
+
+def _prune_low_contribution_agents(
+    agents: list[BlitzAgent],
+    outputs: list[dict],
+    *,
+    selector_enabled: bool,
+) -> list[BlitzAgent]:
+    """AgentDropout-style conservative pruning with role floors."""
+    if not outputs or len(agents) <= 3:
+        return agents
+    scores = _contribution_scores(outputs)
+    floors = {
+        "researcher": 2 if selector_enabled else 1,
+        "critic": 1,
+        "fact_checker": 1,
+        "quality_judge": 1,
+    }
+    by_role: dict[str, list[BlitzAgent]] = {}
+    for agent in agents:
+        by_role.setdefault(agent.role, []).append(agent)
+
+    removable = [
+        agent for agent in agents
+        if len(by_role.get(agent.role, [])) > floors.get(agent.role, 0)
+        and scores.get(agent.id, 1.0) < 0.2
+    ]
+    if not removable:
+        return agents
+    remove = min(removable, key=lambda a: scores.get(a.id, 0.0))
+    print(f"  AgentDropout: pruning {remove.id} (score={scores.get(remove.id, 0.0):.2f})")
+    return [agent for agent in agents if agent.id != remove.id]
 
 
 # ---------------------------------------------------------------------------
@@ -556,71 +1150,147 @@ async def run_swarm(
     topic: str,
     max_rounds: int = DEFAULT_MAX_ROUNDS,
     use_redis: bool = True,
+    *,
+    backend_id: str | None = None,
+    quality_profile: str | None = None,
+    sandbox: str | None = None,
+    use_selector: FeatureOverride = None,
+    use_judge_ensemble: FeatureOverride = None,
+    use_cascade_guard: FeatureOverride = None,
+    use_llm_plan: bool = True,
 ) -> Path:
     """Run the Blitz-Swarm pipeline on a topic.
 
     Full lifecycle: SPAWN -> BLAST -> WRITE -> CHECK -> ITERATE -> FINALIZE
 
-    All agents (researchers + evaluators) blast simultaneously each round.
-    After each round, consensus is checked. If not reached, the swarm
-    re-blasts with updated blackboard context. The synthesizer runs once
-    after consensus or max rounds.
+    Round 1 is staged — researchers, then evaluators, then the judge
+    ensemble — because evaluators need findings to evaluate (a real data
+    dependency). Round 2+ blasts every agent at once with the blackboard
+    snapshot. The blackboard (Redis or in-memory, same interface) is the
+    only round store: outputs are written there and read back before any
+    context is built. Consensus = evaluator unanimity, with the holdout
+    override after round 3; the judge-ensemble KS-stop is a secondary halt
+    only when `[judge_ensemble] halt = true`. The synthesizer runs once
+    after consensus, halt, or max rounds.
     """
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    runtime_cfg = load_config()
+    scratch_dir = scratch_cwd(run_id)
+    profile = quality_profile or runtime_cfg.swarm.quality_profile
+    _, selected_backend, provider, resolved_sandbox = _backend_settings(
+        cfg=runtime_cfg,
+        backend_id=backend_id,
+        sandbox=sandbox,
+    )
+    backend = _make_runtime_backend(
+        cfg=runtime_cfg,
+        backend_id=selected_backend,
+        sandbox=resolved_sandbox,
+    )
+    guard_enabled = _feature_enabled(
+        profile=profile,
+        configured=runtime_cfg.guard.enabled,
+        override=use_cascade_guard,
+        name="cascade_guard",
+    )
+    judge_ensemble_enabled = _feature_enabled(
+        profile=profile,
+        configured=runtime_cfg.judge_ensemble.enabled,
+        override=use_judge_ensemble,
+        name="judge_ensemble",
+    )
+    selector_enabled = _feature_enabled(
+        profile=profile,
+        configured=runtime_cfg.selector.enabled,
+        override=use_selector,
+        name="selector",
+    )
+    guard = None
+    if guard_enabled:
+        # LLM hooks (claim decomposition / adjudication) run on the `guard`
+        # role tier when enabled; the model is injected here, never defaulted
+        # inside mechanisms/cascade_guard.py.
+        # `[guard] mode = "max"` -> real LLM hooks; other modes -> the
+        # heuristic screen, announced as such (mechanisms-02).
+        guard = CascadeGuard.from_config(runtime_cfg, selected_backend)
 
     print(f"\n{'='*60}")
     print(f"BLITZ-SWARM — {topic}")
     print(f"{'='*60}\n")
+    print(
+        f"Backend: {selected_backend} | default model={_model_label('*', selected_backend, runtime_cfg)} "
+        f"| adapter={provider.adapter} | profile={profile} | sandbox={resolved_sandbox}"
+    )
+    print(
+        "Mechanisms: "
+        f"cascade_guard={'on' if guard_enabled else 'off'}, "
+        f"judge_ensemble={'on' if judge_ensemble_enabled else 'off'}"
+        f"{' (halt)' if judge_ensemble_enabled and runtime_cfg.judge_ensemble.halt else ''}, "
+        f"selector={'on' if selector_enabled else 'off'}"
+    )
+    print(STAGING_BANNER)
+    print(f"Scratch cwd: {scratch_dir} | tools: none | max_turns: {CONSENSUS_MAX_TURNS}")
+    print()
 
     # --- METRICS: Initialize ---
-    mc = MetricsCollector()
+    mc = MetricsCollector(cfg=runtime_cfg, backend_id=selected_backend)
     mc.start_run(run_id, topic)
 
     # --- SPAWN ---
-    agents = plan_agents(topic)
+    agents = plan_agents(
+        topic,
+        use_llm=use_llm_plan,
+        domain=runtime_cfg.swarm.domain,
+        persona_critics=runtime_cfg.swarm.persona_critics,
+        backend_id=selected_backend,
+        sandbox=resolved_sandbox,
+        max_agents=runtime_cfg.swarm.max_agents,
+    )
     researchers = [a for a in agents if a.role == "researcher"]
-    evaluators = [a for a in agents if a.role in ("critic", "fact_checker", "quality_judge")]
+    if judge_ensemble_enabled:
+        evaluators = [a for a in agents if a.role in ("critic", "fact_checker")]
+    else:
+        evaluators = [a for a in agents if a.role in ("critic", "fact_checker", "quality_judge")]
     synthesizer_agents = [a for a in agents if a.role == "synthesizer"]
     blast_agents_list = researchers + evaluators  # everyone except synthesizer
 
     print(f"Swarm: {len(agents)} agents ({len(researchers)} researchers, "
           f"{len(evaluators)} evaluators, {len(synthesizer_agents)} synthesizer)")
     for a in agents:
-        print(f"  {a.id:20s} | {a.role:15s} | model={a.model}")
+        print(f"  {a.id:20s} | {a.role:15s} | model={_model_label(a.role, selected_backend, runtime_cfg)}")
     print()
 
-    # Connect blackboard (optional)
-    bb = _try_connect_blackboard(use_redis)
-    if bb:
-        bb.initialize(topic, [a.id for a in agents])
-        print("Blackboard: Redis connected")
-    else:
-        print("Blackboard: in-memory mode")
+    # The blackboard is the round store (Redis or in-memory, same interface).
+    bb = _open_blackboard(use_redis, runtime_cfg)
+    bb.initialize(topic, [a.id for a in agents])
+    print("Blackboard: Redis connected" if isinstance(bb, Blackboard) else "Blackboard: in-memory")
 
-    # --- MEMORY: Retrieve historical context ---
+    # --- MEMORY: Retrieve prior findings (gmemory; FTS5 path needs no extras) ---
+    # The block is fenced as untrusted data and goes to round-1 researchers.
     memory_context = ""
-    mem_reader, mem_writer = _try_init_memory()
-    if mem_reader and mem_reader.is_available():
-        memory = mem_reader.retrieve_memory(topic)
-        memory_context = mem_reader.build_memory_context(memory)
-        n_insights = len(memory.get("insights", []))
-        n_queries = len(memory.get("related_queries", []))
-        print(f"Memory: {n_insights} insights, {n_queries} related queries loaded")
+    mem_writer = _try_init_memory()
+    if mem_writer is not None:
+        try:
+            memory_context, mem_result = mem_writer.context_for(topic)
+            print(f"Memory: {len(mem_result.insights)} insights, "
+                  f"{len(mem_result.related_queries)} related queries loaded"
+                  + (" (LLM-ranked)" if mem_result.used_llm else ""))
+        except Exception as e:
+            print(f"Warning: Memory retrieval failed ({e})")
     else:
-        print("Memory: no historical data yet")
+        print("Memory: off for this run")
     print()
 
-    all_round_outputs = []  # list of lists, one per round
-    accumulated_outputs = []  # flat list of all outputs across rounds
+    all_round_outputs = []  # list of lists, one per round — each read back from the blackboard
     consensus_reached = False
     override_applied = False
+    halt_reason = None
     final_round_n = 0
 
-    # --- BLAST + CHECK loop ---
+    # --- BLAST + WRITE + CHECK loop ---
     for round_n in range(1, max_rounds + 1):
         final_round_n = round_n
-        if bb:
-            bb.advance_round()
+        bb.advance_round()
 
         round_label = f"round_{round_n}"
         mc.start_round(round_label)
@@ -628,23 +1298,34 @@ async def run_swarm(
         print(f"--- Round {round_n}/{max_rounds}: "
               f"{len(blast_agents_list)} agents blasting ---")
 
-        # Build per-role context from accumulated outputs
-        # Round 1: researchers get no context, evaluators get no context
-        # Round 2+: everyone gets prior round outputs
+        # Context is always the blackboard snapshot of the rounds before this one.
+        prior_outputs = _filter_guarded(guard, _read_prior_rounds(bb, round_n))
         task_prompt = f"Research and analyze: {topic}"
 
         if round_n == 1:
-            # First round: blast researchers only (evaluators need findings first)
-            # Inject historical memory context if available
+            # Staged: researchers -> evaluators -> judges (data dependency).
+            # Round-1 researchers get the fenced memory block, if any.
             initial_context = memory_context if memory_context else ""
             print(f"  Phase A: {len(researchers)} researchers...")
             start = time.monotonic()
-            r_outputs = await blast_agents(researchers, initial_context, task_prompt)
+            r_outputs = await blast_agents(
+                researchers,
+                initial_context,
+                task_prompt,
+                backend=backend,
+                backend_id=selected_backend,
+                sandbox=resolved_sandbox,
+                cfg=runtime_cfg,
+                scratch_dir=scratch_dir,
+            )
+            _write_to_blackboard(bb, round_n, _apply_guard(guard, r_outputs, round_n))
             elapsed = time.monotonic() - start
             print(f"  Researchers done [{elapsed:.1f}s]")
 
-            # Now blast evaluators with researcher context
-            r_context = build_context(r_outputs, for_role="critic")
+            # Evaluators read the researcher snapshot back from the blackboard.
+            r_context = build_context(
+                _filter_guarded(guard, bb.read_round_outputs(round_n)), for_role="critic",
+            )
             eval_task = (
                 f"Evaluate the research findings on: {topic}\n\n"
                 "Review the researcher outputs. Identify gaps, contradictions, "
@@ -652,19 +1333,26 @@ async def run_swarm(
             )
             print(f"  Phase B: {len(evaluators)} evaluators...")
             start = time.monotonic()
-            e_outputs = await blast_agents(evaluators, r_context, eval_task)
+            e_outputs = await blast_agents(
+                evaluators,
+                r_context,
+                eval_task,
+                backend=backend,
+                backend_id=selected_backend,
+                sandbox=resolved_sandbox,
+                cfg=runtime_cfg,
+                scratch_dir=scratch_dir,
+            )
+            _write_to_blackboard(bb, round_n, _apply_guard(guard, e_outputs, round_n))
             elapsed = time.monotonic() - start
             print(f"  Evaluators done [{elapsed:.1f}s]")
-
-            round_outputs = r_outputs + e_outputs
+            if judge_ensemble_enabled:
+                print("  Phase C: judge ensemble...")
         else:
-            # Round 2+: all agents blast simultaneously with full context
-            # Each agent gets role-appropriate context
-            round_outputs = []
+            # Round 2+: single blast, every agent with role-appropriate context
             coros = []
-
             for agent in blast_agents_list:
-                ctx = build_context(accumulated_outputs, for_role=agent.role)
+                ctx = build_context(prior_outputs, for_role=agent.role)
                 if agent.role == "researcher":
                     task = (
                         f"Continue researching: {topic}\n\n"
@@ -677,23 +1365,50 @@ async def run_swarm(
                         "Review updated findings. Have prior issues been addressed? "
                         "Vote 'ready' if quality is sufficient, 'needs_work' if not."
                     )
-                coros.append(asyncio.to_thread(invoke_agent, agent, ctx, task))
+                coros.append(asyncio.to_thread(
+                    invoke_agent,
+                    agent,
+                    ctx,
+                    task,
+                    backend=backend,
+                    backend_id=selected_backend,
+                    sandbox=resolved_sandbox,
+                    cfg=runtime_cfg,
+                    scratch_dir=scratch_dir,
+                ))
 
             start = time.monotonic()
-            round_outputs = list(await asyncio.gather(*coros))
+            blast_outputs = list(await asyncio.gather(*coros))
+            _write_to_blackboard(bb, round_n, _apply_guard(guard, blast_outputs, round_n))
             elapsed = time.monotonic() - start
             print(f"  All agents done [{elapsed:.1f}s]")
 
-        # --- WRITE ---
-        _write_to_blackboard(bb, round_n, round_outputs)
+        if judge_ensemble_enabled:
+            start = time.monotonic()
+            judge_output = await _run_judge_ensemble(
+                topic=topic,
+                candidate_outputs=_filter_guarded(guard, bb.read_round_outputs(round_n)),
+                history_outputs=prior_outputs,
+                backend=backend,
+                cfg=runtime_cfg,
+                backend_id=selected_backend,
+                provider=provider,
+                sandbox=resolved_sandbox,
+                scratch_dir=scratch_dir,
+            )
+            _write_to_blackboard(bb, round_n, _apply_guard(guard, [judge_output], round_n))
+            print(f"  Judge ensemble done [{time.monotonic() - start:.1f}s]")
+
+        # --- READ BACK: the round as the blackboard holds it ---
+        round_outputs = bb.read_round_outputs(round_n)
         all_round_outputs.append(round_outputs)
-        accumulated_outputs = [o for rnd in all_round_outputs for o in rnd]
 
         # --- METRICS: End round ---
         mc.end_round(round_label, round_outputs)
 
         # --- CHECK ---
-        eval_votes = [o for o in round_outputs
+        guarded_round_outputs = _filter_guarded(guard, round_outputs)
+        eval_votes = [o for o in guarded_round_outputs
                       if o.get("role") in ("critic", "fact_checker", "quality_judge")]
         consensus_reached = check_consensus(eval_votes)
 
@@ -731,6 +1446,13 @@ async def run_swarm(
             consensus_reached = True
             break
 
+        # Secondary halt: judge-ensemble KS-stop, only with [judge_ensemble] halt = true
+        halt_reason = _judge_ks_halt(guarded_round_outputs, runtime_cfg)
+        if halt_reason:
+            print(f"  HALT ({halt_reason}): judge scores are stable after round {round_n}; "
+                  "stopping without evaluator consensus. Dissent preserved.\n")
+            break
+
         if round_n < max_rounds:
             dissent = extract_dissent(eval_votes)
             print(f"  {len(dissent)} dissenting vote(s) — iterating...")
@@ -740,10 +1462,23 @@ async def run_swarm(
         else:
             print(f"  Max rounds ({max_rounds}) reached. Force-finalizing.\n")
 
+        if round_n < max_rounds and not consensus_reached:
+            blast_agents_list = _prune_low_contribution_agents(
+                blast_agents_list,
+                _filter_guarded(guard, bb.read_all_outputs()),
+                selector_enabled=selector_enabled,
+            )
+            researchers = [a for a in blast_agents_list if a.role == "researcher"]
+            evaluators = [
+                a for a in blast_agents_list
+                if a.role in ("critic", "fact_checker", "quality_judge")
+            ]
+
     # --- FINALIZE: Synthesizer ---
     mc.start_round("synthesis")
 
-    synth_context = build_context(accumulated_outputs, for_role="synthesizer")
+    guarded_accumulated = _filter_guarded(guard, bb.read_all_outputs())
+    synth_context = build_context(guarded_accumulated, for_role="synthesizer")
     synth_task = (
         f"Synthesize all findings on: {topic}\n\n"
         "Integrate all researcher findings, critic feedback, and fact-checker "
@@ -753,13 +1488,41 @@ async def run_swarm(
 
     if not consensus_reached:
         synth_task += (
-            "\n\nNote: The swarm did not reach full consensus. Include a "
-            "quality warning noting unresolved issues."
+            "\n\nNote: The swarm did not reach full consensus"
+            + (f" (halted: {halt_reason})" if halt_reason else "")
+            + ". Include a quality warning noting unresolved issues."
         )
 
     print(f"--- Final: Synthesizer ---")
     start = time.monotonic()
-    synth_outputs = await blast_agents(synthesizer_agents, synth_context, synth_task)
+    if selector_enabled:
+        researcher_outputs = [
+            o for o in guarded_accumulated if o.get("role") == "researcher"
+        ]
+        synth_output = await _run_selector_synthesis(
+            topic=topic,
+            researcher_outputs=researcher_outputs,
+            guard=guard,
+            backend=backend,
+            cfg=runtime_cfg,
+            backend_id=selected_backend,
+            provider=provider,
+            sandbox=resolved_sandbox,
+            scratch_dir=scratch_dir,
+        )
+        synth_outputs = _apply_guard(guard, [synth_output], final_round_n + 1)
+    else:
+        synth_outputs = await blast_agents(
+            synthesizer_agents,
+            synth_context,
+            synth_task,
+            backend=backend,
+            backend_id=selected_backend,
+            sandbox=resolved_sandbox,
+            cfg=runtime_cfg,
+            scratch_dir=scratch_dir,
+        )
+        synth_outputs = _apply_guard(guard, synth_outputs, final_round_n + 1)
     elapsed = time.monotonic() - start
     print(f"  Synthesis complete [{elapsed:.1f}s]\n")
     all_round_outputs.append(synth_outputs)
@@ -785,9 +1548,17 @@ async def run_swarm(
     # --- Output ---
     final_doc = format_final_output(topic, all_round_outputs, synth_output)
     filepath = save_output(topic, final_doc)
+    # bench-01: per-agent round outputs next to the markdown so the bench's
+    # MAST detectors (bench/runner._load_round_outputs) run on real runs.
+    try:
+        filepath.with_suffix(".rounds.json").write_text(
+            json.dumps(all_round_outputs, default=str), encoding="utf-8")
+    except (OSError, TypeError) as e:
+        print(f"Warning: could not write rounds.json ({e})")
 
     total_agents_invoked = sum(len(rnd) for rnd in all_round_outputs)
-    cost_str = f"${metrics_record.get('total_cost_usd', 0):.4f}"
+    _total_cost = metrics_record.get("total_cost_usd")
+    cost_str = "n/a (no cost reported; add [backend.providers.<id>.pricing])" if _total_cost is None else f"${_total_cost:.4f}"
     tokens_str = f"{metrics_record.get('total_input_tokens', 0) + metrics_record.get('total_output_tokens', 0):,}"
 
     print(f"{'='*60}")
@@ -795,7 +1566,8 @@ async def run_swarm(
     print(f"Rounds: {final_round_n} + synthesis")
     print(f"Total agent invocations: {total_agents_invoked}")
     print(f"Consensus: {'yes' if consensus_reached else 'no'}"
-          f"{' (override)' if override_applied else ''}")
+          f"{' (override)' if override_applied else ''}"
+          f"{f' (halted: {halt_reason})' if halt_reason else ''}")
     print(f"Cost: {cost_str} | Tokens: {tokens_str}")
     print(f"Quality: avg={metrics_record.get('avg_quality', 0)} "
           f"(cov={metrics_record.get('coverage', 0)} "
@@ -803,9 +1575,10 @@ async def run_swarm(
           f"clar={metrics_record.get('clarity', 0)} "
           f"dep={metrics_record.get('depth', 0)})")
     print(f"Wall clock: {metrics_record.get('total_wall_clock_s', 0):.1f}s")
-    print(f"Metrics saved to: metrics.jsonl")
+    print(f"Metrics saved to: {METRICS_PATH}")
     print(f"{'='*60}\n")
 
+    shutil.rmtree(scratch_dir, ignore_errors=True)
     return filepath
 
 
@@ -814,15 +1587,43 @@ async def run_swarm(
 # ---------------------------------------------------------------------------
 
 
-def _dry_run(topic: str, use_llm: bool):
+def _dry_run(
+    topic: str,
+    use_llm: bool,
+    *,
+    backend_id: str | None = None,
+    quality_profile: str | None = None,
+    sandbox: str | None = None,
+):
     """Show the agent plan without executing."""
     from agents import plan_agents
+
+    cfg, selected_backend, provider, resolved_sandbox = _backend_settings(
+        backend_id=backend_id,
+        sandbox=sandbox,
+    )
+    profile = quality_profile or cfg.swarm.quality_profile
 
     print(f"\n{'='*60}")
     print(f"BLITZ-SWARM DRY RUN — {topic}")
     print(f"{'='*60}\n")
+    print(
+        f"Backend: {selected_backend} | default model={_model_label('*', selected_backend, cfg)} "
+        f"| adapter={provider.adapter} | profile={profile} | sandbox={resolved_sandbox}"
+    )
+    print("Per-role models: --list-models prints the full role -> tier -> model table.")
+    print(STAGING_BANNER)
+    print()
 
-    agents = plan_agents(topic, use_llm=use_llm)
+    agents = plan_agents(
+        topic,
+        use_llm=use_llm,
+        domain=cfg.swarm.domain,
+        persona_critics=cfg.swarm.persona_critics,
+        backend_id=selected_backend,
+        sandbox=resolved_sandbox,
+        max_agents=cfg.swarm.max_agents,
+    )
     researchers = [a for a in agents if a.role == "researcher"]
     evaluators = [a for a in agents if a.role in ("critic", "fact_checker", "quality_judge")]
     synthesizer = [a for a in agents if a.role == "synthesizer"]
@@ -834,7 +1635,7 @@ def _dry_run(topic: str, use_llm: bool):
     print()
 
     for a in agents:
-        print(f"  {a.id:20s} | {a.role:15s} | model={a.model}")
+        print(f"  {a.id:20s} | {a.role:15s} | model={_model_label(a.role, selected_backend, cfg)}")
         if a.role == "researcher":
             # Show subtopic assignment
             sub = a.subtopic
@@ -846,12 +1647,20 @@ def _dry_run(topic: str, use_llm: bool):
 
 
 def main():
+    try:
+        _main()
+    except ConfigError as exc:
+        print(f"blitz-swarm: config error: {exc}", file=sys.stderr)
+        sys.exit(2)
+
+
+def _main():
     import argparse
 
     parser = argparse.ArgumentParser(
         description="Blitz-Swarm: parallel multi-agent research swarm",
     )
-    parser.add_argument("topic", help="The topic / task spec")
+    parser.add_argument("topic", nargs="?", default=None, help="The topic / task spec")
     parser.add_argument(
         "--mode", choices=["consensus", "mythos"], default="consensus",
         help="Swarm mode: 'consensus' (default, flat parallel) or "
@@ -868,6 +1677,40 @@ def main():
     parser.add_argument(
         "--no-llm-plan", action="store_true",
         help="Use heuristic agent planning instead of LLM — consensus mode only",
+    )
+    parser.add_argument(
+        "--backend", default=None,
+        help="Backend provider id from blitz.toml [backend.providers]",
+    )
+    parser.add_argument(
+        "--model", default=None,
+        help="Override the model for ALL roles (a model string or a tier name "
+             "from [backend.providers.<id>.tiers]). Per-role: env BLITZ_MODEL_<ROLE>.",
+    )
+    parser.add_argument(
+        "--list-models", action="store_true",
+        help="Print the resolved role -> tier -> model table for the chosen "
+             "backend and exit (no model is invoked)",
+    )
+    parser.add_argument(
+        "--quality-profile", choices=["max", "balanced", "cheap"], default=None,
+        help="Mechanism profile controlling quality/cost tradeoffs",
+    )
+    parser.add_argument(
+        "--sandbox", choices=["read-only", "workspace-write"], default=None,
+        help="Sandbox passed to local backend invocations",
+    )
+    parser.add_argument(
+        "--no-selector", action="store_true",
+        help="Disable selector synthesis even when max-quality enables it",
+    )
+    parser.add_argument(
+        "--no-judge-ensemble", action="store_true",
+        help="Disable judge ensemble even when max-quality enables it",
+    )
+    parser.add_argument(
+        "--no-cascade-guard", action="store_true",
+        help="Disable cascade guard context filtering",
     )
     parser.add_argument(
         "--dry-run", action="store_true",
@@ -889,12 +1732,30 @@ def main():
 
     args = parser.parse_args()
 
+    if args.model:
+        # Resolution step 1 for every role in this process (backends/models.py).
+        os.environ["BLITZ_MODEL"] = args.model
+
+    if args.list_models:
+        cfg = load_config()
+        print(format_models_table(cfg, args.backend))
+        return
+
+    if not args.topic:
+        parser.error("topic is required unless --list-models is given")
+
     if args.mode == "mythos":
         _run_mythos_mode(args)
         return
 
     if args.dry_run:
-        _dry_run(args.topic, use_llm=not args.no_llm_plan)
+        _dry_run(
+            args.topic,
+            use_llm=not args.no_llm_plan,
+            backend_id=args.backend,
+            quality_profile=args.quality_profile,
+            sandbox=args.sandbox,
+        )
         return
 
     filepath = asyncio.run(
@@ -902,6 +1763,13 @@ def main():
             args.topic,
             max_rounds=args.max_rounds,
             use_redis=not args.no_redis,
+            backend_id=args.backend,
+            quality_profile=args.quality_profile,
+            sandbox=args.sandbox,
+            use_selector=False if args.no_selector else None,
+            use_judge_ensemble=False if args.no_judge_ensemble else None,
+            use_cascade_guard=False if args.no_cascade_guard else None,
+            use_llm_plan=not args.no_llm_plan,
         )
     )
     print(f"Done. Output at: {filepath}")
@@ -909,7 +1777,14 @@ def main():
 
 def _run_mythos_mode(args) -> None:
     """Dispatch to the mythos package."""
+    import os
+
     from mythos import load_mythos_config, run_mythos
+
+    if args.backend:
+        os.environ["BLITZ_BACKEND"] = args.backend
+    if args.sandbox:
+        os.environ["BLITZ_SANDBOX"] = args.sandbox
 
     cfg = load_mythos_config()
     if args.max_replans is not None:
@@ -923,14 +1798,22 @@ def _run_mythos_mode(args) -> None:
         print(f"\n{'='*60}")
         print(f"MYTHOS DRY RUN — {args.topic}")
         print(f"{'='*60}\n")
+        from mythos.runner import describe_models
+
         print(f"Config:")
-        print(f"  planner_model     = {cfg.planner_model}")
-        print(f"  executor_model    = {cfg.executor_model}")
-        print(f"  verifier_model    = {cfg.verifier_model}")
+        print(f"  planner_model     = {cfg.planner_model or '(blitz.toml [models].planner)'}  (tier)")
+        print(f"  executor_model    = {cfg.executor_model or '(blitz.toml [models].executor)'}  (tier)")
+        print(f"  verifier_model    = {cfg.verifier_model or '(blitz.toml [models].verifier)'}  (tier)")
+        print(f"  resolved          = {describe_models(cfg)}")
         print(f"  max_replans       = {cfg.max_replans}")
         print(f"  max_executors     = {cfg.max_executors}")
         print(f"  cost_ceiling_usd  = {cfg.cost_ceiling_usd}")
+        print(f"  token_ceiling     = {cfg.token_ceiling}")
         print(f"  output_dir        = {cfg.output_dir}")
+        print(f"  backend           = {os.environ.get('BLITZ_BACKEND') or cfg.backend or load_config().backend.default}")
+        loaded = load_config()
+        default_provider = loaded.backend.get_provider(loaded.backend.default)
+        print(f"  sandbox           = {os.environ.get('BLITZ_SANDBOX') or default_provider.sandbox}")
         print(f"\nNo CLI calls will be made. Use without --dry-run to execute.")
         return
 

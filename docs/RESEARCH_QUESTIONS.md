@@ -1,5 +1,9 @@
 # Research Questions
 
+> **Superseded 2026-10-11 (v0.3.0).** This file describes the v0.1 system as of 2026-03-14 and is kept as history. For what the code does today see `README.md`, `docs/MODELS.md`, `docs/CLAIMS_AND_EVIDENCE.md`, `docs/IMPLEMENTATION_STATUS.md` and `docs/LIMITATIONS.md`. `metrics.jsonl` referenced below was archived to `docs/data/metrics-2026-03_06.jsonl`; live runs write `output/metrics.jsonl`.
+
+> **Status update 2026-10-11:** RQ1 untested (no paired run; see `docs/ROADMAP.md` 1, 3). RQ2 mechanism implemented (`consensus.final_votes`, unresolved votes only); value unevaluated. RQ3 insufficient data (no live bench). RQ4 now *testable* — Tiers 2–3 run (`gmemory/store.py`) — but **not tested**: no multi-run series exists. RQ5 untested. Nothing below has changed status from "not tested" by measurement; only RQ4's blocker moved from "not implemented" to "not run".
+
 ## RQ1: Does simultaneous agent execution produce qualitatively different output than sequential phasing?
 
 **Why it matters:** Sequential pipelines (like Research Swarm) impose an ordering that may be artificial for some tasks. If parallel execution discovers more diverse findings by avoiding anchoring effects, it could be preferable for exploratory research.

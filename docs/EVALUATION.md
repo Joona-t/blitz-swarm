@@ -1,5 +1,9 @@
 # Evaluation
 
+> **Superseded 2026-10-11 (v0.3.0).** This file describes the v0.1 system as of 2026-03-14 and is kept as history. For what the code does today see `README.md`, `docs/MODELS.md`, `docs/CLAIMS_AND_EVIDENCE.md`, `docs/IMPLEMENTATION_STATUS.md` and `docs/LIMITATIONS.md`. `metrics.jsonl` referenced below was archived to `docs/data/metrics-2026-03_06.jsonl`; live runs write `output/metrics.jsonl`.
+
+> Judge dimensions and consensus metrics below are still the ones `metrics.py` records; the judge ensemble (`mechanisms/judge_ensemble.py`) adds per-judge rubric scores and a halt reason. Still automatic, still no human evaluation.
+
 ## Scoring System
 
 The quality judge agent scores each round's collective output on 4 dimensions (0-10):

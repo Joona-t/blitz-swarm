@@ -1,7 +1,7 @@
 """Tier 3 — Insight Graph.
 
 Owns the lifecycle of candidate insights and promoted insight nodes.
-Distillation is a Haiku subprocess in production; this module exposes
+Distillation is a `memory_ops`-tier LLM call in production; this module exposes
 a pluggable `distill_fn` so tests can run without LLM calls.
 """
 
@@ -59,7 +59,7 @@ def heuristic_distill(
 
     Extracts up to DISTILL_MAX_INSIGHTS one-line lessons from key_points,
     deduplicating within the call (a real distillation LLM produces
-    distinct insights, never repeats). Real implementation calls Haiku
+    distinct insights, never repeats). Real implementation calls the `memory_ops` tier
     with a structured JSON prompt.
     """
     insights: list[InsightCandidate] = []
@@ -106,15 +106,19 @@ class InsightGraph:
         self.embedder = embedder
         self.distill_fn = distill_fn or heuristic_distill
 
-    def _embed(self, text: str) -> tuple[float, ...]:
-        if self.embedder is not None:
-            try:
-                return tuple(float(x) for x in self.embedder.encode(text))
-            except Exception:
-                pass
-        # Reuse QueryGraph's deterministic stub for consistency
-        from gmemory.query_graph import QueryGraph
-        return QueryGraph._fallback_embed(text)
+    def _embed(self, text: str) -> tuple[float, ...] | None:
+        """Model embedding, or None when no embedder is configured / it fails.
+
+        A None result never aborts the write: the candidate is stored with
+        an empty vector and `vector_source='none'` (memory-04). The
+        promotion gate then clusters it by exact content instead of cosine.
+        """
+        if self.embedder is None:
+            return None
+        try:
+            return tuple(float(x) for x in self.embedder.encode(text))
+        except Exception:
+            return None
 
     # ------------------------------------------------------------------
     # Distillation
@@ -126,13 +130,17 @@ class InsightGraph:
         topic: str,
         utterances: list[dict],
         status: str,
+        *,
+        min_trace_len: int = DISTILL_MIN_TRACE_LEN,
     ) -> list[str]:
         """Run distillation and write candidates. Returns list of candidate IDs.
 
         Idempotent on (query_id) — re-runs that produce duplicate candidates
-        are deduplicated at the (query_id, content) level.
+        are deduplicated at the (query_id, content) level. The N=3 distinct-
+        query gate (promotion.py) is what guards insight quality; the trace
+        length floor only avoids distilling an empty run.
         """
-        if len(utterances) < DISTILL_MIN_TRACE_LEN:
+        if len(utterances) < min_trace_len:
             return []
 
         candidates = self.distill_fn(topic, status, utterances, "")
@@ -158,13 +166,15 @@ class InsightGraph:
                 self.db.execute(
                     """
                     INSERT INTO insight_candidates
-                    (id, content, query_id, embedding, confidence, tags_json, created_at)
-                    VALUES (?,?,?,?,?,?,?)
+                    (id, content, query_id, embedding, vector_source,
+                     confidence, tags_json, created_at)
+                    VALUES (?,?,?,?,?,?,?,?)
                     """,
                     (
                         cand_id, cand.content, query_id,
-                        _encode_blob(emb), cand.confidence,
-                        json.dumps(cand.tags), now,
+                        _encode_blob(emb) if emb else b"",
+                        "model" if emb else "none",
+                        cand.confidence, json.dumps(cand.tags), now,
                     ),
                 )
                 new_ids.append(cand_id)
@@ -177,8 +187,13 @@ class InsightGraph:
     def promote_to_insight(
         self,
         candidate_ids: Iterable[str] | None = None,
+        *,
+        cluster_thresh: float | None = None,
     ) -> list[str]:
-        return evaluate_candidates(self.db)
+        """Run the N=3-distinct-queries promotion gate (gmemory.promotion)."""
+        if cluster_thresh is None:
+            return evaluate_candidates(self.db)
+        return evaluate_candidates(self.db, cluster_thresh=cluster_thresh)
 
     # ------------------------------------------------------------------
     # Retrieval

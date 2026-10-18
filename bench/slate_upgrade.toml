@@ -1,0 +1,154 @@
+# Blitz-Swarm Bench Slate — Upgrade
+#
+# 10 research-synthesis prompts targeting 2025-2026 multi-agent LLM
+# orchestration, verification/self-correction, model routing, agent memory,
+# and evaluation methodology — the topic space blitz-swarm researches.
+#
+# Schema mirrors slate_v1.toml exactly, with two added per-prompt fields:
+#   expected_subtopics  list of 5-8 key subtopics for programmatic coverage scoring
+#   seed                pinned integer for deterministic runs
+#
+# Per-prompt metadata fields (same keys/order as v1):
+#   tier            easy / medium / hard
+#   domain          technical / open / adversarial / multi / compositional
+#   parallelizable  whether parallel agents should outperform sequential
+#                   (per Shen 2603.29632 + Google scaling 2512.08296)
+#   tool_heavy      whether topic requires external tool use (web, code exec)
+#   budget_usd      per-prompt cost cap
+#   expected_coverage  list of keyword strings the judge checks for
+#   expected_subtopics list of subtopics for coverage scoring (NEW)
+#   seed            pinned integer for reproducibility (NEW)
+#
+# Tier counts: 2 easy, 5 medium, 3 hard.
+# Themes: orchestration, verification/self-correction, routing, memory, evaluation.
+
+schema_version = 1
+slate_id = "upgrade"
+created_utc = "2026-06-09"
+prompt_count = 10
+
+# ---------- EASY (2) ----------
+
+[[prompt]]
+id = "u001"
+tier = "easy"
+domain = "open"
+parallelizable = true
+tool_heavy = false
+budget_usd = 0.05
+expected_coverage = ["orchestrator-worker pattern", "blackboard memory", "handoff protocol", "fan-out fan-in", "AutoGen vs LangGraph"]
+expected_subtopics = ["orchestrator-worker topology", "blackboard / shared scratchpad", "agent-to-agent handoff protocols", "fan-out / fan-in parallelism", "supervisor vs swarm control flow", "AutoGen vs LangGraph vs CrewAI tradeoffs", "context isolation per sub-agent", "result aggregation strategies"]
+seed = 101101
+text = "Survey the dominant multi-agent LLM orchestration patterns as of 2025-2026: orchestrator-worker, blackboard, and peer handoff. Contrast the control-flow models of AutoGen, LangGraph, and CrewAI."
+
+[[prompt]]
+id = "u002"
+tier = "easy"
+domain = "technical"
+parallelizable = true
+tool_heavy = false
+budget_usd = 0.05
+expected_coverage = ["self-consistency", "majority vote", "self-refine loop", "verifier model", "reflexion"]
+expected_subtopics = ["self-consistency majority voting", "Self-Refine iterative critique", "Reflexion verbal reinforcement", "generator-verifier separation", "when self-correction fails without oracle", "intrinsic vs extrinsic feedback", "stopping criteria for refine loops", "cost of repeated sampling"]
+seed = 102102
+text = "Explain the main LLM self-correction techniques (self-consistency, Self-Refine, Reflexion) and summarize the 2024-2026 evidence on when intrinsic self-correction helps versus hurts without an external oracle."
+
+# ---------- MEDIUM (5) ----------
+
+[[prompt]]
+id = "u003"
+tier = "medium"
+domain = "technical"
+parallelizable = true
+tool_heavy = false
+budget_usd = 0.20
+expected_coverage = ["cascade routing", "RouteLLM", "complexity classifier", "cost-quality frontier", "predictive router vs cascade"]
+expected_subtopics = ["LLM cascade architectures", "RouteLLM and learned routers", "query-complexity classification", "cost-quality Pareto frontier", "confidence-based deferral", "embedding-based routing", "router training data and labels", "small-model-first escalation"]
+seed = 203203
+text = "How do modern LLM model-routing systems (cascades, RouteLLM-style learned routers, complexity classifiers) decide which model handles a query? Cover the cost-quality frontier and where routing beats always-using-the-largest-model."
+
+[[prompt]]
+id = "u004"
+tier = "medium"
+domain = "multi"
+parallelizable = true
+tool_heavy = false
+budget_usd = 0.20
+expected_coverage = ["G-Memory three tiers", "MemGPT paging", "episodic vs semantic memory", "vector store retrieval", "memory write/consolidation policy"]
+expected_subtopics = ["G-Memory hierarchical graph (NeurIPS 2025)", "MemGPT virtual context paging", "episodic vs semantic vs procedural memory", "retrieval over vector + graph stores", "memory write and consolidation policies", "forgetting / eviction strategies", "cross-agent shared memory", "memory grounding and provenance"]
+seed = 204204
+text = "Synthesize the 2025-2026 landscape of agent memory architectures: hierarchical graph memory (G-Memory), virtual-context paging (MemGPT), and episodic/semantic splits. How do write, consolidation, and retrieval policies differ, and where do they fail?"
+
+[[prompt]]
+id = "u005"
+tier = "medium"
+domain = "adversarial"
+parallelizable = false
+tool_heavy = false
+budget_usd = 0.20
+expected_coverage = ["LLM-as-judge bias", "position bias", "verbosity bias", "self-preference", "functional vs preference benchmarks"]
+expected_subtopics = ["position and order bias in LLM judges", "verbosity / length bias", "self-preference and family bias", "judge-model calibration", "functional (executable) vs preference benchmarks", "human-agreement ceilings", "adversarial gaming of judges", "panel-of-judges and debate aggregation"]
+seed = 205205
+text = "Steelman both sides: are LLM-as-judge evaluations trustworthy for ranking agent systems? Marshal 2024-2026 evidence on position/verbosity/self-preference bias against the case that functional benchmarks plus calibrated judges suffice."
+
+[[prompt]]
+id = "u006"
+tier = "medium"
+domain = "compositional"
+parallelizable = false
+tool_heavy = false
+budget_usd = 0.20
+expected_coverage = ["MAST taxonomy", "FM-1.X specification", "FM-2.X inter-agent", "FM-3.X verification", "named orchestration failures"]
+expected_subtopics = ["MAST three-category structure", "FM-1.X specification/design failures", "FM-2.X inter-agent misalignment failures", "FM-3.X verification/termination failures", "mapping real incidents to FM codes", "inter-annotator agreement of MAST", "coverage gaps in the taxonomy", "remediation per failure category"]
+seed = 206206
+text = "First, summarize the MAST multi-agent failure taxonomy (Cemri et al. 2025) including its FM-1.X / FM-2.X / FM-3.X structure. Then classify three named orchestration failures from 2025 agent-system writeups into MAST codes and propose a remediation for each."
+
+[[prompt]]
+id = "u007"
+tier = "medium"
+domain = "technical"
+parallelizable = true
+tool_heavy = false
+budget_usd = 0.20
+expected_coverage = ["process reward model", "outcome reward model", "step-level verification", "Let's Verify Step by Step", "PRM training data"]
+expected_subtopics = ["outcome reward models (ORM)", "process reward models (PRM)", "step-level vs trajectory-level supervision", "Let's Verify Step by Step findings", "PRM labeling and data cost", "PRM-guided search / best-of-N reranking", "verifier generalization and reward hacking", "PRMs for tool-use and agent trajectories"]
+seed = 207207
+text = "Explain process reward models (PRMs) versus outcome reward models for verifying multi-step LLM reasoning. Cover Let's Verify Step by Step, the cost of step-level labels, and how PRMs guide best-of-N search and agent-trajectory verification."
+
+# ---------- HARD (3) ----------
+
+[[prompt]]
+id = "u008"
+tier = "hard"
+domain = "compositional"
+parallelizable = false
+tool_heavy = false
+budget_usd = 0.60
+expected_coverage = ["MAST findings", "Google scaling 2512.08296", "MultiAgentBench", "Shen et al 2603.29632", "Amdahl parallelism limit", "resolved disagreements"]
+expected_subtopics = ["MAST: most failures are specification/coordination", "Google scaling paper on agent count", "MultiAgentBench coordination metrics", "Shen et al. parallel-vs-sequential results", "Amdahl's-Law ceiling on parallel agents", "task-type dependence (parallelizable vs serial)", "single-agent strong baselines", "reconciling the apparent contradictions"]
+seed = 308308
+text = "Defend a position on when multi-agent LLM orchestration actually beats a strong single-agent baseline on long-horizon research tasks. Cite MAST (Cemri 2025), the Google scaling paper (2512.08296), MultiAgentBench, and Shen et al. (2603.29632), apply Amdahl's-Law reasoning, and resolve the apparent disagreements between these sources."
+
+[[prompt]]
+id = "u009"
+tier = "hard"
+domain = "multi"
+parallelizable = false
+tool_heavy = false
+budget_usd = 0.60
+expected_coverage = ["routing layer", "verification layer", "memory layer", "end-to-end cost accounting", "failure-mode interactions", "latency budget"]
+expected_subtopics = ["per-stage model routing within a swarm", "verifier/PRM placement in the loop", "shared vs per-agent memory integration", "joint cost and latency accounting", "where routing errors compound with memory errors", "verification as a gate on memory writes", "budget allocation across stages", "instrumentation and observability for the full stack"]
+seed = 309309
+text = "Synthesize how model routing, verification/self-correction, and agent memory jointly shape the cost, latency, and reliability of a production research swarm. Where do failures in one layer compound failures in another, and how should a fixed dollar/latency budget be allocated across the three?"
+
+[[prompt]]
+id = "u010"
+tier = "hard"
+domain = "adversarial"
+parallelizable = false
+tool_heavy = false
+budget_usd = 0.60
+expected_coverage = ["contamination", "saturation", "construct validity", "agentic benchmark pitfalls", "live/dynamic benchmarks", "human-agreement ceiling"]
+expected_subtopics = ["benchmark contamination and leakage", "saturation of static benchmarks", "construct validity of agentic evals", "task realism vs reproducibility tradeoff", "live / continuously-refreshed benchmarks", "LLM-judge reliability ceilings", "checklist / rubric-based scoring", "what a trustworthy agent-eval methodology requires by 2026"]
+seed = 310310
+text = "Critically assess the state of evaluation methodology for agentic LLM systems in 2026. Steelman the claim that current agent benchmarks are fundamentally unreliable (contamination, saturation, weak construct validity) against the case for live benchmarks plus rubric scoring, and specify what a trustworthy methodology must include."

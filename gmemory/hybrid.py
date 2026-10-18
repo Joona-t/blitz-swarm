@@ -7,11 +7,13 @@ Vector dominates on paraphrase; BM25 catches rare-token jargon.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from collections import defaultdict
 from typing import Iterable
 
 RRF_K = 60
+_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 VEC_WEIGHT = 0.6
 BM25_WEIGHT = 0.4
 
@@ -38,6 +40,22 @@ def rrf_fuse(
     return sorted(score.items(), key=lambda x: x[1], reverse=True)
 
 
+def fts_match_query(text: str) -> str:
+    """Turn free text into a safe FTS5 MATCH expression.
+
+    FTS5 has its own query grammar: `?`, `-`, `(`, `)`, `:`, `*`, `^`, bare
+    apostrophes and the words AND/OR/NOT all mean something. Every token is
+    therefore double-quoted (a literal phrase; embedded quotes doubled) and
+    tokens are OR-ed so a long topic still matches partial overlap -- bm25()
+    does the ranking. Returns "" when the text has no word tokens (callers
+    must then skip the MATCH entirely).
+    """
+    tokens = _TOKEN_RE.findall(text or "")
+    if not tokens:
+        return ""
+    return " OR ".join('"' + t.replace('"', '""') + '"' for t in tokens)
+
+
 def bm25_search(
     db: sqlite3.Connection,
     query: str,
@@ -48,10 +66,15 @@ def bm25_search(
 ) -> list[tuple[str, float]]:
     """Return `[(id, bm25_score)]` from FTS5 in descending rank.
 
-    Returns empty list if FTS5 unavailable or query has no match.
+    `query` is free text; it is escaped with `fts_match_query` here, so
+    callers never hand raw user text to MATCH. Returns an empty list if
+    FTS5 is unavailable, the text has no tokens, or nothing matches.
     `bm25()` is negative (lower = better in SQLite's API); we flip the
     sign so callers can interpret a higher score as a stronger match.
     """
+    match = fts_match_query(query)
+    if not match:
+        return []
     try:
         rows = db.execute(
             f"""
@@ -62,7 +85,7 @@ def bm25_search(
             ORDER BY score
             LIMIT ?
             """,
-            (query, limit),
+            (match, limit),
         ).fetchall()
         return [(qid, -float(score)) for (qid, score) in rows]
     except sqlite3.OperationalError:

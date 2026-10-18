@@ -11,6 +11,7 @@ arXiv 2512.20845).
 """
 
 import json
+import sys
 from dataclasses import dataclass, field
 
 from prompts.loader import (
@@ -21,7 +22,7 @@ from prompts.loader import (
 )
 
 # ---------------------------------------------------------------------------
-# Agent output schema — passed to claude --json-schema for structured output
+# Agent output schema — passed to local backends for structured output
 # ---------------------------------------------------------------------------
 
 AGENT_OUTPUT_SCHEMA = {
@@ -101,7 +102,10 @@ class BlitzAgent:
     role: str
     subtopic: str
     system_prompt: str
-    model: str = "sonnet"
+    # Not a model name. The orchestrator resolves every agent's model from
+    # its ROLE via blitz.toml [models] tiers (backends.models.resolve_model);
+    # this field is only a free-form hint carried for trace metadata.
+    model: str = ""
     max_iterations: int = 3
     # v0.2: persona-typed critics (MAR mechanism). None for non-critic roles
     # or single-critic mode. Populated by `plan_agents` when
@@ -237,66 +241,9 @@ def _split_subtopics_heuristic(topic: str, count: int) -> list[str]:
     return subtopics
 
 
-def _split_subtopics_llm(topic: str, count: int) -> list[str]:
-    """Split a topic into subtopics using an LLM call.
-
-    Invokes claude -p to analyze the topic and generate targeted subtopics.
-    Falls back to heuristic if the LLM call fails.
-    """
-    import subprocess
-
-    schema = json.dumps({
-        "type": "object",
-        "properties": {
-            "subtopics": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": f"Exactly {count} specific, non-overlapping subtopics.",
-            },
-        },
-        "required": ["subtopics"],
-    })
-
-    prompt = (
-        f"Analyze this research topic and split it into exactly {count} specific, "
-        f"non-overlapping subtopics that together provide comprehensive coverage.\n\n"
-        f"Topic: {topic}\n\n"
-        f"Each subtopic should be a focused research angle that a single researcher "
-        f"can deeply investigate. Make them specific to this topic, not generic."
-    )
-
-    try:
-        result = subprocess.run(
-            [
-                "claude", "-p", prompt,
-                "--system-prompt", "You are a research planning assistant. Return JSON only.",
-                "--output-format", "json",
-                "--model", "haiku",
-                "--dangerously-skip-permissions",
-            ],
-            capture_output=True, text=True, timeout=30,
-        )
-
-        if result.returncode == 0:
-            data = json.loads(result.stdout.strip())
-            subtopics = data.get("subtopics", [])
-            if len(subtopics) >= count:
-                return [f"{topic} — focusing on {st}" for st in subtopics[:count]]
-    except Exception:
-        pass
-
-    return _split_subtopics_heuristic(topic, count)
-
-
 # ---------------------------------------------------------------------------
 # Agent planning
 # ---------------------------------------------------------------------------
-
-# Model overrides for specific roles (others use default "sonnet")
-ROLE_MODEL_OVERRIDES = {
-    "quality_judge": "sonnet",
-    "synthesizer": "sonnet",
-}
 
 PLANNING_SCHEMA = json.dumps({
     "type": "object",
@@ -344,25 +291,62 @@ def _resolve_role_prompt(
         raise
 
 
+HEURISTIC_PLAN = {
+    "researcher_count": 2,
+    "critic_count": 1,
+    "needs_fact_checker": True,
+    "subtopics": None,
+}
+
+
+def _cap_plan(researcher_count: int, critic_count: int, needs_fc: bool,
+              max_agents: int) -> tuple[int, int, bool]:
+    """Enforce `[swarm] max_agents` (core-loop-07). The quality judge and the
+    synthesizer are always spawned (2 slots); researchers shrink first, then
+    critics, then the fact-checker. Floors: 1 researcher, 1 critic."""
+    fixed = 2
+    while True:
+        total = researcher_count + critic_count + int(needs_fc) + fixed
+        if total <= max_agents:
+            return researcher_count, critic_count, needs_fc
+        if researcher_count > 1:
+            researcher_count -= 1
+        elif critic_count > 1:
+            critic_count -= 1
+        elif needs_fc:
+            needs_fc = False
+        else:
+            raise ValueError(
+                f"[swarm] max_agents = {max_agents} cannot fit the minimum swarm "
+                "(1 researcher + 1 critic + quality_judge + synthesizer = 4)"
+            )
+
+
 def plan_agents(
     topic: str,
     use_llm: bool = True,
     *,
     domain: str | None = None,
     persona_critics: bool | None = None,
+    backend_id: str | None = None,
+    sandbox: str | None = None,
+    max_agents: int | None = None,
 ) -> list[BlitzAgent]:
     """Plan which agents to spawn for a given topic.
 
     When use_llm=True, invokes an LLM to analyze the topic and determine
-    optimal agent count and subtopic assignments. Falls back to heuristic.
+    optimal agent count and subtopic assignments. Falls back to the heuristic
+    plan with a loud WARNING on stderr (core-loop-08).
 
     `domain` selects which preset under prompts/<domain>/ is used. If None,
     reads from blitz.toml [swarm] domain.
 
     `persona_critics` enables MAR-style persona-typed critic prompts (Phase 1).
     If None, reads from blitz.toml [swarm] persona_critics.
+
+    `max_agents` caps the roster (None -> blitz.toml [swarm] max_agents).
     """
-    if domain is None or persona_critics is None:
+    if domain is None or persona_critics is None or max_agents is None:
         try:
             from config import load_config
             cfg = load_config()
@@ -370,28 +354,41 @@ def plan_agents(
                 domain = cfg.swarm.domain
             if persona_critics is None:
                 persona_critics = cfg.swarm.persona_critics
+            if max_agents is None:
+                max_agents = cfg.swarm.max_agents
         except Exception:
             domain = domain or "general"
             persona_critics = bool(persona_critics)
+            max_agents = max_agents or 12
 
     loader = PromptLoader(domain=domain)
 
     plan = None
 
     if use_llm:
-        plan = _llm_plan(topic)
+        plan = _llm_plan(topic, backend_id=backend_id, sandbox=sandbox)
+        if plan is None:
+            print(
+                "WARNING: LLM agent planning failed (backend error or unparseable "
+                "plan) — falling back to the heuristic plan: 2 researchers, "
+                "1 critic, fact-checker, generic subtopic angles.",
+                file=sys.stderr,
+            )
 
     if plan is None:
-        plan = {
-            "researcher_count": 2,
-            "critic_count": 1,
-            "needs_fact_checker": True,
-            "subtopics": None,
-        }
+        plan = dict(HEURISTIC_PLAN)
 
-    researcher_count = plan["researcher_count"]
-    critic_count = plan["critic_count"]
-    needs_fc = plan["needs_fact_checker"]
+    researcher_count, critic_count, needs_fc = _cap_plan(
+        int(plan["researcher_count"]), int(plan["critic_count"]),
+        bool(plan["needs_fact_checker"]), int(max_agents),
+    )
+    if (researcher_count, critic_count, needs_fc) != (
+        plan["researcher_count"], plan["critic_count"], plan["needs_fact_checker"]
+    ):
+        print(
+            f"  max_agents={max_agents}: plan trimmed to {researcher_count} researchers, "
+            f"{critic_count} critics, fact_checker={'yes' if needs_fc else 'no'}"
+        )
 
     subtopics = plan.get("subtopics")
     if subtopics and len(subtopics) >= researcher_count:
@@ -409,7 +406,6 @@ def plan_agents(
             role="researcher",
             subtopic=subtopic,
             system_prompt=sys_prompt,
-            model=ROLE_MODEL_OVERRIDES.get("researcher", "sonnet"),
             prompt_path=path,
             prompt_sha256=sha,
         ))
@@ -437,7 +433,6 @@ def plan_agents(
                 role="critic",
                 subtopic=topic,
                 system_prompt=sys_prompt,
-                model="sonnet",
                 persona=persona,
                 prompt_path=path,
                 prompt_sha256=sha,
@@ -451,7 +446,6 @@ def plan_agents(
                 role="critic",
                 subtopic=topic,
                 system_prompt=sys_prompt,
-                model="sonnet",
                 prompt_path=path,
                 prompt_sha256=sha,
             ))
@@ -464,7 +458,6 @@ def plan_agents(
             role="fact_checker",
             subtopic=topic,
             system_prompt=sys_prompt,
-            model="sonnet",
             prompt_path=path,
             prompt_sha256=sha,
         ))
@@ -476,7 +469,6 @@ def plan_agents(
         role="quality_judge",
         subtopic=topic,
         system_prompt=sys_prompt,
-        model=ROLE_MODEL_OVERRIDES.get("quality_judge", "sonnet"),
         prompt_path=path,
         prompt_sha256=sha,
     ))
@@ -488,18 +480,21 @@ def plan_agents(
         role="synthesizer",
         subtopic=topic,
         system_prompt=sys_prompt,
-        model=ROLE_MODEL_OVERRIDES.get("synthesizer", "sonnet"),
         prompt_path=path,
         prompt_sha256=sha,
     ))
 
+    assert len(agents) <= max_agents, (len(agents), max_agents)
     return agents
 
 
-def _llm_plan(topic: str) -> dict | None:
+def _llm_plan(
+    topic: str,
+    *,
+    backend_id: str | None = None,
+    sandbox: str | None = None,
+) -> dict | None:
     """Use an LLM to determine optimal swarm composition for a topic."""
-    import subprocess
-
     prompt = (
         f"Analyze this research topic and determine the optimal agent swarm composition.\n\n"
         f"Topic: {topic}\n\n"
@@ -510,27 +505,56 @@ def _llm_plan(topic: str) -> dict | None:
         f"- What specific subtopics should each researcher focus on?"
     )
 
-    try:
-        result = subprocess.run(
-            [
-                "claude", "-p", prompt,
-                "--system-prompt", "You are a research planning assistant. Return JSON only.",
-                "--output-format", "json",
-                "--model", "haiku",
-                "--dangerously-skip-permissions",
-            ],
-            capture_output=True, text=True, timeout=30,
-        )
-
-        if result.returncode == 0:
-            data = json.loads(result.stdout.strip())
-            # Validate required fields
-            if all(k in data for k in ("researcher_count", "critic_count", "needs_fact_checker")):
-                data["researcher_count"] = max(2, min(6, int(data["researcher_count"])))
-                data["critic_count"] = max(1, min(3, int(data["critic_count"])))
-                return data
-
-    except Exception:
-        pass
+    data = _planning_backend_json(
+        prompt,
+        "You are a research planning assistant. Return JSON only.",
+        json.loads(PLANNING_SCHEMA),
+        timeout_s=30,
+        backend_id=backend_id,
+        sandbox=sandbox,
+    )
+    if data and all(k in data for k in ("researcher_count", "critic_count", "needs_fact_checker")):
+        data["researcher_count"] = max(2, min(6, int(data["researcher_count"])))
+        data["critic_count"] = max(1, min(3, int(data["critic_count"])))
+        return data
 
     return None
+
+
+def _planning_backend_json(
+    prompt: str,
+    system_prompt: str,
+    schema: dict,
+    *,
+    timeout_s: int = 30,
+    backend_id: str | None = None,
+    sandbox: str | None = None,
+) -> dict | None:
+    """Run a small planning call through the configured backend."""
+    try:
+        from backends import AgentCall, make_provider_backend, resolve_model
+        from config import load_config
+
+        cfg = load_config()
+        # Planning runs on the `planner` role tier (blitz.toml [models]).
+        resolved = resolve_model("planner", backend_id, cfg)
+        provider = cfg.backend.get_provider(resolved.backend_id)
+        resolved_sandbox = sandbox or provider.sandbox
+        backend = make_provider_backend(resolved.backend_id, cfg, sandbox=resolved_sandbox)
+        result = backend.call(AgentCall(
+            role="planner",
+            prompt=prompt,
+            system_prompt=system_prompt,
+            schema=schema,
+            model=resolved.model,
+            timeout_s=timeout_s,
+            sandbox=resolved_sandbox,
+            approval_policy=provider.approval_policy,
+            reasoning_effort=resolved.effort or provider.reasoning_effort or None,
+            ephemeral=provider.ephemeral,
+        ))
+        if result.errored:
+            return None
+        return result.parsed
+    except Exception:
+        return None

@@ -15,6 +15,12 @@ Lifecycle:
 
 Design notes:
 - `swarm_fn` is injected so tests can mock without spending $.
+- `swarm_fn` contract (bench-01): returns the output Path, or
+  `(Path, rounds)` where `rounds` is the per-round list of per-agent output
+  dicts. The MAST detectors (`bench.detectors.detect_all`) run only on real
+  per-agent outputs — never on aggregates. A plain Path still works: the
+  runner looks for a sibling `<output>.rounds.json` (the orchestrator writes
+  one) and otherwise records that the detectors did not run.
 - Per-prompt rows are appended to results.jsonl with fsync; the runner
   is resumable: re-running skips prompt_ids already present in the file.
 - Cost tracking uses `total_cost_usd` from `metrics.jsonl` (CLI envelope).
@@ -33,7 +39,7 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Iterable
+from typing import Any, Awaitable, Callable, Iterable, Sequence
 
 # Make the blitz-swarm package root importable when running as a module.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -41,13 +47,13 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from bench import BenchPrompt, BenchSlate, load_slate
-from bench.detectors import detect_all
+from bench.detectors import detect_all, research_quality_composite
 from bench.stats import bootstrap_ci, paired_t_test, cohens_d
 
 
 BENCH_ROOT = Path(__file__).resolve().parent
 RUNS_DIR = BENCH_ROOT / "runs"
-METRICS_PATH = _REPO_ROOT / "metrics.jsonl"
+METRICS_PATH = _REPO_ROOT / "output" / "metrics.jsonl"   # metrics.py writes here (WP3)
 
 
 # ---------------------------------------------------------------------------
@@ -64,11 +70,14 @@ class BenchConfig:
     slate_filter_tiers: tuple[str, ...] = ()
     slate_filter_domains: tuple[str, ...] = ()
     parallel_prompts: int = 2
-    per_prompt_timeout_s: int = 1200
+    # Audit fix C5a: hard research prompts routinely exceed 20 min; the old
+    # 1200s default produced spurious timeouts that poisoned the bench mean.
+    per_prompt_timeout_s: int = 3600
     total_budget_usd: float = 8.00
     max_rounds: int = 4
     use_redis: bool = False
     seed: int = 42
+    backend_id: str | None = None  # swarm backend (e.g. "claude"); None = blitz default
     started_utc: str = ""
     git_sha: str = ""
 
@@ -96,16 +105,40 @@ class PromptResult:
     output_tokens: int
     consensus_reached: bool
     rounds_to_consensus: int
-    quality: dict          # {coverage, accuracy, clarity, depth, avg}
+    quality: dict          # {coverage, accuracy, clarity, depth, avg} — LLM-judge (SECONDARY)
+    functional_composite: dict  # research_quality_composite() output (PRIMARY signal);
+                                # all-None (MISSING) on timeout/error — excluded from mean (C5a)
     coverage_hits: int
     coverage_total: int
     timeout: bool
     error: str | None
     mast_flags: list[str]
+    # bench-01: True only when detect_all actually ran on per-agent outputs.
+    # An empty mast_flags with this False means "not checked", not "clean".
+    mast_detectors_ran: bool = False
 
 
-# Type alias for the swarm function (injected for testing)
-SwarmFn = Callable[..., Awaitable[Path]]
+# Type alias for the swarm function (injected for testing). Returns either
+# the output Path or (Path, rounds) — see the module docstring.
+SwarmFn = Callable[..., Awaitable["Path | tuple[Path, list[list[dict]]]"]]
+
+
+def _split_swarm_result(result: Any) -> tuple[Any, list[list[dict]]]:
+    """Normalise a swarm_fn return value into (out_path, rounds)."""
+    if isinstance(result, tuple) and len(result) == 2:
+        out_path, rounds = result
+        if _valid_rounds(rounds):
+            return out_path, rounds
+        return out_path, []
+    return result, []
+
+
+def _valid_rounds(data: Any) -> bool:
+    return (
+        isinstance(data, list)
+        and all(isinstance(rnd, list) for rnd in data)
+        and all(isinstance(o, dict) for rnd in data for o in rnd)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +157,27 @@ def _git_sha() -> str:
         return sha[:12] if sha else "nogit"
     except Exception:
         return "nogit"
+
+
+def _blitz_swarm_version() -> str:
+    """Package version from installed metadata, else pyproject.toml, else 'unknown'.
+
+    bench-04: the old hard-coded "0.2.0-alpha" string went stale the first
+    time the version bumped and was written into every summary.json.
+    """
+    try:
+        from importlib.metadata import version as _pkg_version
+
+        return _pkg_version("blitz-swarm")
+    except Exception:
+        pass
+    try:
+        import tomllib
+
+        with open(_REPO_ROOT / "pyproject.toml", "rb") as f:
+            return str(tomllib.load(f)["project"]["version"])
+    except Exception:
+        return "unknown"
 
 
 def _run_id(cfg: BenchConfig, slate: BenchSlate) -> str:
@@ -172,6 +226,19 @@ def _coverage_count(md: str, expected: list[str]) -> int:
     return hits
 
 
+def _normalize_topic(topic: str) -> str:
+    """Normalize a topic string for robust metrics-record matching (H4).
+
+    Collapses every whitespace run to a single space, strips, casefolds, and
+    truncates to the first 120 characters. This tolerates the drift we have
+    observed between the prompt text the runner sends and the topic the swarm
+    writes to metrics.jsonl (trailing newlines, double spaces, case changes,
+    long-topic truncation) — drift that used to silently zero cost/tokens.
+    """
+    collapsed = " ".join((topic or "").split())
+    return collapsed.casefold()[:120]
+
+
 def _find_metrics_record_for_topic(
     topic: str,
     *,
@@ -180,11 +247,15 @@ def _find_metrics_record_for_topic(
 ) -> dict | None:
     """Find the most recent metrics.jsonl record matching the topic.
 
-    If after_timestamp is given, only rows with timestamp > after_timestamp
-    are considered (used to avoid picking up an old run with the same topic).
+    Audit fix H4: topics are compared via ``_normalize_topic`` (collapse
+    whitespace, strip, casefold, first 120 chars) instead of exact string
+    equality, PLUS the existing after-timestamp window so an old run with the
+    same topic is never picked up. A miss returns None — the caller logs it
+    loudly and records cost/tokens as 0 rather than crashing.
     """
     if not metrics_path.exists():
         return None
+    want = _normalize_topic(topic)
     matches: list[dict] = []
     with metrics_path.open() as f:
         for line in f:
@@ -195,7 +266,7 @@ def _find_metrics_record_for_topic(
                 row = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if row.get("topic") != topic:
+            if _normalize_topic(str(row.get("topic") or "")) != want:
                 continue
             if after_timestamp is not None and float(row.get("timestamp", 0)) <= after_timestamp:
                 continue
@@ -218,6 +289,71 @@ def _build_quality_dict(record: dict | None) -> dict:
     }
 
 
+def _slate_entry_for(prompt: BenchPrompt) -> dict:
+    """Build the `slate_entry` dict that `research_quality_composite` reads.
+
+    `BenchPrompt` (bench/__init__.py) is a frozen dataclass that only carries
+    `expected_coverage`; the upgrade slate's richer `expected_subtopics` field
+    is not loaded into the dataclass. We therefore feed the keyword list under
+    both `expected_subtopics` (coverage scoring) and leave sources empty unless
+    a future loader supplies them. This keeps the functional coverage sub-score
+    consistent with the existing keyword-based `_coverage_count`.
+    """
+    expected = list(prompt.expected_coverage)
+    return {
+        "expected_subtopics": expected,
+        "sources": [],
+    }
+
+
+# A composite scorecard for prompts that never produced an artifact
+# (timeout / error). Audit fix C5a: the composite is MISSING (None), not 0.0.
+# A prompt that never finished tells us nothing about artifact quality, so it
+# must be EXCLUDED from the functional mean — scoring it 0.0 punished slow
+# backends twice (timeout flag AND a quality crater) and poisoned A/B
+# comparisons. Missing prompts are surfaced loudly instead, via
+# summary["functional_composite"]["missing"] and summary["timeouts"].
+_MISSING_COMPOSITE: dict = {
+    "arxiv_validity": None,
+    "citation_grounding": None,
+    "citations": None,
+    "coverage": None,
+    "dedup_overlap": None,
+    "novelty": None,
+    "composite": None,
+}
+
+
+def _load_round_outputs(out_path: Any) -> list[list[dict]]:
+    """Best-effort load of per-agent round outputs for the MAST detectors (G6).
+
+    The detectors in ``bench/detectors.detect_all`` need the full per-round,
+    per-agent structured outputs as a ``list[list[dict]]``. metrics.jsonl does
+    not carry these. If a run writes a sibling ``rounds.json`` next to the
+    output markdown (``<output>.md`` -> ``<output>.rounds.json``, or a
+    ``rounds.json`` in the same directory), shaped as ``[[{...}, ...], ...]``,
+    we load and return it. Otherwise we return ``[]`` so the caller keeps
+    ``flags=[]`` rather than fabricating failure modes.
+    """
+    if not isinstance(out_path, Path):
+        return []
+    candidates = [
+        out_path.with_suffix(".rounds.json"),
+        out_path.parent / "rounds.json",
+    ]
+    for cand in candidates:
+        try:
+            if not cand.exists():
+                continue
+            data = json.loads(cand.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        # Validate shape: list of rounds, each a list of agent-output dicts.
+        if _valid_rounds(data):
+            return data
+    return []
+
+
 # ---------------------------------------------------------------------------
 # Per-prompt execution
 # ---------------------------------------------------------------------------
@@ -230,18 +366,27 @@ async def run_one_prompt(
     *,
     swarm_fn: SwarmFn,
     metrics_path: Path = METRICS_PATH,
+    prior: Sequence[str] = (),
 ) -> PromptResult:
-    """Run a single prompt through the swarm and collect its result."""
+    """Run a single prompt through the swarm and collect its result.
+
+    `prior` is the list of earlier prompt outputs (markdown) in the run, used
+    by the functional research-quality scorer to penalise near-duplicate
+    artifacts (novelty sub-score). Empty `prior` means everything is novel.
+    """
     started = time.monotonic()
     started_utc_iso = _utc()
     pre_run_timestamp = time.time()
 
     try:
-        out_path = await asyncio.wait_for(
+        swarm_result = await asyncio.wait_for(
             swarm_fn(
                 prompt.text,
                 max_rounds=cfg.max_rounds,
                 use_redis=cfg.use_redis,
+                # Only pass backend_id when set, so injected test swarm_fns that
+                # don't accept the kwarg keep working (default = blitz backend).
+                **({"backend_id": cfg.backend_id} if cfg.backend_id else {}),
             ),
             timeout=cfg.per_prompt_timeout_s,
         )
@@ -250,11 +395,23 @@ async def run_one_prompt(
     except Exception as e:
         return _error_result(prompt, run_dir, started, started_utc_iso, repr(e))
 
+    out_path, returned_rounds = _split_swarm_result(swarm_result)
     elapsed = round(time.monotonic() - started, 1)
 
     record = _find_metrics_record_for_topic(
         prompt.text, metrics_path=metrics_path, after_timestamp=pre_run_timestamp,
     )
+    # H4: one loud line per prompt so a metrics miss is never silent. A miss
+    # must not crash the run — cost/tokens stay 0 — but it must be visible.
+    if record is not None:
+        print(f"[bench] metrics record MATCHED for {prompt.id}", flush=True)
+    else:
+        print(
+            f"[bench] metrics record MISS for {prompt.id} — no metrics.jsonl row "
+            f"matched the normalized topic in the post-start window; "
+            f"cost/tokens recorded as 0",
+            flush=True,
+        )
 
     md = ""
     if isinstance(out_path, Path) and out_path.exists():
@@ -263,14 +420,28 @@ async def run_one_prompt(
         except OSError:
             md = ""
 
-    rounds_record = record.get("rounds", {}) if record else {}
-    rounds_list: list[list[dict]] = []  # we don't have full per-agent outputs in metrics
-    flags: list[str] = []  # rule-based detectors need agent-level outputs; deferred
-    # If we have a rounds dict from metrics, we can at least populate FM-3.3 / FM-3.1 hooks
-    # from aggregate signals. Full detector coverage requires hooking inside run_swarm.
+    # ---- G6 / bench-01: MAST failure-mode detectors (rule-based, no LLM) --
+    # detect_all() needs per-agent round outputs (list[list[dict]]). They come
+    # from the swarm_fn return value `(Path, rounds)` or from the sibling
+    # `<output>.rounds.json` the orchestrator writes. metrics.jsonl only
+    # carries aggregates, so without either the detectors do NOT run and the
+    # row says so (mast_detectors_ran=False) — we never fabricate "clean".
+    rounds_list = returned_rounds or _load_round_outputs(out_path)
+    detectors_ran = bool(rounds_list)
+    if detectors_ran:
+        flags = detect_all(rounds_list, output_md_chars=len(md))
+    else:
+        flags = []
+        print(
+            f"[bench] MAST detectors not run for {prompt.id} (no per-agent outputs)",
+            flush=True,
+        )
 
     quality = _build_quality_dict(record)
     coverage_hits = _coverage_count(md, prompt.expected_coverage)
+
+    # ---- G1: PRIMARY functional research-quality composite ----------------
+    functional = research_quality_composite(md, _slate_entry_for(prompt), prior=list(prior))
 
     return PromptResult(
         prompt_id=prompt.id,
@@ -286,11 +457,13 @@ async def run_one_prompt(
         consensus_reached=bool(record.get("consensus_reached", False)) if record else False,
         rounds_to_consensus=int(record.get("rounds_to_consensus", 0) or 0) if record else 0,
         quality=quality,
+        functional_composite=functional,
         coverage_hits=coverage_hits,
         coverage_total=len(prompt.expected_coverage),
         timeout=False,
         error=None,
         mast_flags=flags,
+        mast_detectors_ran=detectors_ran,
     )
 
 
@@ -309,6 +482,7 @@ def _timeout_result(prompt: BenchPrompt, run_dir: Path, started: float, started_
         consensus_reached=False,
         rounds_to_consensus=0,
         quality={"coverage": 0, "accuracy": 0, "clarity": 0, "depth": 0, "avg": 0.0},
+        functional_composite=dict(_MISSING_COMPOSITE),
         coverage_hits=0,
         coverage_total=len(prompt.expected_coverage),
         timeout=True,
@@ -334,6 +508,7 @@ def _error_result(
         consensus_reached=False,
         rounds_to_consensus=0,
         quality={"coverage": 0, "accuracy": 0, "clarity": 0, "depth": 0, "avg": 0.0},
+        functional_composite=dict(_MISSING_COMPOSITE),
         coverage_hits=0,
         coverage_total=len(prompt.expected_coverage),
         timeout=False,
@@ -397,11 +572,48 @@ def aggregate(run_dir: Path, slate: BenchSlate, cfg: BenchConfig) -> dict:
         else:
             by_tier[tier] = {"n": 0, "avg_quality": 0, "avg_cost": 0}
 
-    # MAST flag summary
+    # MAST flag summary (+ how many rows the detectors actually ran on)
     flag_counts: dict[str, int] = {}
     for r in rows:
         for fm in r.get("mast_flags", []) or []:
             flag_counts[fm] = flag_counts.get(fm, 0) + 1
+    mast_detectors_ran = sum(1 for r in rows if r.get("mast_detectors_ran"))
+
+    # PRIMARY signal — functional research-quality composite (deterministic).
+    # CONTRACT (read by the driver's _bench_avg_quality):
+    #   summary["functional_composite"] = {
+    #       "mean": <float 0..1> | None,        # None when NO prompt was scoreable
+    #       "per_prompt": {prompt_id: composite},  # scored prompts only
+    #       "missing": [prompt_id, ...],        # timeout/error rows, EXCLUDED from mean
+    #   }
+    # Audit fix C5a: a timed-out or errored prompt has no artifact to score.
+    # Its composite is MISSING (None) and must not contribute 0.0 to the mean
+    # — that punished slow backends twice and poisoned A/B comparisons. If
+    # every prompt is missing, mean is None (not 0.0): "no signal", never
+    # "measured zero quality". The driver falls back to the judge avg then.
+    fc_per_prompt: dict[str, float] = {}
+    fc_missing: list[str] = []
+    for r in rows:
+        pid = r.get("prompt_id")
+        if not pid:
+            continue
+        fc = r.get("functional_composite") or {}
+        comp = fc.get("composite")
+        if comp is None:
+            fc_missing.append(pid)
+            continue
+        fc_per_prompt[pid] = round(float(comp), 4)
+    fc_mean = (
+        round(statistics.mean(fc_per_prompt.values()), 4) if fc_per_prompt else None
+    )
+    functional_composite = {
+        "mean": fc_mean,
+        "per_prompt": fc_per_prompt,
+        "missing": sorted(fc_missing),
+    }
+    timeout_ids = sorted({
+        r["prompt_id"] for r in rows if r.get("timeout") and r.get("prompt_id")
+    })
 
     summary = {
         "schema_version": 1,
@@ -410,7 +622,7 @@ def aggregate(run_dir: Path, slate: BenchSlate, cfg: BenchConfig) -> dict:
         "ended_utc": _utc(),
         "code": {
             "git_sha": cfg.git_sha,
-            "blitz_swarm_version": "0.2.0-alpha",
+            "blitz_swarm_version": _blitz_swarm_version(),
             "python_version": sys.version.split()[0],
         },
         "config": {
@@ -430,6 +642,12 @@ def aggregate(run_dir: Path, slate: BenchSlate, cfg: BenchConfig) -> dict:
             "prompts_timed_out": len([r for r in rows if r.get("timeout")]),
             "prompts_errored": len([r for r in rows if r.get("error") and not r.get("timeout")]),
         },
+        # PRIMARY: deterministic functional research-quality composite.
+        "functional_composite": functional_composite,
+        # C5a: prompt ids that hit per_prompt_timeout_s — loud, machine-readable.
+        "timeouts": timeout_ids,
+        # SECONDARY: LLM-judge aggregate (kept for comparison, no longer the
+        # gating signal — the driver reads functional_composite.mean first).
         "aggregate_quality": by_dim,
         "by_tier": by_tier,
         "consensus": {
@@ -447,6 +665,8 @@ def aggregate(run_dir: Path, slate: BenchSlate, cfg: BenchConfig) -> dict:
             "output_tokens_total": sum(r.get("output_tokens", 0) for r in rows),
         },
         "mast_flags_summary": flag_counts,
+        # bench-01: rows on which detect_all actually ran. 0 => "not checked".
+        "mast_detectors_ran": mast_detectors_ran,
     }
 
     summary_path = run_dir / "summary.json"
@@ -454,7 +674,66 @@ def aggregate(run_dir: Path, slate: BenchSlate, cfg: BenchConfig) -> dict:
     return summary
 
 
-def write_stats_md(run_dir: Path, summary: dict) -> Path:
+def paired_comparison(summary: dict, baseline: dict) -> dict:
+    """Paired stats of this run vs a baseline run over the prompts both scored.
+
+    Pairs on `functional_composite.per_prompt` (the PRIMARY signal). Returns
+    n, mean delta, paired t, p, df, Cohen's d_z and the p-value method; with
+    n < 2 the test is not computable and `reason` says why (bench-03: no
+    fabricated p from one pair, no normal approximation at tiny n — see
+    bench/stats.t_two_sided_p).
+    """
+    mine = (summary.get("functional_composite") or {}).get("per_prompt") or {}
+    base = (baseline.get("functional_composite") or {}).get("per_prompt") or {}
+    common = sorted(set(mine) & set(base))
+    out: dict[str, Any] = {
+        "baseline_run_id": baseline.get("run_id", ""),
+        "n_pairs": len(common),
+        "prompt_ids": common,
+    }
+    if len(common) < 2:
+        out.update({"t_stat": None, "p_value": None, "df": None, "cohens_d": None,
+                    "mean_delta": None,
+                    "reason": "fewer than 2 prompts scored in both runs"})
+        return out
+    a = [float(mine[pid]) for pid in common]
+    b = [float(base[pid]) for pid in common]
+    t, p, df = paired_t_test(a, b)
+    out.update({
+        "mean_delta": round(statistics.mean(x - y for x, y in zip(a, b)), 4),
+        "t_stat": round(t, 4), "p_value": round(p, 6), "df": df,
+        "cohens_d": round(cohens_d(a, b), 4),
+        "p_method": _p_method(df),
+    })
+    return out
+
+
+def _p_method(df: int) -> str:
+    try:
+        import scipy  # noqa: F401
+
+        return "scipy.stats.t"
+    except ImportError:
+        from bench.stats import NORMAL_APPROX_MIN_DF
+
+        return "student-t (incomplete beta)" if df < NORMAL_APPROX_MIN_DF else "normal approx (df>=30)"
+
+
+def _paired_comparison_lines(summary: dict, baseline: dict) -> list[str]:
+    cmp = paired_comparison(summary, baseline)
+    lines = [f"## Paired comparison vs baseline `{cmp['baseline_run_id']}`", ""]
+    if cmp.get("p_value") is None:
+        lines.append(f"_Not computable: {cmp.get('reason')} (n={cmp['n_pairs']})._")
+    else:
+        lines.append(f"- Pairs: {cmp['n_pairs']} (functional composite, PRIMARY)")
+        lines.append(f"- Mean delta (this - baseline): {cmp['mean_delta']}")
+        lines.append(f"- Paired t = {cmp['t_stat']}, df = {cmp['df']}, p = {cmp['p_value']} ({cmp['p_method']})")
+        lines.append(f"- Cohen's d_z = {cmp['cohens_d']}")
+    lines.append("")
+    return lines
+
+
+def write_stats_md(run_dir: Path, summary: dict, *, baseline_summary: dict | None = None) -> Path:
     """Write a one-page stats.md report."""
     lines = [
         f"# Bench run {run_dir.name}",
@@ -465,11 +744,40 @@ def write_stats_md(run_dir: Path, summary: dict) -> Path:
         f"timed out {summary['slate']['prompts_timed_out']}, "
         f"errored {summary['slate']['prompts_errored']}",
         "",
-        "## Aggregate quality (0-10)",
-        "",
-        "| Dim | Mean | SD | CI95 |",
-        "|---|---|---|---|",
     ]
+
+    # PRIMARY: functional research-quality composite (0-1, deterministic).
+    fc = summary.get("functional_composite") or {}
+    lines.append("## Functional research-quality composite (0-1) — PRIMARY")
+    lines.append("")
+    fc_mean = fc.get("mean")
+    if fc_mean is None:
+        lines.append("Mean composite: **n/a — no scoreable prompts (all missing)**")
+    else:
+        lines.append(f"Mean composite: **{fc_mean}**")
+    missing = fc.get("missing") or []
+    if missing:
+        lines.append("")
+        lines.append(
+            f"Missing (timeout/error — excluded from mean): {', '.join(missing)}"
+        )
+    timeouts = summary.get("timeouts") or []
+    if timeouts:
+        lines.append("")
+        lines.append(f"Timed out: {', '.join(timeouts)}")
+    lines.append("")
+    per_prompt = fc.get("per_prompt") or {}
+    if per_prompt:
+        lines.append("| Prompt | Composite |")
+        lines.append("|---|---|")
+        for pid in sorted(per_prompt):
+            lines.append(f"| {pid} | {per_prompt[pid]} |")
+        lines.append("")
+
+    lines.append("## Aggregate quality (0-10) — SECONDARY (LLM-judge)")
+    lines.append("")
+    lines.append("| Dim | Mean | SD | CI95 |")
+    lines.append("|---|---|---|---|")
     for dim, stats_dict in summary["aggregate_quality"].items():
         ci = stats_dict["ci95"]
         lines.append(f"| {dim} | {stats_dict['mean']} | {stats_dict['stddev']} | "
@@ -489,9 +797,16 @@ def write_stats_md(run_dir: Path, summary: dict) -> Path:
         lines.append("|---|---|")
         for fm in sorted(summary["mast_flags_summary"]):
             lines.append(f"| {fm} | {summary['mast_flags_summary'][fm]} |")
+    elif summary.get("mast_detectors_ran", 0) > 0:
+        lines.append(
+            f"_No MAST flags raised (detectors ran on "
+            f"{summary['mast_detectors_ran']} prompt(s))._"
+        )
     else:
-        lines.append("_No MAST flags raised._")
+        lines.append("_MAST detectors not run (no per-agent outputs)._")
     lines.append("")
+    if baseline_summary is not None:
+        lines.extend(_paired_comparison_lines(summary, baseline_summary))
     lines.append("## Cost")
     lines.append("")
     cost = summary["cost"]
@@ -514,8 +829,13 @@ async def run_bench(
     *,
     swarm_fn: SwarmFn | None = None,
     metrics_path: Path = METRICS_PATH,
+    baseline_run_dir: Path | None = None,
 ) -> Path:
-    """Top-level: load slate, run prompts, aggregate. Returns the run dir."""
+    """Top-level: load slate, run prompts, aggregate. Returns the run dir.
+
+    `baseline_run_dir`: an earlier run dir; its summary.json is paired against
+    this run's per-prompt composites in stats.md (+ comparison.json).
+    """
     if swarm_fn is None:
         # Lazy import: only require orchestrator when actually running.
         from orchestrator import run_swarm
@@ -544,6 +864,22 @@ async def run_bench(
     budget_lock = asyncio.Lock()
     results_path = run_dir / "results.jsonl"
 
+    # Prior artifacts for the functional novelty sub-score. Seeded from any
+    # already-completed (resumed) outputs, then grown as prompts finish. A
+    # prompt scores novelty against whatever artifacts completed before it;
+    # under concurrency this is scheduling-dependent (best-effort) but the
+    # novelty weight is small (0.15) and distinct slate prompts score ~1.0
+    # regardless.
+    prior_lock = asyncio.Lock()
+    prior_outputs: list[str] = []
+    for _row in _read_results(run_dir):
+        _mp = _row.get("output_md_path") or ""
+        if _mp and Path(_mp).exists():
+            try:
+                prior_outputs.append(Path(_mp).read_text(encoding="utf-8"))
+            except OSError:
+                pass
+
     async def _bounded(p: BenchPrompt) -> PromptResult:
         async with sem:
             async with budget_lock:
@@ -553,14 +889,26 @@ async def run_bench(
                         "budget_exhausted",
                     )
                 budget_remaining[0] -= p.budget_usd
+            async with prior_lock:
+                prior_snapshot = list(prior_outputs)
             result = await run_one_prompt(
                 p, cfg, run_dir,
                 swarm_fn=swarm_fn,
                 metrics_path=metrics_path,
+                prior=prior_snapshot,
             )
             async with budget_lock:
                 # Refund unused budget
                 budget_remaining[0] += max(p.budget_usd - result.cost_usd, 0)
+            # Record this artifact so later prompts can score novelty against it.
+            if result.output_md_path and Path(result.output_md_path).exists():
+                async with prior_lock:
+                    try:
+                        prior_outputs.append(
+                            Path(result.output_md_path).read_text(encoding="utf-8")
+                        )
+                    except OSError:
+                        pass
             return result
 
     if pending:
@@ -573,7 +921,14 @@ async def run_bench(
                   f"{'TIMEOUT' if row.timeout else ('ERR' if row.error else 'ok')}")
 
     summary = aggregate(run_dir, slate, cfg)
-    write_stats_md(run_dir, summary)
+    baseline_summary = None
+    if baseline_run_dir is not None:
+        base_path = Path(baseline_run_dir) / "summary.json"
+        baseline_summary = json.loads(base_path.read_text(encoding="utf-8"))
+        (run_dir / "comparison.json").write_text(
+            json.dumps(paired_comparison(summary, baseline_summary), indent=2)
+        )
+    write_stats_md(run_dir, summary, baseline_summary=baseline_summary)
     return run_dir
 
 
@@ -594,9 +949,11 @@ def main():
     ap.add_argument("--parallel", type=int, default=2)
     ap.add_argument("--budget", type=float, default=8.0)
     ap.add_argument("--max-rounds", type=int, default=4)
-    ap.add_argument("--per-prompt-timeout", type=int, default=1200)
+    ap.add_argument("--per-prompt-timeout", type=int, default=3600)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--use-redis", action="store_true")
+    ap.add_argument("--baseline", default=None,
+                    help="earlier bench run dir to pair against (paired t / Cohen's d in stats.md)")
     args = ap.parse_args()
 
     cfg = BenchConfig(
@@ -611,7 +968,9 @@ def main():
         use_redis=args.use_redis,
         seed=args.seed,
     )
-    run_dir = asyncio.run(run_bench(cfg))
+    run_dir = asyncio.run(run_bench(
+        cfg, baseline_run_dir=Path(args.baseline) if args.baseline else None,
+    ))
     print(f"\nrun complete: {run_dir}")
 
 

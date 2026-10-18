@@ -1,14 +1,17 @@
-"""Managed Agents adapter — opt-in alternative to the CLI orchestrator.
+"""Managed Agents adapter — OPT-IN, PAID Anthropic API (rule-#10 exception).
 
 Default backend is local CLI subprocesses (rule #10 compliant). This
 adapter is for users who explicitly want server-side orchestration with
 the May 2026 Managed Agents beta features (multiagent sessions,
-Outcomes grader, persistent events, shared filesystem).
+Outcomes grader, persistent events, shared filesystem) and accept that it
+bills per token. See contrib/managed_agents/README.md.
 
-The adapter ships the structure but does not import the `anthropic`
-SDK at module-load — users must `pip install anthropic` to actually
-use it. Tests verify schema / spend-cap / coordinator-depth-1 logic
-without touching the network.
+The adapter ships the structure (spec validation, coordinator depth cap,
+spend caps) but does not import the `anthropic` SDK at module-load and
+does NOT implement the session call: `run_task` raises NotImplementedError
+with the real call shape documented, instead of returning a fake
+"completed" record (backends-02). Tests verify schema / spend-cap /
+coordinator-depth-1 logic without touching the network.
 """
 
 from __future__ import annotations
@@ -38,7 +41,9 @@ class ManagedAgentsConfig:
     session_max_runtime_min: int = 60
     spend_cap_usd_per_run: float = 5.0
     spend_cap_usd_per_day: float = 50.0
-    coordinator_model: str = "claude-opus-4-7"
+    # Set by the caller from config (e.g. resolve_model("coordinator", ...)
+    # or a [managed_agents] key); never a literal default here.
+    coordinator_model: str = ""
     coordinator_prompt: str = (
         "You are the coordinator of a research swarm. Decompose the topic "
         "into sub-questions, delegate to specialist agents, integrate their "
@@ -135,14 +140,36 @@ class ManagedAgentsAdapter:
         return adapter
 
     def estimate_run_cost(self, n_specialists: int, n_rounds: int) -> float:
-        """Rough cost estimate (Sonnet ≈ $0.05/round/specialist)."""
+        """Rough cost estimate (standard tier ≈ $0.05/round/specialist)."""
         return n_specialists * n_rounds * 0.05
 
     def run_task(self, topic: str, n_specialists: int, n_rounds: int) -> dict:
-        """Execute a swarm run via Managed Agents (network call here in prod).
+        """Pre-flight a swarm run via Managed Agents.
 
-        Pre-flight enforces spend cap. Real implementation issues
-        client.beta.sessions.create + events.create + events.stream.
+        Enforces the spend cap first. Without a client this returns a
+        `status: "stub"` dry-run record (no network, no spend). WITH a client
+        it raises NotImplementedError: the session call is not written, and
+        pretending it completed (the old fake "completed" record that charged
+        the spend tracker without calling anything) is worse than refusing.
+
+        The real call shape, when someone implements it against the
+        `managed-agents-2026-04-01` beta:
+
+            session = client.beta.sessions.create(
+                betas=[self.cfg.beta_header],
+                agents=[{"role": s.role, "model": s.model,
+                         "system": s.system_prompt, "tools": list(s.tools)}
+                        for s in specs],
+                coordinator={"model": self.cfg.coordinator_model,
+                             "system": self.cfg.coordinator_prompt},
+                max_runtime_minutes=self.cfg.session_max_runtime_min,
+            )
+            client.beta.sessions.events.create(session.id, content=topic)
+            for event in client.beta.sessions.events.stream(session.id):
+                ...  # collect outputs; record real usage via self.spend.record()
+
+        Only record spend from the provider's reported usage — never from
+        `estimate_run_cost`.
         """
         cost_estimate = self.estimate_run_cost(n_specialists, n_rounds)
         self.spend.assert_ok(cost_estimate)
@@ -155,10 +182,9 @@ class ManagedAgentsAdapter:
                 "note": "client not initialized; this is a dry-run scaffold",
             }
 
-        # Real implementation goes here — beta.sessions.create / events.stream.
-        self.spend.record(cost_estimate)
-        return {
-            "status": "completed",
-            "topic": topic,
-            "cost_usd": cost_estimate,
-        }
+        raise NotImplementedError(
+            "ManagedAgentsAdapter.run_task: the Managed Agents session call is "
+            "not implemented (see the docstring for the call shape). This "
+            "adapter is a paid-API, opt-in scaffold under contrib/ and must not "
+            "report a run as completed."
+        )

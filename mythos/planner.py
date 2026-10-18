@@ -1,7 +1,7 @@
 """Mythos Planner — decomposes a task into sub-specs + invariants.
 
-Plain agent: one shot of `claude -p --model opus --effort max` with the
-planner.md system prompt and the planner JSON schema. Replanning passes
+Plain agent: one shot through the configured backend at the `planner`
+role tier (mythos.toml / blitz.toml [models]) with the planner.md system prompt and the planner JSON schema. Replanning passes
 the prior plan + executor outputs + verifier feedback as additional
 context so the planner can fix what failed without redoing what worked.
 """
@@ -24,11 +24,12 @@ class Plan:
     rationale: str
     confidence: float
     raw: dict = field(default_factory=dict)
-    cost_usd: float = 0.0
+    cost_usd: float | None = None     # None = provider did not report cost
+    tokens: int = 0
     error: str | None = None
 
     @classmethod
-    def from_parsed(cls, parsed: dict, cost_usd: float) -> "Plan":
+    def from_parsed(cls, parsed: dict, cost_usd: float | None, tokens: int = 0) -> "Plan":
         return cls(
             task_summary=parsed.get("task_summary", ""),
             sub_specs=list(parsed.get("sub_specs", [])),
@@ -38,10 +39,11 @@ class Plan:
             confidence=float(parsed.get("confidence", 0.0)),
             raw=parsed,
             cost_usd=cost_usd,
+            tokens=tokens,
         )
 
     @classmethod
-    def errored(cls, error: str, cost_usd: float = 0.0) -> "Plan":
+    def errored(cls, error: str, cost_usd: float | None = None, tokens: int = 0) -> "Plan":
         return cls(
             task_summary="",
             sub_specs=[],
@@ -50,17 +52,24 @@ class Plan:
             rationale="",
             confidence=0.0,
             cost_usd=cost_usd,
+            tokens=tokens,
             error=error,
         )
 
 
-def decompose(task: str, config: MythosConfig) -> Plan:
-    """Initial decomposition pass."""
+def decompose(task: str, config: MythosConfig, *, prior_findings: str = "") -> Plan:
+    """Initial decomposition pass.
+
+    `prior_findings` is the fenced G-Memory block (gmemory.retrieval
+    FENCE_OPEN/FENCE_CLOSE) when `use_memory` is on; it is data for the
+    planner, never instructions, and empty when memory has nothing.
+    """
     system = _invoke.load_prompt("planner")
     user = (
         "## Task\n"
         f"{task}\n\n"
-        "## Your job\n"
+        + (f"{prior_findings}\n\n" if prior_findings else "")
+        + "## Your job\n"
         f"Decompose this task into at most {config.max_executors} parallel sub-specs "
         "with clear acceptance criteria and global invariants the verifier can check.\n\n"
         "Return only the JSON object matching the planner schema."
@@ -71,13 +80,15 @@ def decompose(task: str, config: MythosConfig) -> Plan:
         system_prompt=system,
         user_prompt=user,
         schema_json=PLANNER_SCHEMA_JSON,
-        model_alias=config.planner_model,
+        model_role="planner",
+        tier=config.planner_model,
         timeout_s=config.planner_timeout_s,
+        mode_backend=config.backend or None,
     )
 
     if res.parsed is None:
-        return Plan.errored(res.error or "planner returned no JSON", cost_usd=res.cost_usd)
-    return Plan.from_parsed(res.parsed, cost_usd=res.cost_usd)
+        return Plan.errored(res.error or "planner returned no JSON", cost_usd=res.cost_usd, tokens=res.tokens)
+    return Plan.from_parsed(res.parsed, cost_usd=res.cost_usd, tokens=res.tokens)
 
 
 def replan(
@@ -139,10 +150,12 @@ def replan(
         system_prompt=system,
         user_prompt=user,
         schema_json=PLANNER_SCHEMA_JSON,
-        model_alias=config.planner_model,
+        model_role="planner",
+        tier=config.planner_model,
         timeout_s=config.planner_timeout_s,
+        mode_backend=config.backend or None,
     )
 
     if res.parsed is None:
-        return Plan.errored(res.error or "replanner returned no JSON", cost_usd=res.cost_usd)
-    return Plan.from_parsed(res.parsed, cost_usd=res.cost_usd)
+        return Plan.errored(res.error or "replanner returned no JSON", cost_usd=res.cost_usd, tokens=res.tokens)
+    return Plan.from_parsed(res.parsed, cost_usd=res.cost_usd, tokens=res.tokens)

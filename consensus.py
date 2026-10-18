@@ -32,6 +32,22 @@ def extract_dissent(agent_outputs: list[dict]) -> list[dict]:
     return dissent
 
 
+def final_votes(all_rounds: list[list[dict]]) -> list[dict]:
+    """Each voting agent's LAST output across rounds, in first-seen order.
+
+    The dissent section reports only unresolved votes: an agent that voted
+    'needs_work' in round 1 and 'ready' in round 3 is not a dissenter
+    (core-loop-08). Outputs without a quality_vote are ignored.
+    """
+    last: dict[str, dict] = {}
+    for outputs in all_rounds:
+        for output in outputs:
+            if output.get("quality_vote") is None:
+                continue
+            last[output.get("agent_id", "unknown")] = output
+    return list(last.values())
+
+
 def should_override_holdout(round_n: int, agent_outputs: list[dict]) -> bool:
     """Check if a single holdout should be overridden.
 

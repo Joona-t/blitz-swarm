@@ -1,5 +1,7 @@
 # Phase 0 Bench Harness — Implementation Deep Dive
 
+> **Superseded 2026-10-11 (v0.3.0).** Frozen 2026-05-09 design output; kept as history. What actually shipped is in `README.md`, `docs/IMPLEMENTATION_STATUS.md` and `docs/CLAIMS_AND_EVIDENCE.md`. Paths below that do not exist in the tree are marked `[never created]`. Dollar figures below assumed paid Anthropic API pricing; every default path runs on the user's own CLI subscription (rule #10), so read them as **token budgets**, not spend — see the note in each budget section.
+
 **Status:** Frozen research output from background-task agent run 2026-05-09.
 **Source:** Phase 0 bench-harness deep-dive subagent.
 **Consumed by:** `bench/` implementation.
@@ -195,7 +197,7 @@ FM-3.3: avg quality > 8 AND output length < 500 chars
 
 ---
 
-## 4. Parallel-vs-sequential bench — `bench/parallel_vs_sequential.py`
+## 4. Parallel-vs-sequential bench — `bench/parallel_vs_sequential.py` `[never created]` — `bench/runner.py` is `swarm_fn`-injectable; the sequential topology was never written
 
 ### 4.1 Methodology (per Shen 2603.29632 + Google 2512.08296)
 
@@ -259,6 +261,9 @@ Anthropic pricing as of May 2026:
 
 ### 7.1 Realistic per-tier budget
 
+> **Reframed 2026-10-11 (research-docs-06):** the $ figures in this section were computed from paid-API list prices that no default path uses. Read each `$` as a *token budget* at the stated per-million rates (e.g. a "$0.08" easy cell ≈ 20k input-equivalent tokens on the standard tier); the actual cost on a subscription CLI is tokens against the user's plan, reported as `n/a` unless `[backend.providers.<id>.pricing]` is set. Nothing in this table has been measured: no live bench run exists (`docs/LIMITATIONS.md` 1).
+
+
 | Tier | Agents | Rounds | Models | Est. per-prompt | Slate count | Subtotal |
 |---|---|---|---|---|---|---|
 | easy | 4 | 2 | Sonnet only | $0.08 | 15 | $1.20 |
@@ -304,7 +309,7 @@ jobs:
         with: { python-version: '3.12' }
       - run: pip install -e '.[dev]' jsonlines scipy matplotlib
       - run: python bench/runner.py --filter s001 s003 s016 s022 s026 --budget 3.0
-      - run: python bench/regression_check.py
+      - run: python bench/regression_check.py   # [never created]; actual CI: .github/workflows/tests.yml runs pytest
       - uses: actions/upload-artifact@v4
         with: { name: bench-results, path: bench/runs/ }
 ```
@@ -367,8 +372,8 @@ Tagline: *"The first multi-agent research bench that fails the system, not just 
 |---|---|---|---|
 | Mon | `bench/slate_v1.toml` (30 prompts) + `bench/__init__.py` + skeleton tests | 350 LOC TOML + 30 LOC stub | data-only |
 | Tue | `bench/runner.py` + `bench/detectors.py` (MAST flags only) | ~600 LOC Python | runner runs against 5-prompt smoke |
-| Wed | `bench/mast_regression.py` (14 pytest cases) + `bench/sequential.py` | ~500 LOC Python | suite passes locally, no LLM cost |
-| Thu | `bench/parallel_vs_sequential.py` + `bench/stats.py` | ~250 LOC Python | first paired run executes |
+| Wed | `bench/mast_regression.py` (14 pytest cases) + `bench/sequential.py` `[never created]` | ~500 LOC Python | suite passes locally, no LLM cost |
+| Thu | `bench/parallel_vs_sequential.py` `[never created]` + `bench/stats.py` | ~250 LOC Python | first paired run executes |
 | Fri | Charts, summary.json polish, GitHub Actions, README, MIT release scaffold | ~150 LOC + docs | bench/runner.py ships green |
 
 ---
