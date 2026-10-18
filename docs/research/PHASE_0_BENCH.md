@@ -145,7 +145,7 @@ Full Python module skeleton with:
 - `run_bench` async orchestrator with semaphore + budget-lock + atomic JSONL appends
 - CLI argparse main
 
-(See full code in original deep-dive output preserved in agent transcript at `/private/tmp/claude-501/-Users-darkfire/.../tasks/a7c30054dc80bf3a5.output` — implementation will reproduce.)
+(See full code in original deep-dive output preserved in agent transcript at `<scratch>` — implementation will reproduce.)
 
 ### 2.3 Sequential baseline — `run_sequential_swarm`
 
