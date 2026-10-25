@@ -138,3 +138,23 @@ pip install redis aiosqlite lancedb sentence-transformers
 ## License
 
 MIT. Build on it. Break it. Make it better.
+
+## Neural Quest Lab MVP
+
+This repo now also includes a separate local Streamlit app at [neural_quest_lab/app.py](neural_quest_lab/app.py).
+
+It is a Python-first neural network simulator with:
+
+- a transparent autograd engine
+- Academy / Playground / Sandbox / Profile modes
+- SQLite-backed XP, quests, badges, and experiment logs
+- live decision-boundary and training telemetry plots
+
+Launch it with:
+
+```bash
+pip install -e .[lab]
+streamlit run neural_quest_lab/app.py
+```
+
+More detail lives in [neural_quest_lab/README.md](neural_quest_lab/README.md).

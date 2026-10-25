@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "blitz-swarm"
 version = "0.1.0"
@@ -15,3 +19,17 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest", "pytest-asyncio"]
+lab = ["streamlit>=1.42", "plotly>=5.24"]
+
+[tool.setuptools]
+py-modules = [
+    "agents",
+    "blackboard",
+    "config",
+    "consensus",
+    "embedder",
+    "orchestrator",
+]
+
+[tool.setuptools.packages.find]
+include = ["memory", "memory.*", "neural_quest_lab", "neural_quest_lab.*"]

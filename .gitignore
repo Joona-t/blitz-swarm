@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 *.pyo
 .DS_Store
+node_modules/
 output/
 *.db
 memory_vectors/
