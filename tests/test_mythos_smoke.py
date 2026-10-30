@@ -29,7 +29,7 @@ def test_mythos_package_imports():
     finally:
         sys.path.pop(0)
     assert run_mythos is not None
-    assert MythosConfig().planner_model == "mythos"
+    assert MythosConfig().planner_model == "opus"
 
 
 def test_resolve_model_aliases():
@@ -42,7 +42,7 @@ def test_resolve_model_aliases():
     assert resolve_model("sonnet") == ("sonnet", None)
     assert resolve_model("opus") == ("opus", None)
     # Unknown alias passes through
-    assert resolve_model("claude-opus-4-7") == ("claude-opus-4-7", None)
+    assert resolve_model("claude-opus-5-5") == ("claude-opus-5-5", None)
 
 
 def test_cost_budget():
@@ -68,9 +68,9 @@ def test_load_mythos_config_with_toml():
         sys.path.pop(0)
     cfg = load_mythos_config(REPO_ROOT / "mythos.toml")
     # Defaults from mythos.toml
-    assert cfg.planner_model == "mythos"
+    assert cfg.planner_model == "opus"
     assert cfg.executor_model == "sonnet"
-    assert cfg.verifier_model == "mythos"
+    assert cfg.verifier_model == "opus"
     assert cfg.cost_ceiling_usd == 5.0
     assert cfg.max_replans == 3
 

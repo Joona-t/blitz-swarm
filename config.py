@@ -13,7 +13,8 @@ CONFIG_PATH = Path(__file__).parent / "blitz.toml"
 @dataclass
 class SwarmConfig:
     max_rounds: int = 5
-    default_model: str = "sonnet"
+    default_model: str = "sonnet"     # workers: researchers, critics, fact-checker
+    orchestrator_model: str = "opus"  # planning, quality judge, synthesizer
     timeout_seconds: int = 180
     max_agents: int = 12
     domain: str = "general"           # which prompts/<domain>/ preset to load

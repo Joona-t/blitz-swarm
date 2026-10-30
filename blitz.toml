@@ -2,7 +2,11 @@
 
 [swarm]
 max_rounds = 4
+# Sonnet researches (researchers, critics, fact-checker); Opus orchestrates (swarm planning,
+# quality judge, synthesizer). Both are `claude -p --model` aliases, so they track the current
+# models (claude-sonnet-5-5 / claude-opus-5-5 on 2026-10-30) without editing this file.
 default_model = "sonnet"
+orchestrator_model = "opus"
 timeout_seconds = 300
 max_agents = 10
 # Domain preset for role prompts. Loads from prompts/<domain>/.

@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.2.1] — 2026-10-30
+
+### Opus orchestrates, Sonnet researches
+
+- **Role split:** the quality judge, synthesizer and both planning calls now run on `[swarm] orchestrator_model`
+  (default `"opus"`); researchers, critics and the fact-checker stay on `default_model` (`"sonnet"`). Both are
+  `claude -p --model` aliases, so they track the current models. Probed 2026-10-30: `opus` → `claude-opus-5-5`,
+  `sonnet` → `claude-sonnet-5-5`, `haiku` → `claude-haiku-5-5`. Haiku stays on memory extraction and retrieval scoring.
+- **Fix (audit H3):** `_llm_plan` and `_split_subtopics_llm` read the planning keys off the CLI envelope, where they
+  never are, so every run fell back to the heuristic plan. They now pass `--json-schema` and read
+  `envelope["structured_output"]` (the fix `mythos/_invoke.py` got in b995365), with `--max-turns 4` and a 120 s timeout.
+- **Mythos mode runs on plain Opus** (owner, 2026-10-30: no longer has Mythos access, "just use opus"): planner and
+  verifier default to `opus` in `mythos/policies.py`, `mythos.toml` and `MYTHOS-SWARM.md`. The `mythos` alias still
+  resolves to Opus at effort=max for old configs.
+- Stale `claude-opus-4-7` references updated in `mythos/policies.py`, `managed_agents/adapter.py` and a test fixture;
+  dated research notes are left as written.
+- `tests/test_model_roles.py`: 5 tests (role split, config override, planner parsing, envelope-key regression, error fallback).
+
 ## [0.2.0] — 2026-05-09
 
 ### Frontier methodology + mechanism + memory + recursion upgrade

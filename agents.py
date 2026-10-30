@@ -237,14 +237,54 @@ def _split_subtopics_heuristic(topic: str, count: int) -> list[str]:
     return subtopics
 
 
-def _split_subtopics_llm(topic: str, count: int) -> list[str]:
-    """Split a topic into subtopics using an LLM call.
+PLANNER_TIMEOUT_S = 120
 
-    Invokes claude -p to analyze the topic and generate targeted subtopics.
-    Falls back to heuristic if the LLM call fails.
+
+def _orchestrator_model() -> str:
+    """Opus orchestrates: swarm planning, quality judge, synthesizer (blitz.toml [swarm] orchestrator_model)."""
+    try:
+        from config import load_config
+        return load_config().swarm.orchestrator_model
+    except Exception:
+        return "opus"
+
+
+def _call_planner(prompt: str, schema: str) -> dict | None:
+    """One orchestrator call that returns the parsed JSON object, or None.
+
+    `claude -p --json-schema` puts the parsed object in envelope["structured_output"]; the envelope
+    itself never has the planning keys (same fix as mythos/_invoke.py, b995365). --max-turns 4
+    because the structured-output tool call consumes a turn.
     """
     import subprocess
 
+    result = subprocess.run(
+        [
+            "claude", "-p", prompt,
+            "--system-prompt", "You are a research planning assistant. Return JSON only.",
+            "--output-format", "json",
+            "--json-schema", schema,
+            "--model", _orchestrator_model(),
+            "--max-turns", "4",
+            "--dangerously-skip-permissions",
+        ],
+        capture_output=True, text=True, timeout=PLANNER_TIMEOUT_S,
+    )
+    if result.returncode != 0:
+        return None
+    envelope = json.loads(result.stdout.strip())
+    if not isinstance(envelope, dict) or envelope.get("is_error"):
+        return None
+    data = envelope.get("structured_output")
+    return data if isinstance(data, dict) else None
+
+
+def _split_subtopics_llm(topic: str, count: int) -> list[str]:
+    """Split a topic into subtopics using an LLM call.
+
+    Invokes the orchestrator model to analyze the topic and generate targeted subtopics.
+    Falls back to heuristic if the LLM call fails.
+    """
     schema = json.dumps({
         "type": "object",
         "properties": {
@@ -266,22 +306,10 @@ def _split_subtopics_llm(topic: str, count: int) -> list[str]:
     )
 
     try:
-        result = subprocess.run(
-            [
-                "claude", "-p", prompt,
-                "--system-prompt", "You are a research planning assistant. Return JSON only.",
-                "--output-format", "json",
-                "--model", "haiku",
-                "--dangerously-skip-permissions",
-            ],
-            capture_output=True, text=True, timeout=30,
-        )
-
-        if result.returncode == 0:
-            data = json.loads(result.stdout.strip())
-            subtopics = data.get("subtopics", [])
-            if len(subtopics) >= count:
-                return [f"{topic} — focusing on {st}" for st in subtopics[:count]]
+        data = _call_planner(prompt, schema)
+        subtopics = (data or {}).get("subtopics", [])
+        if len(subtopics) >= count:
+            return [f"{topic} — focusing on {st}" for st in subtopics[:count]]
     except Exception:
         pass
 
@@ -292,11 +320,8 @@ def _split_subtopics_llm(topic: str, count: int) -> list[str]:
 # Agent planning
 # ---------------------------------------------------------------------------
 
-# Model overrides for specific roles (others use default "sonnet")
-ROLE_MODEL_OVERRIDES = {
-    "quality_judge": "sonnet",
-    "synthesizer": "sonnet",
-}
+# Model split: the quality judge, synthesizer and planning calls run on blitz.toml [swarm]
+# orchestrator_model (opus); researchers, critics and the fact-checker are Sonnet workers.
 
 PLANNING_SCHEMA = json.dumps({
     "type": "object",
@@ -409,7 +434,7 @@ def plan_agents(
             role="researcher",
             subtopic=subtopic,
             system_prompt=sys_prompt,
-            model=ROLE_MODEL_OVERRIDES.get("researcher", "sonnet"),
+            model="sonnet",
             prompt_path=path,
             prompt_sha256=sha,
         ))
@@ -476,7 +501,7 @@ def plan_agents(
         role="quality_judge",
         subtopic=topic,
         system_prompt=sys_prompt,
-        model=ROLE_MODEL_OVERRIDES.get("quality_judge", "sonnet"),
+        model=_orchestrator_model(),
         prompt_path=path,
         prompt_sha256=sha,
     ))
@@ -488,7 +513,7 @@ def plan_agents(
         role="synthesizer",
         subtopic=topic,
         system_prompt=sys_prompt,
-        model=ROLE_MODEL_OVERRIDES.get("synthesizer", "sonnet"),
+        model=_orchestrator_model(),
         prompt_path=path,
         prompt_sha256=sha,
     ))
@@ -497,9 +522,7 @@ def plan_agents(
 
 
 def _llm_plan(topic: str) -> dict | None:
-    """Use an LLM to determine optimal swarm composition for a topic."""
-    import subprocess
-
+    """Use the orchestrator model to determine optimal swarm composition for a topic."""
     prompt = (
         f"Analyze this research topic and determine the optimal agent swarm composition.\n\n"
         f"Topic: {topic}\n\n"
@@ -511,25 +534,11 @@ def _llm_plan(topic: str) -> dict | None:
     )
 
     try:
-        result = subprocess.run(
-            [
-                "claude", "-p", prompt,
-                "--system-prompt", "You are a research planning assistant. Return JSON only.",
-                "--output-format", "json",
-                "--model", "haiku",
-                "--dangerously-skip-permissions",
-            ],
-            capture_output=True, text=True, timeout=30,
-        )
-
-        if result.returncode == 0:
-            data = json.loads(result.stdout.strip())
-            # Validate required fields
-            if all(k in data for k in ("researcher_count", "critic_count", "needs_fact_checker")):
-                data["researcher_count"] = max(2, min(6, int(data["researcher_count"])))
-                data["critic_count"] = max(1, min(3, int(data["critic_count"])))
-                return data
-
+        data = _call_planner(prompt, PLANNING_SCHEMA)
+        if data and all(k in data for k in ("researcher_count", "critic_count", "needs_fact_checker")):
+            data["researcher_count"] = max(2, min(6, int(data["researcher_count"])))
+            data["critic_count"] = max(1, min(3, int(data["critic_count"])))
+            return data
     except Exception:
         pass
 

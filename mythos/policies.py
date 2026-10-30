@@ -16,11 +16,12 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 # alias -> (claude --model value, --effort value or None)
-# CLI probe (2026-05-09) confirmed: --model opus routes to claude-opus-4-7,
-# --effort accepts {low, medium, high, xhigh, max}. Mythos = opus + effort max.
+# CLI probe (2026-10-30): --model opus -> claude-opus-5-5, sonnet -> claude-sonnet-5-5, haiku -> claude-haiku-5-5
+# (modelUsage in the `claude -p --output-format json` envelope). --effort accepts {low, medium, high, xhigh, max}.
+# Mythos = opus + effort max. Aliases track the latest model, so no edit is needed when a new one ships.
 MODEL_ALIASES: dict[str, tuple[str, str | None]] = {
-    "mythos": ("opus", "max"),     # extended-thinking Opus; the killer model
-    "opus": ("opus", None),        # plain Opus 4.7 — orchestration without thinking budget
+    "mythos": ("opus", "max"),     # kept for old configs: plain Opus at max effort, not a separate model
+    "opus": ("opus", None),        # plain Opus — orchestration without thinking budget
     "sonnet": ("sonnet", None),    # workhorse executor
     "haiku": ("haiku", None),      # cheapest executor
 }
@@ -30,7 +31,7 @@ def resolve_model(alias: str) -> tuple[str, str | None]:
     """Map an alias to (model, effort) for `claude -p` invocation.
 
     Unknown aliases pass through unchanged with effort=None — lets users
-    pass concrete model IDs (e.g. "claude-opus-4-7") directly.
+    pass concrete model IDs (e.g. "claude-opus-5-5") directly.
     """
     if alias in MODEL_ALIASES:
         return MODEL_ALIASES[alias]
@@ -66,9 +67,9 @@ class CostBudget:
 @dataclass
 class MythosConfig:
     # Models (aliases — resolved via resolve_model at call time)
-    planner_model: str = "mythos"
+    planner_model: str = "opus"
     executor_model: str = "sonnet"
-    verifier_model: str = "mythos"
+    verifier_model: str = "opus"
 
     # Loop budget
     max_replans: int = 3
