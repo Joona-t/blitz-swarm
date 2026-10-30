@@ -160,3 +160,24 @@ CLI probe (2026-05-09): `claude -p --model opus` routes to `claude-opus-4-7` wit
 **Root cause:** Why it happened
 **Fix:** What was done to resolve it
 -->
+
+---
+
+## 2026-10-30: planner never used its result; judge and synthesizer were on Sonnet
+
+**Problem:** `_llm_plan` / `_split_subtopics_llm` looked for planning keys on the `claude -p --output-format json`
+envelope; `--json-schema` was never passed. Every run spent a haiku call and fell back to the heuristic (audit H3,
+`docs/audit/2026-10-27/AUDIT.md`). Separately, the judge and synthesizer were hard-wired to Sonnet.
+
+**Root cause:** the Mythos path was fixed in b995365 (read `envelope.structured_output`); the consensus path was never
+touched, and nothing tested the parse against a realistic envelope.
+
+**Fix:** `agents.py::_call_planner` (schema + `structured_output` + `is_error` check) shared by both planning calls;
+`[swarm] orchestrator_model = "opus"` drives planning, judge and synthesizer; researchers, critics and the fact-checker
+stay on Sonnet. 5 new tests incl. a regression that fails if planning keys are read off the envelope.
+
+**Verified:** 252 passed, 14 skipped (baseline 247 passed, 14 skipped). Alias resolution probed live. **Not verified:**
+a live end-to-end planner call (the live run was blocked by the permission classifier; the tests mock the CLI).
+
+**Compliance:** all calls go through the `claude` CLI subscription. `managed_agents/` still has an `ANTHROPIC_API_KEY`
+path (paid API, against the no-paid-API rule); left untouched and flagged.

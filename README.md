@@ -3,7 +3,7 @@
 **A parallel multi-agent architecture for consensus-driven research synthesis, with hierarchical memory, frontier-paper mechanisms, and a recursive self-improvement loop.**
 
 [![Tests](https://img.shields.io/badge/tests-238_passing-brightgreen)](#testing)
-[![Version](https://img.shields.io/badge/version-v0.2.0-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-v0.2.1-blue)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 ---
@@ -113,7 +113,8 @@ python -m bench.mast_regression --write
 ```toml
 [swarm]
 max_rounds = 4
-default_model = "sonnet"
+default_model = "sonnet"            # workers: researchers, critics, fact-checker
+orchestrator_model = "opus"        # planning, quality judge, synthesizer
 domain = "crypto"            # or "general"; loads prompts/<domain>/
 persona_critics = false      # MAR personas (factual/logical/counterfactual)
 
@@ -219,7 +220,7 @@ blitz-swarm/
   title = {Blitz-Swarm v0.2: Frontier multi-agent research swarm with recursive self-improvement},
   year = {2026},
   url = {https://github.com/Joona-t/blitz-swarm},
-  version = {0.2.0},
+  version = {0.2.1},
   license = {MIT}
 }
 ```

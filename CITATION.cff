@@ -8,7 +8,7 @@ authors:
     alias: Darkfire
 repository-code: "https://github.com/Joona-t/blitz-swarm"
 license: MIT
-version: "0.1.0"
+version: "0.2.1"
 date-released: "2026-03-12"
 abstract: >-
   A parallel multi-agent architecture where all agents execute simultaneously,

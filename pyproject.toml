@@ -1,6 +1,6 @@
 [project]
 name = "blitz-swarm"
-version = "0.1.0"
+version = "0.2.1"
 description = "Parallel multi-agent swarm architecture for collective AI intelligence"
 readme = "README.md"
 license = "MIT"

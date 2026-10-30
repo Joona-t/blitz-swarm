@@ -42,7 +42,7 @@ def test_resolve_model_aliases():
     assert resolve_model("sonnet") == ("sonnet", None)
     assert resolve_model("opus") == ("opus", None)
     # Unknown alias passes through
-    assert resolve_model("claude-opus-4-7") == ("claude-opus-4-7", None)
+    assert resolve_model("claude-opus-5-5") == ("claude-opus-5-5", None)
 
 
 def test_cost_budget():
