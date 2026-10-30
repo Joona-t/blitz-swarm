@@ -20,7 +20,7 @@ from pathlib import Path
 # (modelUsage in the `claude -p --output-format json` envelope). --effort accepts {low, medium, high, xhigh, max}.
 # Mythos = opus + effort max. Aliases track the latest model, so no edit is needed when a new one ships.
 MODEL_ALIASES: dict[str, tuple[str, str | None]] = {
-    "mythos": ("opus", "max"),     # extended-thinking Opus; the killer model
+    "mythos": ("opus", "max"),     # kept for old configs: plain Opus at max effort, not a separate model
     "opus": ("opus", None),        # plain Opus — orchestration without thinking budget
     "sonnet": ("sonnet", None),    # workhorse executor
     "haiku": ("haiku", None),      # cheapest executor
@@ -67,9 +67,9 @@ class CostBudget:
 @dataclass
 class MythosConfig:
     # Models (aliases — resolved via resolve_model at call time)
-    planner_model: str = "mythos"
+    planner_model: str = "opus"
     executor_model: str = "sonnet"
-    verifier_model: str = "mythos"
+    verifier_model: str = "opus"
 
     # Loop budget
     max_replans: int = 3

@@ -75,9 +75,9 @@ Two layers. CLI flags override `mythos.toml` overrides defaults.
 
 ```toml
 [models]
-planner_model  = "mythos"   # "mythos" alias resolves to opus + effort=max
+planner_model  = "opus"     # plain Opus; the old "mythos" alias is Opus at effort=max, not a separate model
 executor_model = "sonnet"   # cheap parallelism
-verifier_model = "mythos"
+verifier_model = "opus"
 
 [policies]
 max_replans       = 3

@@ -4,11 +4,11 @@
 
 [models]
 # Aliases resolved via mythos.policies.MODEL_ALIASES.
-# Default: planner + verifier on Mythos (extended-thinking Opus),
-# executor on Sonnet for cheap parallelism.
-planner_model = "mythos"
+# Default: planner + verifier on Opus, executor on Sonnet for cheap parallelism.
+# ("mythos" still resolves to Opus at effort=max, but no Mythos model is assumed.)
+planner_model = "opus"
 executor_model = "sonnet"
-verifier_model = "mythos"
+verifier_model = "opus"
 
 [policies]
 # Loop budget
