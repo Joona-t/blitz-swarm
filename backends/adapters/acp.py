@@ -69,6 +69,14 @@ STOP_ERRORS = {
 }
 
 
+class _Timeout(Exception):
+    pass
+
+
+class _AgentExited(Exception):
+    pass
+
+
 class _Rpc:
     """Minimal JSON-RPC client over a child process's stdio."""
 
@@ -99,8 +107,13 @@ class _Rpc:
             del self.stderr_tail[:-20]
 
     def send(self, obj: dict) -> None:
-        self.proc.stdin.write(json.dumps(obj) + "\n")
-        self.proc.stdin.flush()
+        try:
+            self.proc.stdin.write(json.dumps(obj) + "\n")
+            self.proc.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            # the agent died between our messages (seen as a race in the
+            # crash test): report it as an exit, not a traceback
+            raise _AgentExited()
 
     def request(self, method: str, params: dict) -> int:
         rid = self._next_id
@@ -115,14 +128,6 @@ class _Rpc:
         else:
             msg["result"] = result or {}
         self.send(msg)
-
-
-class _Timeout(Exception):
-    pass
-
-
-class _AgentExited(Exception):
-    pass
 
 
 @dataclass

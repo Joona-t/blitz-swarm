@@ -562,6 +562,75 @@ async def blast_agents(
 # ---------------------------------------------------------------------------
 
 
+# Share of MAX_CONTEXT_CHARS each section may use. Before 2026-11-04 every
+# researcher was cut to 800 chars, critics/judges to 500, and the whole
+# string was then cut at MAX_CONTEXT_CHARS oldest-first, so with 4
+# researchers x 3 rounds the synthesizer lost half of the final round and
+# ALL critic and judge text (AUDIT 2026-10-27 H2). Budgets are per section
+# and newest round comes first, so a section can shrink but never vanish.
+CONTEXT_BUDGET = {
+    "researcher": 0.60,
+    "critic": 0.18,
+    "fact_checker": 0.12,
+    "quality_judge": 0.10,
+}
+# Per-entry caps: the newest round keeps full findings (up to the section
+# budget); older rounds are summarised to this many chars each.
+CONTEXT_OLDER_ROUND_CHARS = 600
+
+
+def _round_of(o: dict) -> int:
+    try:
+        return int(o.get("_round") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _render_section(title: str, outputs: list[dict], budget: int, *, with_header: bool) -> list[str]:
+    """Newest round first; the newest round's entries are kept whole (within
+    budget), older rounds are capped per entry; the oldest entries are the
+    first to go when the budget runs out. At least one entry always survives,
+    truncated to the budget, so the section can never be silently empty."""
+    if not outputs:
+        return []
+    ordered = sorted(outputs, key=_round_of, reverse=True)
+    newest = _round_of(ordered[0])
+    n_newest = sum(1 for o in ordered if _round_of(o) == newest)
+    # Every newest-round entry gets an equal slice, so all of them appear
+    # even when one agent writes far more than the others.
+    newest_cap = max(200, budget // max(1, n_newest) - 160)   # 160 ~ header + fence overhead
+    rendered: list[str] = []
+    used = 0
+    for o in ordered:
+        aid = o.get("agent_id", "unknown")
+        findings = (o.get("findings", "") or "")
+        if _round_of(o) == newest:
+            if len(findings) > newest_cap:
+                findings = findings[:newest_cap] + " [truncated to share]"
+        else:
+            findings = findings[:CONTEXT_OLDER_ROUND_CHARS]
+        body = findings
+        kps = o.get("key_points", []) or []
+        if with_header and kps:
+            body += "\nKey points: " + "; ".join(str(k) for k in kps[:5])
+        if with_header:
+            conf = o.get("confidence", 0) or 0
+            head = f"**{aid}** (confidence: {conf:.0%}, round {_round_of(o)}):"
+        else:
+            head = f"**{aid}** (round {_round_of(o)}):"
+        remaining = budget - used
+        if _round_of(o) != newest:
+            # older rounds are optional: stop when the budget is spent
+            if remaining <= 0 or len(body) > remaining:
+                break
+        elif len(body) > remaining and remaining > 0 and n_newest == 1:
+            body = body[:remaining] + "\n[truncated to section budget]"
+        block = head + "\n" + fence_agent_output(aid, body) + "\n"
+        rendered.append(block)
+        used += len(block)
+    return [f"### {title}", *rendered]
+
+
 def build_context(outputs: list[dict], for_role: str = "") -> str:
     """Build a role-filtered context string from agent outputs.
 
@@ -573,63 +642,34 @@ def build_context(outputs: list[dict], for_role: str = "") -> str:
     - Researchers see: prior researcher findings + critic feedback
     - Critics/Fact-checkers/Judges see: all researcher findings + prior critic feedback
     - Synthesizer sees: everything
+
+    Each section has its own share of MAX_CONTEXT_CHARS (CONTEXT_BUDGET),
+    newest round first; no section is dropped by a later one overflowing.
     """
-    sections = []
-
-    by_role = {}
+    by_role: dict[str, list[dict]] = {}
     for o in outputs:
-        role = o.get("role", "unknown")
-        by_role.setdefault(role, []).append(o)
+        by_role.setdefault(o.get("role", "unknown"), []).append(o)
 
-    researcher_outputs = by_role.get("researcher", [])
-    critic_outputs = by_role.get("critic", [])
-    fc_outputs = by_role.get("fact_checker", [])
-    judge_outputs = by_role.get("quality_judge", [])
+    sees_feedback = for_role in ("critic", "fact_checker", "quality_judge", "synthesizer", "researcher")
+    plan = [("Researcher Findings", "researcher", True, True)]
+    plan.append(("Critic Feedback", "critic", False, sees_feedback))
+    plan.append(("Fact-Checker Verification", "fact_checker", False, sees_feedback))
+    plan.append(("Quality Judge Assessment", "quality_judge", False, for_role == "synthesizer"))
 
-    def _fenced(o: dict, body: str) -> str:
-        return fence_agent_output(o.get("agent_id", "unknown"), body)
-
-    # All roles see researcher findings
-    if researcher_outputs:
-        sections.append("### Researcher Findings")
-        for o in researcher_outputs:
-            aid = o.get("agent_id", "unknown")
-            findings = (o.get("findings", "") or "")[:800]
-            kps = o.get("key_points", []) or []
-            conf = o.get("confidence", 0) or 0
-            body = findings
-            if kps:
-                body += "\nKey points: " + "; ".join(str(k) for k in kps[:5])
-            sections.append(f"**{aid}** (confidence: {conf:.0%}):")
-            sections.append(_fenced(o, body))
-            sections.append("")
-
-    # Evaluators and synthesizer see critic + fact-checker feedback
-    if for_role in ("critic", "fact_checker", "quality_judge", "synthesizer", "researcher"):
-        if critic_outputs:
-            sections.append("### Critic Feedback")
-            for o in critic_outputs:
-                sections.append(_fenced(o, (o.get("findings", "") or "")[:500]))
-                sections.append("")
-
-        if fc_outputs:
-            sections.append("### Fact-Checker Verification")
-            for o in fc_outputs:
-                sections.append(_fenced(o, (o.get("findings", "") or "")[:500]))
-                sections.append("")
-
-    # Synthesizer also sees judge feedback
-    if for_role == "synthesizer" and judge_outputs:
-        sections.append("### Quality Judge Assessment")
-        for o in judge_outputs:
-            sections.append(_fenced(o, (o.get("findings", "") or "")[:500]))
-            sections.append("")
+    # Budget not used by absent sections flows to the researchers.
+    active = [key for _, key, _, show in plan if show and by_role.get(key)]
+    spare = sum(CONTEXT_BUDGET[k] for k in CONTEXT_BUDGET if k not in active)
+    sections: list[str] = []
+    for title, key, with_header, show in plan:
+        if not show or not by_role.get(key):
+            continue
+        share = CONTEXT_BUDGET[key] + (spare if key == "researcher" else 0.0)
+        sections.extend(_render_section(title, by_role[key], int(MAX_CONTEXT_CHARS * share), with_header=with_header))
+        sections.append("")
 
     context = "\n".join(sections)
-
-    if len(context) > MAX_CONTEXT_CHARS:
+    if len(context) > MAX_CONTEXT_CHARS * 1.1:   # fences/headers only; sections already budgeted
         context = context[:MAX_CONTEXT_CHARS] + "\n\n[Context truncated to fit token limit]"
-
     return context
 
 
