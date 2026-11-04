@@ -1,0 +1,14 @@
+{
+  "baseline_run_id": "20261104T211647_f48cde461b11_v1",
+  "n_pairs": 2,
+  "prompt_ids": [
+    "s001",
+    "s003"
+  ],
+  "mean_delta": -0.0019,
+  "t_stat": -1.0,
+  "p_value": 0.5,
+  "df": 1,
+  "cohens_d": -0.7071,
+  "p_method": "student-t (incomplete beta)"
+}

@@ -1,0 +1,107 @@
+{
+  "schema_version": 1,
+  "run_id": "20261104T212231_37a9a3631484_v1",
+  "started_utc": "2026-11-04T21:22:31+00:00",
+  "ended_utc": "2026-11-04T21:28:16+00:00",
+  "code": {
+    "git_sha": "37a9a3631484",
+    "blitz_swarm_version": "0.4.0",
+    "python_version": "3.12.16"
+  },
+  "config": {
+    "slate_path": "~/blitz-swarm/bench/slate_v1.toml",
+    "max_rounds": 1,
+    "use_redis": false,
+    "seed": 42,
+    "total_budget_usd": 3.0,
+    "per_prompt_timeout_s": 3600
+  },
+  "slate": {
+    "slate_id": "v1",
+    "sha256": "f14ac96dbcf481b133e02601e901e83b06be7af44fef27bcda483545a7bd820b",
+    "prompt_count": 30,
+    "prompts_run": 2,
+    "prompts_skipped": 0,
+    "prompts_timed_out": 0,
+    "prompts_errored": 0
+  },
+  "functional_composite": {
+    "mean": 0.8463,
+    "per_prompt": {
+      "s001": 0.7298,
+      "s003": 0.9629
+    },
+    "missing": []
+  },
+  "timeouts": [],
+  "aggregate_quality": {
+    "avg": {
+      "mean": 7.75,
+      "stddev": 0.212,
+      "ci95": [
+        7.6,
+        7.9
+      ]
+    },
+    "coverage": {
+      "mean": 6.92,
+      "stddev": 0.354,
+      "ci95": [
+        6.67,
+        7.17
+      ]
+    },
+    "accuracy": {
+      "mean": 8.585,
+      "stddev": 0.12,
+      "ci95": [
+        8.5,
+        8.67
+      ]
+    },
+    "clarity": {
+      "mean": 8.25,
+      "stddev": 0.113,
+      "ci95": [
+        8.17,
+        8.33
+      ]
+    },
+    "depth": {
+      "mean": 7.25,
+      "stddev": 0.113,
+      "ci95": [
+        7.17,
+        7.33
+      ]
+    }
+  },
+  "by_tier": {
+    "easy": {
+      "n": 2,
+      "avg_quality": 7.75,
+      "avg_cost": 0.5093
+    },
+    "medium": {
+      "n": 0,
+      "avg_quality": 0,
+      "avg_cost": 0
+    },
+    "hard": {
+      "n": 0,
+      "avg_quality": 0,
+      "avg_cost": 0
+    }
+  },
+  "consensus": {
+    "rate": 0.0,
+    "avg_rounds_to_consensus": 1
+  },
+  "cost": {
+    "total_usd": 1.0186,
+    "input_tokens_total": 515890,
+    "output_tokens_total": 49940
+  },
+  "mast_flags_summary": {},
+  "mast_detectors_ran": 2
+}

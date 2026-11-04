@@ -155,3 +155,11 @@ profile `max`. s001 q=7.8 cov 2/5 $0.841 158 s; s003 q=8.0 cov 3/5 $0.285 115 s;
 total $1.13 (Claude-reported part only; Codex uncosted), 435k input tokens. `summary.json`,
 `stats.md`, `results.jsonl`, `config.json` committed (paths redacted to `~/`). n=2 proves the
 pipeline, not anything about quality.
+
+**Paired bench smoke** `bench/runs/20261104T212231_37a9a3631484_v1` — the same two prompts re-run
+with `--baseline` pointing at the first run, to exercise the paired statistics live. s001 q=7.9
+$0.703 211 s; s003 q=7.6 $0.316 133 s; 0 errors. `stats.md`: 2 pairs on the functional composite,
+mean Δ −0.0019, paired t = −1.0 (df 1), p = 0.5 (stdlib student-t fallback, labelled as such),
+Cohen's d_z = −0.71. At n=2 these numbers carry no information; the point is that the pairing,
+the p-method label and the cost block all appear. Run-to-run noise on identical prompts: Δq of
++0.1 and −0.4, cost −16% / +11%.
