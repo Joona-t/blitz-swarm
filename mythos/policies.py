@@ -110,7 +110,8 @@ def load_mythos_config(path: Path | None = None) -> MythosConfig:
     cfg = MythosConfig()
 
     if path is None:
-        path = Path(__file__).parent.parent / "mythos.toml"
+        from config import find_config_file
+        path = find_config_file("mythos.toml", env_var="MYTHOS_CONFIG")
 
     if not path.exists():
         return cfg

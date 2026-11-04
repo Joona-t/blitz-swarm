@@ -640,16 +640,16 @@ def _invoke_live(kind: str, *, tracker: BudgetTracker, **kw: Any) -> dict[str, A
         }
 
     if kind == "research":
-        # LIVE: research-swarm lives OUTSIDE this repo at
-        # "/Users/darkfire/Claude x LoveSpark/research-swarm/orchestrator.py"
-        # (see recon). It is a separate program with no --mode flag. We shell
-        # out to it and grep the "Done. Output at:" line for the report path.
-        research_orch = Path(
-            "/Users/darkfire/Claude x LoveSpark/research-swarm/orchestrator.py"
-        )
-        if not research_orch.exists():
+        # LIVE: research-swarm is a separate program outside this repo (no
+        # --mode flag). Its orchestrator path comes from env
+        # BLITZ_RESEARCH_SWARM (WP8: no home paths in code); we shell out to
+        # it and grep the "Done. Output at:" line for the report path.
+        research_env = os.environ.get("BLITZ_RESEARCH_SWARM", "")
+        research_orch = Path(research_env).expanduser() if research_env else None
+        if research_orch is None or not research_orch.exists():
             return {"ok": False, "kind": kind, "tokens": 0, "artifact": None,
-                    "result": {"error": "research-swarm orchestrator not found",
+                    "result": {"error": "research-swarm orchestrator not found: set "
+                                        "BLITZ_RESEARCH_SWARM=~/path/to/research-swarm/orchestrator.py",
                                "topic": topic}}
         pre_ts = _now_epoch()
         proc = subprocess.run(  # noqa: PLW1510  (we inspect returncode below)

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "blitz-swarm"
-version = "0.3.0"
+version = "0.4.0"
 description = "Parallel multi-agent swarm architecture for collective AI intelligence"
 readme = "README.md"
 license = "MIT"
@@ -27,6 +27,12 @@ bench = ["scipy"]
 # scripts/optimize_prompts.py (EXPERIMENTAL, gated by [evolve] enabled): GEPA prompt optimizer
 gepa = ["gepa"]
 dev = ["pytest", "pytest-asyncio"]
+# backends/adapters/acp.py speaks ACP v1 with the stdlib; the official SDK
+# is optional (Python <3.15) and only used by tooling/tests that want its models.
+acp = ["agent-client-protocol>=0.12,<2; python_version < '3.15'"]
+
+[project.scripts]
+blitz = "orchestrator:main"
 
 [tool.setuptools]
 # Flat layout: top-level modules + packages listed explicitly so setuptools
@@ -46,7 +52,15 @@ packages = [
     "mechanisms",
     "memory",
     "mythos",
+    "prompts",
 ]
+# Role prompts ship with the package (prompts/<domain>/*.md); blitz.toml and
+# mythos.toml are installed as data files and found by config.py's lookup
+# (env BLITZ_CONFIG -> ./blitz.toml -> next to config.py -> <prefix>/share/blitz-swarm).
+[tool.setuptools.package-data]
+prompts = ["*/*.md"]
+[tool.setuptools.data-files]
+"share/blitz-swarm" = ["blitz.toml", "mythos.toml"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

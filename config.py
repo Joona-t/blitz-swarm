@@ -20,6 +20,27 @@ from pathlib import Path
 CONFIG_PATH = Path(__file__).parent / "blitz.toml"
 
 
+def find_config_file(name: str = "blitz.toml", env_var: str = "BLITZ_CONFIG") -> Path:
+    """Where the config lives, first hit wins (WP8):
+    1. env `BLITZ_CONFIG` (or `env_var`), 2. ./<name> in the current
+    directory, 3. next to this module (editable/checkout), 4. the wheel's
+    data dir <sys.prefix>/share/blitz-swarm/<name>. Returns the last
+    candidate even when none exists so the caller's 'missing -> defaults'
+    path still applies."""
+    import sys
+    explicit = os.environ.get(env_var)
+    if explicit:
+        # An explicit path is authoritative even when missing (-> defaults),
+        # so a typo never silently loads some other file.
+        return Path(explicit)
+    candidates = [Path.cwd() / name, Path(__file__).parent / name,
+                  Path(sys.prefix) / "share" / "blitz-swarm" / name]
+    for c in candidates:
+        if c.exists():
+            return c
+    return candidates[-1]
+
+
 class ConfigError(ValueError):
     """Raised for a malformed blitz.toml; the message names path and key."""
 
@@ -316,7 +337,7 @@ def load_config(path: Path | str | None = None) -> BlitzConfig:
     `path` defaults to env `BLITZ_CONFIG`, then the repo's blitz.toml.
     """
     config = BlitzConfig()
-    path = Path(path or os.environ.get("BLITZ_CONFIG") or CONFIG_PATH)
+    path = Path(path) if path else find_config_file()
 
     if not path.exists():
         return config
