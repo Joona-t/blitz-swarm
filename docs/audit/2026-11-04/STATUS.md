@@ -26,7 +26,7 @@ through `scripts/hooks/pre-commit` (pytest exit code).
 - **Run B** (balanced, 2 rounds): judge ensemble now 1 scoring/round; guard promoted claims; selector output carries critique/dissent; **but** judge/pairwise calls bypassed the judge pin and were invisible to metrics → fixed (`653747e`); Codex researchers at `high` effort timed out half the time → `medium`.
 - **Run C**: no timeouts, 258 s, `quality_judge → claude`, selector cost reported. Cross-family judging is live.
 - **Bench smokes**: first live `bench.runner` runs on any version (2 prompts, then paired `--baseline`): budget, aggregate, paired stats all work; n=2, so no claim.
-- **Slate run** (30 prompts, 2 rounds, `--budget 30`) was started 23:29 EET as the first baseline dataset: see `bench/runs/*_4e57c44_v1/` for its `summary.json` and `stats.md` if it finished, or `BUGS_AND_ITERATIONS.md` if it did not.
+- **Slate run** `bench/runs/20261104T212924_4e57c4496ae2_v1` (23:29–00:58 EET): 10 of 30 prompts scored before the $30 budget gate stopped it (20 `budget_exhausted`, excluded from means); self-judged q 7.53 (CI95 7.13–7.86), composite 0.856, $31.74 reported, 22M input tokens. First baseline dataset for `--baseline` pairing; no comparison arm. A full 30-prompt arm at this configuration is ~$90–100.
 
 ## Audited defects fixed beyond the plan (ITER-V04b)
 
