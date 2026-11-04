@@ -84,6 +84,11 @@ class PatchEvaluation:
 @dataclass(slots=True)
 class MetaLoopConfig:
     auto_merge_threshold: float = 0.4   # Cohen's d_z required
+    # Fail closed (2026-11-04, AUDIT M7): an auto-merge needs ALL of
+    # holdout / per_dim / cost / stddev / n present, and n >= min_pairs.
+    # Before, a missing holdout counted as delta 0, a missing stddev as 1.0,
+    # and {"aggregate": 7.0} -> {"aggregate": 7.4} merged.
+    min_pairs: int = 20
     regression_bound: float = 0.3        # max per-dim drop allowed
     cost_ratio_cap: float = 1.5
     holdout_min_delta: float = -0.2      # holdout can't drop more than this
@@ -183,6 +188,20 @@ def evaluate_patch(
     else:
         cohens_d = float("inf") if delta > 0 else 0.0
 
+    # Evidence completeness: anything missing blocks an automatic merge.
+    missing: list[str] = []
+    if holdout_score is None:
+        missing.append("holdout")
+    if not base_dims or not cand_dims:
+        missing.append("per_dim")
+    if "cost" not in baseline_score or "cost" not in candidate_score:
+        missing.append("cost")
+    if "stddev" not in baseline_score:
+        missing.append("stddev")
+    n_pairs = baseline_score.get("n", candidate_score.get("n"))
+    if not isinstance(n_pairs, (int, float)) or n_pairs < cfg.min_pairs:
+        missing.append(f"n>={cfg.min_pairs}")
+
     # Decision
     decision = "human_review"
     reason = ""
@@ -198,6 +217,9 @@ def evaluate_patch(
     elif holdout_delta < cfg.holdout_min_delta:
         reason = f"holdout regressed by {-holdout_delta:.2f}"
         decision = "rejected"
+    elif missing:
+        reason = f"evidence incomplete ({', '.join(missing)}); no automatic merge"
+        decision = "human_review"
     elif cohens_d >= cfg.auto_merge_threshold:
         reason = f"d_z={cohens_d:.2f} >= threshold {cfg.auto_merge_threshold}"
         decision = "merged"

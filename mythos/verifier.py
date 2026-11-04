@@ -175,6 +175,22 @@ def apply_gates(verification: Verification, config: MythosConfig, *, mechanical:
         else:
             verification.gate_notes.append(f"mechanical: not run ({mechanical.get('reason', '')})")
 
+    # A "pass" verdict must agree with the verifier's own per-spec results:
+    # before 2026-11-04 the verdict was taken as-is even when spec_results
+    # listed failures (AUDIT 2026-10-27 M11).
+    failed_specs = [
+        str(r.get("spec_id") or "?") for r in (verification.spec_results or [])
+        if isinstance(r, dict) and r.get("status") == "fail"
+    ]
+    if verification.verdict == "pass" and failed_specs:
+        verification.gate_notes.append(
+            f"verdict pass contradicts spec_results: fail on {', '.join(failed_specs)} -> needs_work")
+        verification.verdict = "needs_work"
+        verification.required_fixes.append(
+            "Verifier reported 'pass' while marking sub-spec(s) "
+            f"{', '.join(failed_specs)} as failed; fix those sub-specs before re-verifying."
+        )
+
     floor = float(getattr(config, "verifier_min_confidence", 0.0) or 0.0)
     if verification.verdict == "pass" and verification.confidence < floor:
         verification.gate_notes.append(

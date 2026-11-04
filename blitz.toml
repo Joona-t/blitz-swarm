@@ -76,7 +76,7 @@ deep = "max"                     # claude --effort {low, medium, high, xhigh, ma
 # ---------------------------------------------------------------------------
 [backend.providers.codex]
 adapter = "codex_cli"
-reasoning_effort = "high"        # codex model_reasoning_effort {minimal, low, medium, high, xhigh}
+reasoning_effort = "medium"      # live 2026-11-04: at "high" one researcher took 85 s and another timed out at 300 s        # codex model_reasoning_effort {minimal, low, medium, high, xhigh}
 sandbox = "read-only"
 approval_policy = "never"
 ephemeral = true

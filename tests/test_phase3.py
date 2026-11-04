@@ -283,16 +283,33 @@ def test_evaluate_patch_merges_when_d_above_threshold():
             "per_dim": {"coverage": 7.0, "accuracy": 7.0},
             "stddev": 0.5,
             "cost": 1.0,
+            "n": 24,
         },
         candidate_score={
             "aggregate": 7.5,
             "per_dim": {"coverage": 7.5, "accuracy": 7.5},
             "stddev": 0.5,
             "cost": 1.0,
+            "n": 24,
         },
+        holdout_score={"baseline": 7.0, "candidate": 7.4},
     )
     assert result.decision == "merged"
     assert result.delta == pytest.approx(0.5)
+
+
+def test_evaluate_patch_fails_closed_without_holdout_or_n():
+    """AUDIT M7: {"aggregate": 7.0} -> 7.4 used to merge. Missing evidence
+    now routes to human review and the reason names what is missing."""
+    patch = _patch("judge_ensemble.n_judges", 3)
+    result = evaluate_patch(patch, baseline_score={"aggregate": 7.0}, candidate_score={"aggregate": 7.4})
+    assert result.decision == "human_review"
+    for word in ("holdout", "per_dim", "cost", "stddev", "n>="):
+        assert word in result.reason
+    full = dict(aggregate=7.0, per_dim={"a": 7.0}, stddev=0.5, cost=1.0, n=10)
+    result = evaluate_patch(patch, baseline_score=full, candidate_score={**full, "aggregate": 7.5},
+                            holdout_score={"baseline": 7.0, "candidate": 7.4})
+    assert result.decision == "human_review" and "n>=20" in result.reason
 
 
 def test_evaluate_patch_rejects_per_dim_regression():

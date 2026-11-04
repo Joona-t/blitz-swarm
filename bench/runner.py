@@ -32,6 +32,7 @@ import asyncio
 import hashlib
 import json
 import os
+import subprocess
 import statistics
 import sys
 import time
@@ -153,7 +154,12 @@ def _utc() -> str:
 def _git_sha() -> str:
     """Return short git SHA, or 'nogit' if unavailable."""
     try:
-        sha = os.popen("git -C " + str(_REPO_ROOT) + " rev-parse HEAD 2>/dev/null").read().strip()
+        # subprocess with argv, not os.popen with an unquoted path: a repo
+        # path containing spaces made this silently return "nogit"
+        # (AUDIT 2026-10-27 M5).
+        proc = subprocess.run(["git", "-C", str(_REPO_ROOT), "rev-parse", "HEAD"],
+                              capture_output=True, text=True, timeout=10)
+        sha = proc.stdout.strip() if proc.returncode == 0 else ""
         return sha[:12] if sha else "nogit"
     except Exception:
         return "nogit"
