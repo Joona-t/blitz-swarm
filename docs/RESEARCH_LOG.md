@@ -1,5 +1,14 @@
 # Research Log
 
+> **Corrections (2026-11-04, from `docs/audit/2026-10-27/AUDIT.md`).** The entries below are
+> kept as written in March 2026. Three statements in them do not match the code or the data:
+> (1) the consensus rule was **unanimous** "ready", not a 2/3 majority (`consensus.py`);
+> (2) the judge ran on **Sonnet**, not Opus (`agents.py` role models at the time);
+> (3) run 1's dimension scores in `metrics.jsonl` are coverage 6 / accuracy 9 / clarity 8 /
+> depth 5, not 7/7/7/7. The run-2 diagnosis ("self-referential topic") was speculation:
+> rounds 2–3 errored within ~3 s, which is a CLI or rate-limit failure signature.
+
+
 > **Superseded 2026-10-11 (v0.3.0).** This file describes the v0.1 system as of 2026-03-14 and is kept as history. For what the code does today see `README.md`, `docs/MODELS.md`, `docs/CLAIMS_AND_EVIDENCE.md`, `docs/IMPLEMENTATION_STATUS.md` and `docs/LIMITATIONS.md`. `metrics.jsonl` referenced below was archived to `docs/data/metrics-2026-03_06.jsonl`; live runs write `output/metrics.jsonl`.
 
 A lab-notebook-style record of Blitz-Swarm development and runs.

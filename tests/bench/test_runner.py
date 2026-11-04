@@ -397,3 +397,28 @@ def test_write_stats_md_creates_file(tmp_path):
     text = path.read_text()
     assert "# Bench run" in text
     assert "FM-2.4" in text
+
+
+def test_aggregate_quality_excludes_errored_and_timed_out_prompts(tmp_path, slate_path):
+    """AUDIT M5: errored prompts used to be averaged in as quality 0."""
+    from bench import load_slate
+    from bench.runner import BenchConfig, aggregate
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    def row(pid, avg, *, error=None, timeout=False):
+        return {
+            "prompt_id": pid, "run_id": run_dir.name, "swarm_run_id": pid, "prompt_sha256": "p",
+            "output_md_path": "", "started_utc": "2026-11-04T00:00:00+00:00", "elapsed_s": 1.0,
+            "cost_usd": 0.1, "input_tokens": 1, "output_tokens": 1, "consensus_reached": False,
+            "rounds_to_consensus": 1,
+            "quality": {"coverage": avg, "accuracy": avg, "clarity": avg, "depth": avg, "avg": avg},
+            "coverage_hits": 0, "coverage_total": 1, "timeout": timeout, "error": error, "mast_flags": [],
+        }
+
+    rows = [row("s001", 8.0), row("s002", 0.0, error="codex exit 1"), row("s003", 0.0, timeout=True)]
+    (run_dir / "results.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+    summary = aggregate(run_dir, load_slate(slate_path), BenchConfig(slate_path=slate_path, total_budget_usd=1.0))
+    assert summary["aggregate_quality"]["avg"]["mean"] == 8.0, "errored/timed-out prompts must not drag the mean to 0"
+    assert summary["slate"]["prompts_errored"] == 1

@@ -548,11 +548,16 @@ def _read_results(run_dir: Path) -> list[dict]:
 def aggregate(run_dir: Path, slate: BenchSlate, cfg: BenchConfig) -> dict:
     """Aggregate per-prompt rows into a single summary.json. Returns the dict."""
     rows = _read_results(run_dir)
+    # Quality statistics use SCORED prompts only. An errored or timed-out
+    # prompt has no artifact; averaging its zeros in pulled every mean down
+    # and made a flaky backend look like a bad swarm (AUDIT M5). Errors are
+    # reported separately under slate.prompts_errored / prompts_timed_out.
+    scored = [r for r in rows if r.get("quality") and not r.get("error") and not r.get("timeout")]
 
     # Per-dim aggregates
     by_dim: dict[str, dict[str, float]] = {}
     for dim in ("avg", "coverage", "accuracy", "clarity", "depth"):
-        vals = [r["quality"].get(dim, 0) for r in rows if r.get("quality")]
+        vals = [r["quality"].get(dim, 0) for r in scored]
         if not vals:
             by_dim[dim] = {"mean": 0.0, "stddev": 0.0, "ci95": [0.0, 0.0]}
             continue
@@ -565,7 +570,7 @@ def aggregate(run_dir: Path, slate: BenchSlate, cfg: BenchConfig) -> dict:
     # By tier
     by_tier: dict[str, dict] = {}
     for tier in ("easy", "medium", "hard"):
-        tier_rows = [r for r in rows if slate.by_id(r["prompt_id"]).tier == tier
+        tier_rows = [r for r in scored if slate.by_id(r["prompt_id"]).tier == tier
                      if r.get("prompt_id") and any(p.id == r["prompt_id"] for p in slate.prompts)]
         if tier_rows:
             avgs = [r["quality"].get("avg", 0) for r in tier_rows]
@@ -904,8 +909,13 @@ async def run_bench(
                 prior=prior_snapshot,
             )
             async with budget_lock:
-                # Refund unused budget
-                budget_remaining[0] += max(p.budget_usd - result.cost_usd, 0)
+                # Reconcile against ACTUAL spend: refund what was not used and
+                # charge any overspend. Before 2026-11-04 only the unused part
+                # came back and overspend was never charged, so a 30-prompt
+                # slate at the observed $0.5-3.7/run could pass an $8 cap by
+                # ~10x (AUDIT M5). Unknown cost keeps the planned deduction.
+                if isinstance(result.cost_usd, (int, float)):
+                    budget_remaining[0] += p.budget_usd - float(result.cost_usd)
             # Record this artifact so later prompts can score novelty against it.
             if result.output_md_path and Path(result.output_md_path).exists():
                 async with prior_lock:
