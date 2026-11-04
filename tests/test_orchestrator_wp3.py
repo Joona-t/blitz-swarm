@@ -92,7 +92,7 @@ def test_judge_ensemble_votes_fan_out_concurrently():
     cfg.judge_ensemble.min_rounds = 1
     fake = FakeBackend(delay=0.2)   # 3 judges x 0.2 s = 0.6 s if sequential
     t0 = time.monotonic()
-    output = asyncio.run(_run_judge_ensemble(
+    output, _ensemble = asyncio.run(_run_judge_ensemble(
         topic="t", candidate_outputs=[_researcher_output(0, "Useful research.")],
         history_outputs=[], backend=fake, cfg=cfg, backend_id="codex",
         provider=cfg.backend.get_provider("codex"), sandbox="read-only",

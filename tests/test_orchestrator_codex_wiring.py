@@ -141,7 +141,7 @@ def test_judge_ensemble_produces_quality_judge_vote_with_fake_backend():
     cfg.judge_ensemble.min_rounds = 1
     fake = FakeBackend()
 
-    output = asyncio.run(_run_judge_ensemble(
+    output, _ensemble = asyncio.run(_run_judge_ensemble(
         topic="SQLite WAL",
         candidate_outputs=[
             {

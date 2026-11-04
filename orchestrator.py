@@ -897,42 +897,47 @@ async def _run_judge_ensemble(
     provider,
     sandbox: str,
     scratch_dir: Path | None = None,
-) -> dict:
-    """Judge-ensemble vote. The N judge calls of every debate round fan out
-    via `asyncio.to_thread` + `gather` (JudgeEnsemble.round_async); awaited
-    on the event loop, never run inline (core-loop-01)."""
+    ensemble: JudgeEnsemble | None = None,
+    judge_fn=None,
+) -> tuple[dict, JudgeEnsemble]:
+    """One judge-ensemble scoring of THIS swarm round.
+
+    The ensemble persists across swarm rounds (pass the one returned by the
+    previous call), so its KS statistic compares round k's votes with round
+    k-1's votes on NEW text. Before 2026-11-04 a fresh ensemble was built
+    every swarm round and looped `while not is_stable()` on the SAME
+    candidate: 6-15 judge calls per round measuring judge self-consistency,
+    not convergence (AUDIT 2026-10-27, PR #2 defect 1). Now: exactly
+    n_judges calls per swarm round. The N calls fan out via
+    `asyncio.to_thread` + `gather` (JudgeEnsemble.round_async).
+    """
     candidate = build_context(candidate_outputs, for_role="quality_judge")
     history = build_context(history_outputs, for_role="quality_judge")
-    model = resolve_model("judge", backend_id, cfg).model
-    judge_cfg = JudgeConfig(
-        n_judges=cfg.judge_ensemble.n_judges,
-        ks_threshold=cfg.judge_ensemble.ks_threshold,
-        ks_consecutive=cfg.judge_ensemble.ks_consecutive,
-        min_rounds=cfg.judge_ensemble.min_rounds,
-        judge_models=tuple(model for _ in range(cfg.judge_ensemble.n_judges)),
-    )
-    ensemble = JudgeEnsemble(
-        judge_cfg,
-        judge_fn=_make_judge_fn(
-            backend=backend,
-            cfg=cfg,
-            backend_id=backend_id,
-            provider=provider,
-            sandbox=sandbox,
-            scratch_dir=scratch_dir,
-        ),
-    )
+    if ensemble is None:
+        model = resolve_model("judge", backend_id, cfg).model
+        judge_cfg = JudgeConfig(
+            n_judges=cfg.judge_ensemble.n_judges,
+            ks_threshold=cfg.judge_ensemble.ks_threshold,
+            ks_consecutive=cfg.judge_ensemble.ks_consecutive,
+            min_rounds=cfg.judge_ensemble.min_rounds,
+            judge_models=tuple(model for _ in range(cfg.judge_ensemble.n_judges)),
+        )
+        ensemble = JudgeEnsemble(
+            judge_cfg,
+            judge_fn=judge_fn or _make_judge_fn(
+                backend=backend,
+                cfg=cfg,
+                backend_id=backend_id,
+                provider=provider,
+                sandbox=sandbox,
+                scratch_dir=scratch_dir,
+            ),
+        )
 
-    state = None
-    while not ensemble.is_stable():
-        state = await ensemble.round_async(candidate, history)
-        if state.halted:
-            break
-
-    score = ensemble.final_score()
-    if score is None and state is not None:
-        score = state.mean_score
-    score = score or 0.0
+    state = await ensemble.round_async(candidate, history)
+    # The round's own mean is the score. `final_score()` is only defined
+    # once the ensemble reports stability across swarm rounds.
+    score = state.mean_score or 0.0
     breakdown = ensemble.aggregate_breakdown()
     halt_reason = state.halt_reason if state is not None else "not_started"
     notes = f"Judge ensemble score {score:.1f}/10; halt_reason={halt_reason}"
@@ -967,7 +972,7 @@ async def _run_judge_ensemble(
             }
             for s in ensemble.state_log
         ],
-    }
+    }, ensemble
 
 
 def _make_pairwise_judge_fn(
@@ -1223,6 +1228,7 @@ async def run_swarm(
 
     # --- METRICS: Initialize ---
     mc = MetricsCollector(cfg=runtime_cfg, backend_id=selected_backend)
+    judge_ensemble_obj: JudgeEnsemble | None = None   # persists across swarm rounds
     mc.start_run(run_id, topic)
 
     # --- SPAWN ---
@@ -1374,7 +1380,7 @@ async def run_swarm(
 
         if judge_ensemble_enabled:
             start = time.monotonic()
-            judge_output = await _run_judge_ensemble(
+            judge_output, judge_ensemble_obj = await _run_judge_ensemble(
                 topic=topic,
                 candidate_outputs=_filter_guarded(guard, bb.read_round_outputs(round_n)),
                 history_outputs=prior_outputs,
@@ -1384,6 +1390,7 @@ async def run_swarm(
                 provider=provider,
                 sandbox=resolved_sandbox,
                 scratch_dir=scratch_dir,
+                ensemble=judge_ensemble_obj,
             )
             _write_to_blackboard(bb, round_n, _apply_guard(guard, [judge_output], round_n))
             print(f"  Judge ensemble done [{time.monotonic() - start:.1f}s]")
