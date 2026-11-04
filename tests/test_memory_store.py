@@ -111,7 +111,8 @@ def test_persist_then_retrieve_round_trip_without_embedder(store):
         n_agents=3,
     )
     assert report.vector_source == "none"
-    assert report.n_utterances == 3 and report.n_utterance_edges == 2
+    # synthesizer output is excluded from the Tier-1 trace (P4): 2 researcher utterances, no cross-round edge
+    assert report.n_utterances == 2 and report.n_utterance_edges == 0
     assert report.distilled_by == "heuristic"
     assert len(report.candidate_ids) >= 1
 
@@ -241,7 +242,7 @@ def test_eviction_archives_cold_queries_and_purges_old_traces(store):
     # Cascades took the cold query's traces and candidates with it; insights never evict.
     assert store.db.execute("SELECT COUNT(*) FROM utterances WHERE query_id=?", (cold.query_id,)).fetchone()[0] == 0
     assert store.db.execute("SELECT COUNT(*) FROM insight_candidates WHERE query_id=?", (cold.query_id,)).fetchone()[0] == 0
-    assert store.db.execute("SELECT COUNT(*) FROM utterances WHERE query_id=?", (hot.query_id,)).fetchone()[0] == 3
+    assert store.db.execute("SELECT COUNT(*) FROM utterances WHERE query_id=?", (hot.query_id,)).fetchone()[0] == 2  # synthesizer excluded
 
 
 # ---------------------------------------------------------------------------
@@ -361,13 +362,13 @@ def test_orchestrator_persist_to_memory_writes_all_tiers(tmp_path, capsys):
     agents = [object(), object(), object()]
     orchestrator._persist_to_memory(store, None, "Consensus mechanisms", True, False, rounds, agents)
     out = capsys.readouterr().out
-    assert "Memory: stored query" in out and "3 utterances" in out
+    assert "Memory: stored query" in out and "2 utterances" in out   # synthesizer excluded from Tier 1
 
     check = MemoryStore.open(tmp_path / "mem.db", embedder=None, llm=None)   # the function closed `store`
     row = check.db.execute("SELECT status, n_agents, n_rounds, tags_json FROM queries").fetchone()
     assert row[0] == "resolved" and row[1] == 3 and row[2] == 2
     assert "swarm:consensus" in json.loads(row[3])
-    assert check.db.execute("SELECT COUNT(*) FROM utterances").fetchone()[0] == 3
+    assert check.db.execute("SELECT COUNT(*) FROM utterances").fetchone()[0] == 2
     assert check.db.execute("SELECT COUNT(*) FROM insight_candidates").fetchone()[0] >= 1
     context, _ = check.context_for("Consensus mechanisms in distributed systems")
     assert "Consensus mechanisms" in context and context.startswith(FENCE_OPEN)

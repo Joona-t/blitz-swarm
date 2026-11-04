@@ -10,6 +10,9 @@
 [swarm]
 max_rounds = 4
 timeout_seconds = 300
+# The synthesizer reads everything and writes the most; it gets its own
+# budget (0 = twice timeout_seconds). Live 2026-11-04: Codex needed > 300 s.
+synthesizer_timeout_seconds = 600
 max_agents = 10
 quality_profile = "max"
 # Domain preset for role prompts. Loads from prompts/<domain>/.

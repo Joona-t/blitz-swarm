@@ -49,6 +49,7 @@ class ConfigError(ValueError):
 class SwarmConfig:
     max_rounds: int = 5
     timeout_seconds: int = 180
+    synthesizer_timeout_seconds: int = 0      # 0 = 2 x timeout_seconds
     max_agents: int = 12
     domain: str = "general"           # which prompts/<domain>/ preset to load
     persona_critics: bool = False     # MAR-style persona-typed critics (Phase 1 opt-in)

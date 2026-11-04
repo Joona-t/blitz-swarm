@@ -148,7 +148,7 @@ class MetricsCollector:
         for o in outputs:
             if o.get("_error"):
                 msg = o.get("_error_msg", "") or o.get("findings", "")
-                if "Timed out" in msg or "TIMEOUT" in msg:
+                if "timed out" in msg.lower() or "timeout" in msg.lower():
                     timeouts += 1
                 else:
                     errors += 1

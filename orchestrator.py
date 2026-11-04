@@ -68,6 +68,10 @@ _config = _load_config_or_die()
 
 DEFAULT_MAX_ROUNDS = _config.swarm.max_rounds
 AGENT_TIMEOUT_SECONDS = _config.swarm.timeout_seconds
+# The synthesizer reads the whole blackboard and writes the longest text;
+# live run 2026-11-04: Codex needed > 300 s and timed out, so it gets its
+# own budget ([swarm] synthesizer_timeout_seconds, default 2x).
+SYNTHESIZER_TIMEOUT_SECONDS = _config.swarm.synthesizer_timeout_seconds or AGENT_TIMEOUT_SECONDS * 2
 OUTPUT_DIR = Path(_config.storage.output_dir) if not Path(_config.storage.output_dir).is_absolute() else Path(_config.storage.output_dir)
 if not OUTPUT_DIR.is_absolute():
     OUTPUT_DIR = Path(__file__).parent / _config.storage.output_dir
@@ -312,7 +316,8 @@ def invoke_agent(
                 system_prompt=agent.system_prompt,
                 schema=AGENT_OUTPUT_SCHEMA,
                 model=model,
-                timeout_s=AGENT_TIMEOUT_SECONDS,
+                timeout_s=(SYNTHESIZER_TIMEOUT_SECONDS if agent.role == "synthesizer"
+                           else AGENT_TIMEOUT_SECONDS),
                 cwd=scratch_dir,
                 sandbox=resolved_sandbox,
                 approval_policy=provider.approval_policy,
@@ -691,13 +696,20 @@ def format_final_output(
         "",
     ]
 
-    if synthesizer_output and synthesizer_output.get("findings"):
+    if synthesizer_output and synthesizer_output.get("findings") and not synthesizer_output.get("_error"):
         lines.append(synthesizer_output["findings"])
         lines.append("")
     else:
         lines.append("## Research Findings")
         lines.append("")
-        last_round = all_round_outputs[-1] if all_round_outputs else []
+        # The last entry is the synthesis round (which just failed); fall back
+        # to the latest round that actually holds researcher findings. Live
+        # run 2026-11-04: the synthesizer timed out and this printed nothing.
+        last_round = next(
+            (rnd for rnd in reversed(all_round_outputs)
+             if any(o.get("role") == "researcher" and not o.get("_error") for o in rnd)),
+            [],
+        )
         for o in last_round:
             if o.get("role") == "researcher":
                 lines.append(f"### {o.get('agent_id', 'Researcher')}")
