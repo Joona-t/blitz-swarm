@@ -325,6 +325,8 @@ def invoke_agent(
                 "_model": result.model or model,
                 "_elapsed_s": round(result.elapsed_s, 1),
                 "_cost_usd": result.cost_usd,
+                "_cost_policy": result.cost_policy,
+                "_schema_mode": result.schema_mode,
                 "_input_tokens": result.input_tokens,
                 "_output_tokens": result.output_tokens,
                 "_validation_errors": result.validation_errors,
@@ -1544,7 +1546,9 @@ async def run_swarm(
 
     total_agents_invoked = sum(len(rnd) for rnd in all_round_outputs)
     _total_cost = metrics_record.get("total_cost_usd")
-    cost_str = "n/a (no cost reported; add [backend.providers.<id>.pricing])" if _total_cost is None else f"${_total_cost:.4f}"
+    cost_str = "unknown (no cost reported; add [backend.providers.<id>.pricing])" if _total_cost is None else f"${_total_cost:.4f}"
+    if _total_cost is not None and metrics_record.get("cost_incomplete"):
+        cost_str = f">= ${_total_cost:.4f} (some calls reported no cost)"
     tokens_str = f"{metrics_record.get('total_input_tokens', 0) + metrics_record.get('total_output_tokens', 0):,}"
 
     print(f"{'='*60}")

@@ -52,6 +52,11 @@ class RoundMetrics:
     agents_raw: int = 0
     wall_clock_s: float = 0.0
     cost_usd: float | None = None     # None = no provider reported cost and no pricing configured
+    # WP4: how the round's cost was obtained. "reported" when every costed
+    # call reported USD, "priced" when at least one came from a pricing
+    # table, "unknown" when any call has no cost at all (then cost_usd is a
+    # lower bound and is printed as such).
+    cost_policy: str = "unknown"
     input_tokens: int = 0
     output_tokens: int = 0
     ready_votes: int = 0
@@ -90,6 +95,7 @@ class RunMetrics:
     total_wall_clock_s: float = 0.0
     total_agent_invocations: int = 0
     total_cost_usd: float | None = None   # None = unknown (n/a), never coerced to 0
+    cost_incomplete: bool = False         # WP4: some call had no cost -> total is a lower bound
     total_input_tokens: int = 0
     total_output_tokens: int = 0
     estimated_cost_units: float = 0.0
@@ -132,6 +138,7 @@ class MetricsCollector:
         round_cost: float | None = None
         round_input_tokens = 0
         round_output_tokens = 0
+        policies: set[str] = set()
 
         for o in outputs:
             if o.get("_error"):
@@ -149,13 +156,17 @@ class MetricsCollector:
             in_tok = int(o.get("_input_tokens", 0) or 0)
             out_tok = int(o.get("_output_tokens", 0) or 0)
             cost = o.get("_cost_usd")
+            policy = "reported" if cost is not None else "unknown"
             if cost is None:
                 cost = cost_from_pricing(
                     self.cfg, o.get("_backend_id") or self.backend_id,
                     o.get("_model"), in_tok, out_tok,
                 )
+                if cost is not None:
+                    policy = "priced"
             if cost is not None:
                 round_cost = (round_cost or 0.0) + float(cost)
+            policies.add(policy)
             round_input_tokens += in_tok
             round_output_tokens += out_tok
 
@@ -168,6 +179,8 @@ class MetricsCollector:
             agents_raw=raw,
             wall_clock_s=round(wall_clock, 1),
             cost_usd=None if round_cost is None else round(round_cost, 6),
+            cost_policy=("unknown" if "unknown" in policies or not policies
+                         else "priced" if "priced" in policies else "reported"),
             input_tokens=round_input_tokens,
             output_tokens=round_output_tokens,
         )
@@ -176,6 +189,8 @@ class MetricsCollector:
         self.run.total_agent_invocations += len(outputs)
         if round_cost is not None:
             self.run.total_cost_usd = (self.run.total_cost_usd or 0.0) + round_cost
+        if "unknown" in policies:
+            self.run.cost_incomplete = True
         self.run.total_input_tokens += round_input_tokens
         self.run.total_output_tokens += round_output_tokens
 

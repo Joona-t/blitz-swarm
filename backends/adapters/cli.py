@@ -66,6 +66,33 @@ def _extract_last_codex_agent_message(stdout: str) -> str:
     return last
 
 
+def _codex_usage(stdout: str) -> tuple[int, int, int]:
+    """(input_tokens, cached_input_tokens, output_tokens) summed over every
+    JSONL event that carries a `usage` object (`turn.completed` in current
+    builds; older builds nest it under `item`/`info`). Missing -> zeros."""
+    in_tok = cached = out_tok = 0
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line or not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        usage = None
+        if isinstance(event, dict):
+            usage = event.get("usage")
+            if usage is None and isinstance(event.get("item"), dict):
+                usage = event["item"].get("usage")
+            if usage is None and isinstance(event.get("info"), dict):
+                usage = event["info"].get("usage") or event["info"].get("total_token_usage")
+        if isinstance(usage, dict):
+            in_tok += int(usage.get("input_tokens", 0) or 0)
+            cached += int(usage.get("cached_input_tokens", 0) or 0)
+            out_tok += int(usage.get("output_tokens", 0) or 0)
+    return in_tok, cached, out_tok
+
+
 def _read_text_if_present(path: Path) -> str:
     try:
         if path.exists():
@@ -202,6 +229,7 @@ class CodexLocalBackend:
                 final_text = _extract_last_codex_agent_message(proc.stdout)
             if not final_text:
                 final_text = proc.stdout.strip()
+            in_tok, cached_tok, out_tok = _codex_usage(proc.stdout)
             return normalize_result(
                 backend_id=self.backend_id,
                 adapter_kind=self.adapter_kind,
@@ -216,8 +244,16 @@ class CodexLocalBackend:
                     if proc.returncode != 0 else None
                 ),
                 strict_nulls=True,
+                # WP4: codex reports tokens, never USD. input_tokens includes
+                # cached input (it is still billed, at a lower rate); the
+                # split is kept in metadata for a pricing table that cares.
+                input_tokens=in_tok,
+                output_tokens=out_tok,
+                cost_policy=COST_UNKNOWN,
+                schema_mode=SCHEMA_NATIVE if call.schema else "",
                 metadata={"sandbox": sandbox, "approval": approval,
-                          "tools": list(call.tools or [])},
+                          "tools": list(call.tools or []),
+                          "cached_input_tokens": cached_tok},
             )
 
 
@@ -359,14 +395,19 @@ class ClaudeCLIBackend:
         envelope = parse_json_loose(proc.stdout)
         text = proc.stdout.strip()
         parsed = None
-        cost = 0.0
+        cost = None
         in_tok = 0
         out_tok = 0
         if envelope:
             raw_cost = envelope.get("total_cost_usd")
             cost = float(raw_cost) if isinstance(raw_cost, (int, float)) else None
             usage = envelope.get("usage", {}) or {}
-            in_tok = int(usage.get("input_tokens", 0) or 0)
+            # WP4: the envelope splits input into fresh + cache_creation +
+            # cache_read; metrics.py summed only the first and reported
+            # 3-15 input tokens per round (AUDIT, metrics). Count all three.
+            cache_create = int(usage.get("cache_creation_input_tokens", 0) or 0)
+            cache_read = int(usage.get("cache_read_input_tokens", 0) or 0)
+            in_tok = int(usage.get("input_tokens", 0) or 0) + cache_create + cache_read
             out_tok = int(usage.get("output_tokens", 0) or 0)
             if isinstance(envelope.get("structured_output"), dict):
                 parsed = envelope["structured_output"]
@@ -400,8 +441,14 @@ class ClaudeCLIBackend:
             errored=proc.returncode != 0 or is_error or bool(validation_errors),
             error=error, cost_usd=cost, input_tokens=in_tok,
             output_tokens=out_tok, validation_errors=validation_errors,
+            cost_policy=COST_REPORTED if isinstance(cost, (int, float)) else COST_UNKNOWN,
+            schema_mode=SCHEMA_NATIVE if call.schema else "",
             metadata={"effort": effort, "prompt_via": "stdin" if use_stdin else "argv",
-                      "tools": list(call.tools or []), "max_turns": call.max_turns},
+                      "tools": list(call.tools or []), "max_turns": call.max_turns,
+                      "cache_creation_input_tokens": (
+                          int((envelope or {}).get("usage", {}).get("cache_creation_input_tokens", 0) or 0)),
+                      "cache_read_input_tokens": (
+                          int((envelope or {}).get("usage", {}).get("cache_read_input_tokens", 0) or 0))},
         )
 
 
