@@ -33,44 +33,52 @@ Effort: `[backend.providers.<id>.effort].<tier>` if set, else the provider-wide 
 
 ## 3. What the shipped config resolves to
 
+(Regenerated 2026-11-04 on v0.4: the table gained a `provider` column, `[models] <role>_provider` pins route a role elsewhere, and a model-free capability table follows.)
+
 `python orchestrator.py --list-models --backend claude`:
 
 ```
 Resolved models for backend='claude' (default tier='standard')
-role            tier      model                       effort  source
-critic          standard  sonnet                      high    tier
-executor        fast      haiku                       high    tier
-fact_checker    standard  sonnet                      high    tier
-guard           fast      haiku                       high    tier
-judge           standard  sonnet                      high    tier
-memory_ops      fast      haiku                       high    tier
-planner         deep      fable                       max     tier
-quality_judge   standard  sonnet                      high    tier
-researcher      standard  sonnet                      high    tier
-synthesizer     deep      fable                       max     tier
-verifier        deep      fable                       max     tier
-*               standard  sonnet                      high    default_tier
+role            provider    tier      model                       effort  source
+critic          claude      standard  sonnet                      high    tier
+executor        claude      fast      haiku                       high    tier
+fact_checker    claude      standard  sonnet                      high    tier
+guard           claude      fast      haiku                       high    tier
+judge           claude      standard  sonnet                      high    tier
+memory_ops      claude      fast      haiku                       high    tier
+planner         claude      deep      fable                       max     tier
+quality_judge   claude      standard  sonnet                      high    tier
+researcher      claude      standard  sonnet                      high    tier
+synthesizer     claude      deep      fable                       max     tier
+verifier        claude      deep      fable                       max     tier
+*               claude      standard  sonnet                      high    default_tier
 Override: --model <model|tier>, env BLITZ_MODEL, env BLITZ_MODEL_<ROLE>; '*' = any role not listed under [models].
+
+Provider capabilities (schema | tools | cost | effort | max_turns):
+  claude      native    allowlist  reported  yes     yes
 ```
 
 `python orchestrator.py --list-models --backend codex`:
 
 ```
 Resolved models for backend='codex' (default tier='standard')
-role            tier      model                       effort  source
-critic          standard  gpt-5.5                     high    tier
-executor        fast      gpt-5.5                     high    tier
-fact_checker    standard  gpt-5.5                     high    tier
-guard           fast      gpt-5.5                     high    tier
-judge           standard  gpt-5.5                     high    tier
-memory_ops      fast      gpt-5.5                     high    tier
-planner         deep      gpt-5.5                     high    tier
-quality_judge   standard  gpt-5.5                     high    tier
-researcher      standard  gpt-5.5                     high    tier
-synthesizer     deep      gpt-5.5                     high    tier
-verifier        deep      gpt-5.5                     high    tier
-*               standard  gpt-5.5                     high    default_tier
+role            provider    tier      model                       effort  source
+critic          codex       standard  gpt-6.1-sol                 medium  tier
+executor        codex       fast      gpt-6.1-sol                 medium  tier
+fact_checker    codex       standard  gpt-6.1-sol                 medium  tier
+guard           codex       fast      gpt-6.1-sol                 medium  tier
+judge           codex       standard  gpt-6.1-sol                 medium  tier
+memory_ops      codex       fast      gpt-6.1-sol                 medium  tier
+planner         codex       deep      gpt-6.1-sol                 medium  tier
+quality_judge   codex       standard  gpt-6.1-sol                 medium  tier
+researcher      codex       standard  gpt-6.1-sol                 medium  tier
+synthesizer     codex       deep      gpt-6.1-sol                 medium  tier
+verifier        codex       deep      gpt-6.1-sol                 medium  tier
+*               codex       standard  gpt-6.1-sol                 medium  default_tier
 Override: --model <model|tier>, env BLITZ_MODEL, env BLITZ_MODEL_<ROLE>; '*' = any role not listed under [models].
+
+Provider capabilities (schema | tools | cost | effort | max_turns):
+  codex       native    sandbox    priced    yes     no
 ```
 
 `python orchestrator.py "x" --mode mythos --dry-run` (no flags → `mythos.toml` picks `claude`):
