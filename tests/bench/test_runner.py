@@ -422,3 +422,12 @@ def test_aggregate_quality_excludes_errored_and_timed_out_prompts(tmp_path, slat
     summary = aggregate(run_dir, load_slate(slate_path), BenchConfig(slate_path=slate_path, total_budget_usd=1.0))
     assert summary["aggregate_quality"]["avg"]["mean"] == 8.0, "errored/timed-out prompts must not drag the mean to 0"
     assert summary["slate"]["prompts_errored"] == 1
+
+
+def test_portable_paths_never_contain_the_home_directory(tmp_path):
+    from bench.runner import _REPO_ROOT, _portable
+    assert _portable(_REPO_ROOT / "bench" / "slate_v1.toml") == "bench/slate_v1.toml"
+    outside = Path.home() / "somewhere" / "x.md"
+    assert _portable(outside) == "~/somewhere/x.md"
+    assert _portable("") == ""
+    assert "/Users/" not in _portable(tmp_path / "a.md") or str(tmp_path).startswith("/Users/") is False or _portable(tmp_path / "a.md").startswith("~/")

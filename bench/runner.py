@@ -151,6 +151,27 @@ def _utc() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _portable(path) -> str:
+    """A path as it should appear in committed artefacts: relative to the
+    repo root when inside it, else with the home directory collapsed to
+    `~`. Absolute home paths in bench/runs/*.json tripped the leak gate on
+    2026-11-04 (no home folders in anything public)."""
+    if not path:
+        return ""
+    try:
+        pth = Path(path).expanduser().resolve()
+    except (OSError, RuntimeError):
+        return str(path)
+    try:
+        return str(pth.relative_to(_REPO_ROOT))
+    except ValueError:
+        pass
+    try:
+        return "~/" + str(pth.relative_to(Path.home()))
+    except ValueError:
+        return str(pth)
+
+
 def _git_sha() -> str:
     """Return short git SHA, or 'nogit' if unavailable."""
     try:
@@ -454,7 +475,7 @@ async def run_one_prompt(
         run_id=run_dir.name,
         swarm_run_id=record.get("run_id", "") if record else "",
         prompt_sha256=hashlib.sha256(prompt.text.encode()).hexdigest(),
-        output_md_path=str(out_path) if isinstance(out_path, Path) else "",
+        output_md_path=_portable(out_path) if isinstance(out_path, Path) else "",
         started_utc=started_utc_iso,
         elapsed_s=elapsed,
         cost_usd=float(record.get("total_cost_usd", 0) or 0) if record else 0.0,
@@ -637,7 +658,7 @@ def aggregate(run_dir: Path, slate: BenchSlate, cfg: BenchConfig) -> dict:
             "python_version": sys.version.split()[0],
         },
         "config": {
-            "slate_path": str(cfg.slate_path),
+            "slate_path": _portable(cfg.slate_path),
             "max_rounds": cfg.max_rounds,
             "use_redis": cfg.use_redis,
             "seed": cfg.seed,
@@ -867,7 +888,7 @@ async def run_bench(
 
     # Snapshot config + slate hash for reproducibility
     (run_dir / "config.json").write_text(json.dumps({
-        **{k: (str(v) if isinstance(v, Path) else v) for k, v in asdict(cfg).items()},
+        **{k: (_portable(v) if isinstance(v, Path) else v) for k, v in asdict(cfg).items()},
     }, indent=2))
 
     sem = asyncio.Semaphore(max(cfg.parallel_prompts, 1))
