@@ -217,10 +217,12 @@ class MetricsCollector:
         self.run.accuracy = judge_output.get("accuracy_score", 0)
         self.run.clarity = judge_output.get("clarity_score", 0)
         self.run.depth = judge_output.get("depth_score", 0)
-        scores = [self.run.coverage, self.run.accuracy,
-                  self.run.clarity, self.run.depth]
-        nonzero = [s for s in scores if s > 0]
-        self.run.avg_quality = round(sum(nonzero) / len(nonzero), 1) if nonzero else 0
+        # Average over the dimensions the judge actually reported. A reported
+        # 0 counts as 0; before 2026-11-04 zeros were dropped, which inflated
+        # avg_quality (AUDIT 2026-10-27, metrics).
+        present = [judge_output.get(k) for k in ("coverage_score", "accuracy_score", "clarity_score", "depth_score")
+                   if isinstance(judge_output.get(k), (int, float))]
+        self.run.avg_quality = round(sum(present) / len(present), 1) if present else 0
 
     def record_consensus_result(self, rounds_to_consensus: int,
                                  consensus_reached: bool,

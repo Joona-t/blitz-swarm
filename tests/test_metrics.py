@@ -174,11 +174,12 @@ def test_record_consensus_state_only_for_known_rounds():
     assert (rm["ready_votes"], rm["total_voters"], rm["avg_confidence"]) == (2, 3, 0.833)
 
 
-def test_record_quality_scores_averages_nonzero_only():
+def test_record_quality_scores_averages_reported_dimensions():
+    """A reported 0 counts (2026-11-04); only missing dimensions are skipped."""
     mc = MetricsCollector()
     mc.record_quality_scores({"coverage_score": 8, "accuracy_score": 6, "clarity_score": 0, "depth_score": 7})
     assert (mc.run.coverage, mc.run.accuracy, mc.run.clarity, mc.run.depth) == (8, 6, 0, 7)
-    assert mc.run.avg_quality == 7.0
+    assert mc.run.avg_quality == 5.2
     mc.record_quality_scores({})
     assert mc.run.avg_quality == 0
 

@@ -282,6 +282,28 @@ def bt_mle(
     return skill
 
 
+_HEADING_STOP = {
+    "the", "a", "an", "and", "or", "of", "for", "to", "in", "on", "with", "key",
+    "main", "overview", "summary", "section", "notes", "analysis", "details",
+}
+
+
+def heading_words(heading: str | None) -> frozenset[str]:
+    """Stemmed content words of a markdown heading ("3. Key Risks:" -> {"risk"})."""
+    if not heading:
+        return frozenset()
+    out = set()
+    for w in re.findall(r"[a-z0-9]+", heading.lower()):
+        if w in _HEADING_STOP:
+            continue   # enumerators ("a", "b", "1", "h2") are kept: they are often the only difference
+        for suf in ("ations", "ation", "ings", "ing", "ies", "es", "s"):
+            if w.endswith(suf) and len(w) - len(suf) >= 3:
+                w = w[: -len(suf)] + ("y" if suf == "ies" else "")
+                break
+        out.add(w[:6])
+    return frozenset(out)
+
+
 def _aggregate_pairwise_verdicts(
     span_ids: list[str],
     verdicts: list[PairwiseVerdict],
@@ -474,13 +496,36 @@ class SelectorSynth:
     # ------------------------------------------------------------------
 
     def _cluster_spans(self, spans: list[Span]) -> dict[str, list[Span]]:
-        """Cluster spans by heading. Whole-mode → single cluster."""
+        """Cluster spans by normalised heading. Whole-mode → single cluster.
+
+        Headings are compared as sets of stemmed content words with a
+        Jaccard threshold, so "Risks", "Risk Analysis" and "3. Key risks"
+        land in one cluster and actually compete. Exact-text keys (before
+        2026-11-04) made almost every heading its own cluster of one, which
+        skipped every pairwise judgement and degraded selection to
+        concatenation (AUDIT 2026-10-27 M2).
+        """
         if self.cfg.granularity == "whole":
             return {"_root": list(spans)}
         clusters: dict[str, list[Span]] = {}
+        keys: dict[str, frozenset[str]] = {}
         for s in spans:
-            key = s.heading or "_unsorted"
-            clusters.setdefault(key, []).append(s)
+            words = heading_words(s.heading)
+            if not words:
+                clusters.setdefault("_unsorted", []).append(s)
+                continue
+            best_key, best_j = None, 0.0
+            for key, kw in keys.items():
+                j = len(words & kw) / max(len(words | kw), 1)
+                if j > best_j:
+                    best_key, best_j = key, j
+            if best_key is not None and best_j >= 0.5:
+                clusters[best_key].append(s)
+                keys[best_key] = keys[best_key] | words
+            else:
+                key = " ".join(sorted(words))
+                clusters.setdefault(key, []).append(s)
+                keys[key] = words
         return clusters
 
     def _judge_cluster(

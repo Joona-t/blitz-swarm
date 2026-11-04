@@ -167,6 +167,10 @@ aflow_max_iters = 50
 [judge_ensemble]
 enabled = true
 n_judges = 3
+# With n_judges = 3 the KS distance between two rounds' score buckets can
+# only be 0, 1/3, 2/3 or 1, so any threshold below 0.34 means "identical
+# buckets two rounds running" (AUDIT 2026-10-27 M1). The ensemble now
+# persists across swarm rounds, so this compares round k with round k-1.
 ks_threshold = 0.05
 ks_consecutive = 2
 min_rounds = 2
