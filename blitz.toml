@@ -22,6 +22,12 @@ domain = "general"
 persona_critics = false
 
 [models]
+# WP7: pin a role to another provider: `<role>_provider = "<provider id>"`.
+# A judge or critic on a different model family than the researchers is the
+# one provider-layer change the evidence says improves accuracy
+# (docs/audit/2026-11-04/FRONTIER-RESEARCH.md §1-3). Off by default.
+# judge_provider = "claude"
+# critic_provider = "claude"
 # Role -> tier. Tiers are abstract; providers map them to real model strings below.
 default       = "standard"
 researcher    = "standard"

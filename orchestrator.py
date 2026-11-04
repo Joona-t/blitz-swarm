@@ -23,7 +23,7 @@ from agents import (
     BlitzAgent,
     plan_agents,
 )
-from backends import AgentBackend, AgentCall, make_provider_backend
+from backends import AgentBackend, AgentCall, make_provider_backend, make_role_router
 from backends.models import ModelResolutionError, ResolvedModel, format_models_table, resolve_model
 from blackboard import Blackboard, InMemoryBlackboard
 from config import ConfigError, load_config
@@ -192,8 +192,9 @@ def _make_runtime_backend(
         sandbox=sandbox,
     )
     # Data-driven by provider.adapter; wraps the [backend] fallback chain so
-    # an "unavailable"-class error is retried once on the next provider.
-    return make_provider_backend(selected, cfg, sandbox=resolved_sandbox)
+    # an "unavailable"-class error is retried once on the next provider, and
+    # (WP7) routes pinned roles to their own provider.
+    return make_role_router(selected, cfg, sandbox=resolved_sandbox)
 
 
 def _feature_enabled(
@@ -1602,6 +1603,12 @@ def _dry_run(
         f"| adapter={provider.adapter} | profile={profile} | sandbox={resolved_sandbox}"
     )
     print("Per-role models: --list-models prints the full role -> tier -> model table.")
+    _pins = getattr(cfg.models, "providers", {}) or {}
+    if _pins:
+        print("Role pins: " + ", ".join(f"{r} -> {p}" for r, p in sorted(_pins.items())))
+    else:
+        print("Role pins: none (judges and critics share the researchers' provider; "
+              "set [models] judge_provider = \"<id>\" for a cross-family judge)")
     print(STAGING_BANNER)
     print()
 
@@ -1729,6 +1736,7 @@ def _main():
     if args.list_models:
         cfg = load_config()
         print(format_models_table(cfg, args.backend))
+        print(_capabilities_table(cfg, args.backend))
         return
 
     if not args.topic:
@@ -1763,6 +1771,33 @@ def _main():
         )
     )
     print(f"Done. Output at: {filepath}")
+
+
+def _capabilities_table(cfg, backend_id: str | None = None) -> str:
+    """Capability words per provider in use (default + every pin), model-free."""
+    from backends.models import provider_for_role
+    ids = []
+    for role in ["*", *sorted(getattr(cfg.models, "providers", {}) or {})]:
+        try:
+            pid = provider_for_role(role, cfg, backend_id) if role != "*" else (backend_id or cfg.backend.default)
+        except ValueError as exc:
+            return f"! {exc}"
+        if pid and pid not in ids:
+            ids.append(pid)
+    lines = ["", "Provider capabilities (schema | tools | cost | effort | max_turns):"]
+    for pid in ids:
+        try:
+            caps = make_provider_backend(pid, cfg, with_fallback=False).capabilities
+            lines.append(
+                f"  {pid:<12}{caps.schema_policy:<10}{caps.tool_policy:<11}{caps.cost_policy:<10}"
+                f"{'yes' if caps.effort else 'no':<8}{'yes' if caps.max_turns else 'no'}"
+            )
+        except Exception as exc:
+            lines.append(f"  {pid:<12}! {exc}")
+    pins = getattr(cfg.models, "providers", {}) or {}
+    if pins:
+        lines.append("Role pins: " + ", ".join(f"{r} -> {p}" for r, p in sorted(pins.items())))
+    return "\n".join(lines)
 
 
 def _run_mythos_mode(args) -> None:

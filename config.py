@@ -41,9 +41,16 @@ class ModelsConfig:
 
     default: str = "standard"
     roles: dict[str, str] = field(default_factory=dict)
+    # WP7: `<role>_provider = "<provider id>"` pins a role to a provider other
+    # than [backend] default, e.g. judge_provider = "claude" so the judge is
+    # a different model family from the researchers (FRONTIER-RESEARCH §3).
+    providers: dict[str, str] = field(default_factory=dict)
 
     def tier_for(self, role: str) -> str | None:
         return self.roles.get(role) or self.default or None
+
+    def provider_for(self, role: str) -> str | None:
+        return self.providers.get(role) or None
 
 
 @dataclass
@@ -263,6 +270,8 @@ def _apply_models(target: ModelsConfig, raw, *, path: Path) -> None:
             raise ConfigError(f"{path}: [models].{k} must be a non-empty tier name, got {v!r}")
         if k == "default":
             target.default = v
+        elif k.endswith("_provider") and len(k) > len("_provider"):
+            target.providers[k[: -len("_provider")]] = v
         else:
             target.roles[k] = v
 

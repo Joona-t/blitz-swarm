@@ -164,26 +164,43 @@ def pricing_for(provider, model: str) -> dict | None:
     }
 
 
+def provider_for_role(role: str, cfg, backend_id: str | None = None) -> str | None:
+    """Provider id a role runs on: its `[models] <role>_provider` pin, else
+    `backend_id`, else `[backend] default`. A pin naming an undefined
+    provider raises ValueError (loud, at the first use)."""
+    pin = cfg.models.provider_for(role) if hasattr(cfg.models, "provider_for") else None
+    if pin:
+        if pin not in cfg.backend.providers:
+            raise ValueError(
+                f"[models] {role}_provider = {pin!r} is not defined under [backend.providers] "
+                f"(defined: {', '.join(sorted(cfg.backend.providers)) or 'none'})"
+            )
+        return pin
+    return backend_id or cfg.backend.default or None
+
+
 def list_models(cfg, backend_id: str | None = None, override: str | None = None, *, env=None) -> list[dict]:
     """One row per configured role (+ a `*` row for any other role).
 
     Rows never raise: a role that cannot be resolved carries its error text,
     so `--list-models` stays dry-run friendly.
     """
-    roles = sorted(cfg.models.roles) + ["*"]
+    pinned = sorted(getattr(cfg.models, "providers", {}) or {})
+    roles = sorted(set(cfg.models.roles) | set(pinned)) + ["*"]
     rows: list[dict] = []
     for role in roles:
         try:
-            r = resolve_model(role, backend_id, cfg, override, env=env)
+            bid = provider_for_role(role, cfg, backend_id) if role != "*" else backend_id
+            r = resolve_model(role, bid, cfg, override, env=env)
             rows.append({
                 "role": role, "tier": r.tier, "model": r.model,
                 "effort": r.effort or "-", "backend": r.backend_id,
                 "source": r.source, "error": None,
             })
-        except ModelResolutionError as exc:
+        except (ModelResolutionError, ValueError) as exc:
             rows.append({
-                "role": role, "tier": exc.tier or "-", "model": "-", "effort": "-",
-                "backend": exc.backend_id or "-", "source": "error", "error": str(exc),
+                "role": role, "tier": getattr(exc, "tier", None) or "-", "model": "-", "effort": "-",
+                "backend": getattr(exc, "backend_id", None) or "-", "source": "error", "error": str(exc),
             })
     return rows
 
@@ -192,9 +209,9 @@ def format_models_table(cfg, backend_id: str | None = None, override: str | None
     rows = list_models(cfg, backend_id, override, env=env)
     backend = rows[0]["backend"] if rows else (backend_id or cfg.backend.default)
     header = f"Resolved models for backend={backend!r} (default tier={cfg.models.default!r})"
-    lines = [header, f"{'role':<16}{'tier':<10}{'model':<28}{'effort':<8}source"]
+    lines = [header, f"{'role':<16}{'provider':<12}{'tier':<10}{'model':<28}{'effort':<8}source"]
     for r in rows:
-        lines.append(f"{r['role']:<16}{r['tier']:<10}{r['model']:<28}{r['effort']:<8}{r['source']}")
+        lines.append(f"{r['role']:<16}{r['backend']:<12}{r['tier']:<10}{r['model']:<28}{r['effort']:<8}{r['source']}")
         if r["error"]:
             lines.append(f"    ! {r['error']}")
     lines.append(
@@ -212,6 +229,7 @@ __all__ = [
     "format_models_table",
     "list_models",
     "pricing_for",
+    "provider_for_role",
     "resolve_model",
     "role_env_var",
 ]

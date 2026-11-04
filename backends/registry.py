@@ -29,7 +29,7 @@ from backends.core import (
     prepare_schema_call,
     schema_failed,
 )
-from backends.models import ModelResolutionError, resolve_model
+from backends.models import ModelResolutionError, provider_for_role, resolve_model
 
 BackendFactory = Callable[..., AgentBackend]
 
@@ -207,6 +207,63 @@ def make_provider_backend(
     if not fallbacks:
         return primary
     return FallbackBackend(primary, fallbacks, cfg)
+
+
+def make_role_router(backend_id: str | None, cfg, *, sandbox: str | None = None) -> AgentBackend:
+    """The runtime backend: the default provider (with its fallback chain),
+    plus one lazily built backend per `[models] <role>_provider` pin. With no
+    pins this is exactly `make_provider_backend`."""
+    default = make_provider_backend(backend_id, cfg, sandbox=sandbox)
+    pins = dict(getattr(cfg.models, "providers", {}) or {})
+    if not pins:
+        return default
+    for role in pins:
+        provider_for_role(role, cfg, backend_id)   # raises on an undefined pin
+    return RoleRouter(default, cfg, sandbox=sandbox)
+
+
+class RoleRouter:
+    """Routes each call to the provider pinned for its role (WP7).
+
+    The orchestrator resolves a call's model for the DEFAULT provider; when
+    a role is pinned elsewhere the model is re-resolved for that provider
+    through its own tier table (env overrides still apply), the same way
+    `FallbackBackend` re-resolves for a hop. `metadata["routed_provider"]`
+    records where the call went.
+    """
+
+    def __init__(self, default: AgentBackend, cfg, *, sandbox: str | None = None, log=None):
+        self.default = default
+        self.cfg = cfg
+        self.sandbox = sandbox
+        self.backend_id = default.backend_id
+        self.adapter_kind = getattr(default, "adapter_kind", "")
+        self.capabilities = getattr(default, "capabilities", None)
+        self.pins: dict[str, str] = dict(getattr(cfg.models, "providers", {}) or {})
+        self._built: dict[str, AgentBackend] = {}
+        self._log = log or (lambda msg: print(msg, file=sys.stderr))
+
+    def is_available(self) -> bool:
+        return self.default.is_available()
+
+    def backend_for(self, role: str) -> tuple[str, AgentBackend]:
+        pid = self.pins.get(role)
+        if not pid or pid == self.backend_id:
+            return self.backend_id, self.default
+        if pid not in self._built:
+            self._built[pid] = make_provider_backend(pid, self.cfg, sandbox=self.sandbox)
+        return pid, self._built[pid]
+
+    def call(self, call: AgentCall) -> AgentResult:
+        role = call.model_role or call.role
+        pid, backend = self.backend_for(role)
+        if backend is self.default:
+            return backend.call(call)
+        resolved = resolve_model(role, pid, self.cfg)
+        routed = dataclasses.replace(call, model=resolved.model, reasoning_effort=resolved.effort)
+        result = backend.call(routed)
+        result.metadata = {**(result.metadata or {}), "routed_provider": pid, "routed_from": self.backend_id}
+        return result
 
 
 class FallbackBackend:
