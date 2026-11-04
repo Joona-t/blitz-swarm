@@ -1,5 +1,43 @@
 # Changelog
 
+## [0.4.0] — 2026-11-04 "Any harness, any provider"
+
+Plan of record: `docs/audit/2026-11-04/PLAN.md` (nine work packages), from the audit
+`docs/audit/2026-10-27/AUDIT.md` and the briefs `docs/audit/2026-11-04/{HARNESS,FRONTIER}-RESEARCH.md`.
+Research-only until "implement it all" (2026-11-04). Trail: `BUGS_AND_ITERATIONS.md` ITER-V04.
+
+- **WP1 capability negotiation.** `BackendCapabilities` declares `schema_policy` / `tool_policy` /
+  `cost_policy` / `effort` / `max_turns`; `AgentCall.requires` plus implied requirements (a schema
+  implies `schema`, `tools=None` implies `no_tools`). `PolicyBackend` wraps every provider and raises
+  `BackendCapabilityError` before any process is spawned, or degrades with a stderr line when the
+  provider lists the requirement in `allow_degrade`.
+- **WP2 one schema policy.** `native` → `validate` (prompt + client-side check + one retry) → refuse.
+  The brace-scan JSON fallback is gone from `parse_json_loose` and the orchestrator; a reply that still
+  fails after the retry is an error, not a `needs_work` vote (AUDIT H5, M9). Gemini reads the
+  `--output-format json` envelope.
+- **WP3 tool policy.** Codex: `tools=None` forces `--sandbox read-only` + approval `never`,
+  `danger-full-access` refused. Claude: a build without `--tools` refuses no-tools calls. HTTP/Ollama
+  refuse calls that ask for tools. Lint test: no permission-bypass flags in production code.
+- **WP4 cost.** `AgentResult.cost_policy` (`reported | priced | unknown`); Claude counts cache tokens
+  as input (the 3–15 tokens/round under-count); Codex sums JSONL usage events; metrics carry a per-round
+  policy and a run-level `cost_incomplete` flag; the final print never shows `$0` for unknown.
+- **WP5 ACP adapter.** `backends/adapters/acp.py`: Agent Client Protocol v1 over the agent's stdio,
+  stdlib only; `session/request_permission` is the tool gate; `{model}` placeholder in the command.
+  Scripted fake agent in `tests/fakes/acp_agent.py`.
+- **WP6 conformance suite.** Six canonical calls through every registered adapter behind
+  `PolicyBackend` against `tests/fakes.FakeWorld` (ok / timeout / unavailable); one result shape, one
+  error taxonomy; an unlisted registry adapter fails the suite.
+- **WP7 provider pins.** `[models] <role>_provider = "<id>"`; `RoleRouter` re-resolves the model per
+  provider; `--list-models` prints a provider column and a model-free capability table.
+- **WP8 packaging/CI.** `prompts` package + data files for the two TOMLs, `config.find_config_file`
+  lookup order, `blitz` console script, wheel verified in a clean venv; CI 3.12/3.13/3.14 + wheel job +
+  leak gate; `BLITZ_RESEARCH_SWARM` replaces a hard-coded home path; historical paths redacted.
+- **WP9 docs truth.** README "Supported harnesses" table generated from the declarations and guarded
+  by `tests/test_docs_truth.py`; Gemini marked conformance-tested, not live-verified.
+
+Still true: no live bench run exists on any version. Nothing here changes that; it makes the next
+one portable across providers.
+
 ## [0.3.0] — 2026-10-11 "Fable remediation"
 
 Driven by the adversarial audit of 2026-10-11 (`~/swarm-audit-2026-10-11.md`, Part 1; 47 findings,

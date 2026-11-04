@@ -18,7 +18,7 @@ What has **not** changed: there is still no live n≥20 bench run, and the four 
 
 ---
 
-## What ships in v0.3.0
+## What ships in v0.4.0
 
 Test counts are per test file from `pytest --co -q` on the v0.3.0 tree (759 collected = 745 passed + 14 conditional skips; the WP1–4 commit 36767cd alone was 667 / 14, WP5 added `test_config` +19, `test_agents_planner` 19, `test_embedder` 12, `test_metrics` 28). LOC is `wc -l` over the package's `.py`/`.sql`/prompt files.
 
@@ -35,7 +35,7 @@ Test counts are per test file from `pytest --co -q` on the v0.3.0 tree (759 coll
 | Experimental (gated) | `evolve/{aflow_search,meta_loop,gepa_adapter}.py`, `heterogeneity/cli_router.py`, `scripts/optimize_prompts.py` | **unwired**; every entry point refuses unless `[evolve] enabled = true` | ~1,130 | 36 (`test_phase3`) |
 | Contrib (paid, opt-in) | `contrib/managed_agents/adapter.py` | Anthropic Managed Agents scaffold; nothing imports it | ~210 | 13 |
 
-**Total: 745 passing, 14 conditional skips, 0 failures** in a clean venv with only `pytest` + `pytest-asyncio` (run 2026-10-11, 6.1 s). The suite never invokes a model: adapters are tested at the subprocess/HTTP boundary with fakes.
+**Total: 845 passing, 16 conditional skips, 0 failures** in a clean venv with only `pytest` + `pytest-asyncio` (run 2026-11-04, 7.2 s; v0.3.0 was 745/14). The suite never invokes a model: adapters are tested at the subprocess/HTTP boundary with fakes.
 
 ---
 
@@ -86,6 +86,22 @@ Measured head-to-head numbers exist only from 2026-05-10 (`mythos-bench/results/
 ## Model & provider configuration
 
 Code names **roles** and **tiers**; `blitz.toml` maps tiers to provider-native model strings. No `.py` file outside `tests/` contains a model name — `tests/test_no_hardcoded_models.py` greps the tree and fails the build on any literal. Full reference with real command output: **[`docs/MODELS.md`](docs/MODELS.md)**.
+
+### Supported harnesses
+
+Generated from the adapters' own capability declarations and checked by `tests/test_docs_truth.py` and the conformance suite (`tests/test_conformance.py`: the same six calls through every adapter against fake harnesses). "Live-verified" means a real run on the reference machine; the others pass conformance only.
+
+| adapter | schema | tools | cost | status |
+|---|---|---|---|---|
+| `claude_cli` | native | allowlist | reported | live-verified (Claude Code) |
+| `codex_cli` | native | sandbox | priced | live-verified (Codex CLI) |
+| `gemini_cli` | validate | none | unknown | conformance-tested, not live-verified |
+| `acp` | validate | allowlist | unknown | conformance-tested against `tests/fakes/acp_agent.py`; live smoke runs when `gemini --experimental-acp` is installed |
+| `ollama_http` | native | allowlist | priced | conformance-tested |
+| `openai_http` | native | allowlist | priced | conformance-tested |
+| `generic_cli` | validate | none | unknown | conformance-tested (`native` when the template has `{schema_file}`) |
+
+Vocabulary (`backends/core.py`): **schema** `native` = the harness enforces the JSON schema, `validate` = schema appended to the prompt, reply validated client-side, one retry, then an error; **tools** `allowlist` = per-tool allow/deny (or no tools at all), `sandbox` = coarse sandbox only, `none` = cannot be restricted, so a no-tools call is refused unless the provider sets `allow_degrade = ["no_tools"]`; **cost** `reported` = USD from the provider, `priced` = tokens × `[backend.providers.<id>.pricing]`, `unknown` = printed as unknown, never `$0`. Any agent on the [ACP registry](https://agentclientprotocol.com/get-started/agents) that runs locally is added by config alone: `[backend.providers.<id>] adapter = "acp"`, `command = ["<agent>", "...", "{model}"]`.
 
 ### Role → tier (from `blitz.toml [models]`)
 
@@ -146,7 +162,7 @@ deep = "qwen2.5:7b"
 
 Then `python orchestrator.py "topic" --backend local` (or `ollama`, `mycli`). `[backend] fallback = ["claude", "ollama"]` retries once on the next provider when a call fails for an "unavailable"-class reason (CLI missing, server down, rate-limited); timeouts and schema failures never fall back (`backends/registry.py:128-180`).
 
-Optional per-model pricing (`[backend.providers.<id>.pricing."<model>"] input_per_mtok / output_per_mtok`) feeds cost reporting; absent, cost is `n/a`.
+Optional per-model pricing (`[backend.providers.<id>.pricing."<model>"] input_per_mtok / output_per_mtok`) feeds cost reporting; absent, cost is `unknown` (a run with any uncosted call prints `>= $x`). Pin a role to another provider with `[models] judge_provider = "<id>"` (a cross-family judge is the one provider-layer change the evidence says helps: `docs/audit/2026-11-04/FRONTIER-RESEARCH.md`).
 
 ---
 

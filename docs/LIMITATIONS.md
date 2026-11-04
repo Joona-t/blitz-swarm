@@ -40,7 +40,7 @@ Numbered so other docs can cite them. Each item says what is true at commit 3676
 
 16. **`contrib/managed_agents/` is a scaffold.** Paid Anthropic API, opt-in, unimported, and the network call is not implemented.
 
-17. **Gemini adapter unverified.** Not installed on the reference machine; `blitz.toml` model ids for it are placeholders.
+17. **Gemini adapter conformance-tested, not live-verified.** Not installed on the reference machine; `blitz.toml` model ids for it are placeholders. Its headless JSON envelope shape (`{response, stats, error}`) comes from documentation mirrors. The same holds for the `acp` adapter: the fake agent in `tests/fakes/` follows the ACP v1 schema; the live smoke (`tests/test_acp_adapter.py::test_live_gemini_acp_smoke`) has not been run here.
 
 ## External validity
 

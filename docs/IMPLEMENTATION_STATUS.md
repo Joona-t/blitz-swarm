@@ -15,7 +15,7 @@ Regenerated from the v0.3.0 tree (36767cd + WP5 tests). "Wired" means the orches
 | Strict config loader | `config.py` | 26 | unknown key / bad type / undefined provider raise |
 | Model resolution (role → tier → model) | `backends/models.py` | 38 + 3 (grep guard) | |
 | Embedder (optional MiniLM, hash stub fallback) | `embedder.py` | 12 | |
-| Adapters: claude_cli, codex_cli, gemini_cli, ollama_http, openai_http, generic_cli | `backends/adapters/` | 27 + 12 + 12 | strict Codex schema; `--effort`; fallback chain |
+| Adapters: claude_cli, codex_cli, gemini_cli, ollama_http, openai_http, generic_cli, acp | `backends/adapters/` | 27 + 12 + 12 + conformance 50 + acp 13 | capability declarations (schema/tools/cost), PolicyBackend, strict Codex schema; `--effort`; fallback chain; role pins (`RoleRouter`) |
 | Cascade guard (heuristic screen by default; LLM hooks on `max`) | `mechanisms/cascade_guard.py` | 23 | |
 | Judge ensemble (N=3, KS-stop recorded) | `mechanisms/judge_ensemble.py` | 23 | enabled in the `max` profile |
 | Selector synthesis (Bradley-Terry pairwise) | `mechanisms/selector_synth.py` | 21 | enabled in the `max` profile |

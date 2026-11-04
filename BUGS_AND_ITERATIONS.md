@@ -1,5 +1,29 @@
 # Bugs & Iterations
 
+## 2026-11-04: ITER-V04 — any harness, any provider (plan WP1–WP9)
+
+**What hurt (audit 2026-10-27):** every v0.2 mechanism was unit-tested but the adapters each
+honoured schemas, tools and cost their own way; a reply with a `{` in it parsed as data; a no-tools
+call on a CLI build without `--tools` would have run with tools; cost printed `$0.0000` when nothing
+was reported; the wheel did not install (`prompts/` missing); a home path sat in `jobs/`.
+
+**Fix (branch `next/v0.4`, nine commits WP1–WP8 + this one):** see `CHANGELOG.md` 0.4.0. Root
+cause pattern for all of it: each adapter decided policy locally, so nothing could be required or
+compared. The fix is one declaration (`BackendCapabilities`), one checkpoint (`PolicyBackend`) and
+one gate (`tests/test_conformance.py`) that every adapter must pass to be called supported.
+
+**Process slips during this iteration (self-caught, logged in the studio failures ledger):**
+- WP5 was first committed with 2 red tests (`test_no_hardcoded_models` flagged model literals in the
+  ACP docstring); caught on the next full run, fixed, commit amended before push. Prevention: the
+  full suite runs in the same command as `git commit` (`pytest … && git commit`), so a red suite
+  cannot reach a commit.
+- A conformance test briefly spawned the real `codex` binary (a fake `subprocess.run` was missing in
+  one test); fixed the test and added `spawned == []` assertions where no process may start.
+
+**Measured:** 845 passed, 16 skipped (7.2 s). Wheel: `blitz --list-models` and
+`blitz --dry-run --no-llm-plan` exit 0 in a clean venv with `PATH=/nonexistent`. No model was called.
+
+
 ## 2026-06-10: ITER-AUDIT-1 — Fable audit wave on the upgrade harness (10 findings fixed)
 
 **What hurt:** a model-upgrade audit of the Opus-built 10M-token upgrade harness
