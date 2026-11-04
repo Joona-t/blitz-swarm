@@ -213,10 +213,12 @@ class MetricsCollector:
 
     def record_quality_scores(self, judge_output: dict):
         """Extract numeric quality scores from judge agent output."""
-        self.run.coverage = judge_output.get("coverage_score", 0)
-        self.run.accuracy = judge_output.get("accuracy_score", 0)
-        self.run.clarity = judge_output.get("clarity_score", 0)
-        self.run.depth = judge_output.get("depth_score", 0)
+        def _r(v):
+            return round(float(v), 2) if isinstance(v, (int, float)) else 0
+        self.run.coverage = _r(judge_output.get("coverage_score", 0))
+        self.run.accuracy = _r(judge_output.get("accuracy_score", 0))
+        self.run.clarity = _r(judge_output.get("clarity_score", 0))
+        self.run.depth = _r(judge_output.get("depth_score", 0))
         # Average over the dimensions the judge actually reported. A reported
         # 0 counts as 0; before 2026-11-04 zeros were dropped, which inflated
         # avg_quality (AUDIT 2026-10-27, metrics).

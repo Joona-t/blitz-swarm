@@ -844,6 +844,58 @@ def _persist_to_memory(
 # ---------------------------------------------------------------------------
 
 
+class _CallTally:
+    """Cost/token/provider telemetry for hook-driven calls (judge ensemble,
+    selector pairwise judges). Live run 2026-11-04: those calls were
+    invisible to metrics (synthesis round by_role={}, cost None), so the
+    run's cost was a lower bound for a reason nobody could see."""
+
+    def __init__(self):
+        self.calls = 0
+        self.cost_usd: float | None = None
+        self.cost_unknown = 0
+        self.input_tokens = 0
+        self.output_tokens = 0
+        self.backend_ids: set[str] = set()
+
+    def add(self, result) -> None:
+        self.calls += 1
+        if isinstance(result.cost_usd, (int, float)):
+            self.cost_usd = (self.cost_usd or 0.0) + float(result.cost_usd)
+        else:
+            self.cost_unknown += 1
+        self.input_tokens += int(result.input_tokens or 0)
+        self.output_tokens += int(result.output_tokens or 0)
+        if result.backend_id:
+            self.backend_ids.add(result.backend_id)
+
+    def snapshot(self) -> dict:
+        return {"calls": self.calls, "cost_usd": self.cost_usd, "cost_unknown": self.cost_unknown,
+                "input_tokens": self.input_tokens, "output_tokens": self.output_tokens,
+                "backend_ids": sorted(self.backend_ids)}
+
+    @staticmethod
+    def telemetry(now: dict, before: dict | None = None) -> dict:
+        """Output fields for the calls made since `before` (metrics-compatible)."""
+        before = before or {"calls": 0, "cost_usd": None, "cost_unknown": 0, "input_tokens": 0, "output_tokens": 0}
+        calls = now["calls"] - before["calls"]
+        unknown = now["cost_unknown"] - before["cost_unknown"]
+        cost = None
+        if now["cost_usd"] is not None or before["cost_usd"] is not None:
+            cost = (now["cost_usd"] or 0.0) - (before["cost_usd"] or 0.0)
+        if unknown > 0:
+            cost = None      # any uncosted call -> unknown, never a partial number as if complete
+        elif cost is not None:
+            cost = round(cost, 6)
+        return {
+            "_backend_id": (now["backend_ids"] or [""])[0],
+            "_hook_calls": calls,
+            "_cost_usd": cost,
+            "_input_tokens": now["input_tokens"] - before["input_tokens"],
+            "_output_tokens": now["output_tokens"] - before["output_tokens"],
+        }
+
+
 def _make_judge_fn(
     *,
     backend: AgentBackend,
@@ -861,6 +913,7 @@ def _make_judge_fn(
     """
     judge = resolve_model("judge", backend_id, cfg)
     scratch_dir = scratch_dir or scratch_cwd()
+    tally = _CallTally()
 
     def _judge(
         candidate: str,
@@ -883,6 +936,7 @@ def _make_judge_fn(
         )
         result = backend.call(AgentCall(
             role="judge_ensemble",
+            model_role="judge",     # routes through [models] judge_provider (RoleRouter)
             prompt=prompt,
             system_prompt="Return JSON only. Be strict, independent, and concise.",
             schema=_judge_vote_schema(tuple(rubric_dims)),
@@ -896,6 +950,7 @@ def _make_judge_fn(
             tools=CONSENSUS_TOOLS,
             max_turns=CONSENSUS_MAX_TURNS,
         ))
+        tally.add(result)
         parsed = result.parsed or {}
         if result.errored and not parsed:
             return JudgeVote(
@@ -943,6 +998,7 @@ def _make_judge_fn(
             errored=bool(result.validation_errors),
         )
 
+    _judge.tally = tally
     return _judge
 
 
@@ -998,6 +1054,12 @@ async def _run_judge_ensemble(
     # The round's own mean is the score. `final_score()` is only defined
     # once the ensemble reports stability across swarm rounds.
     score = state.mean_score or 0.0
+    tally = getattr(ensemble.judge_fn, "tally", None)
+    telemetry: dict = {}
+    if tally is not None:
+        now = tally.snapshot()
+        telemetry = _CallTally.telemetry(now, getattr(ensemble, "_tally_seen", None))
+        ensemble._tally_seen = now
     breakdown = ensemble.aggregate_breakdown()
     halt_reason = state.halt_reason if state is not None else "not_started"
     notes = f"Judge ensemble score {score:.1f}/10; halt_reason={halt_reason}"
@@ -1021,6 +1083,7 @@ async def _run_judge_ensemble(
         "accuracy_score": breakdown.get("accuracy", 0.0),
         "clarity_score": breakdown.get("clarity", 0.0),
         "depth_score": breakdown.get("depth", 0.0),
+        **telemetry,
         "_judge_ensemble": True,
         "_judge_state_log": [
             {
@@ -1050,6 +1113,7 @@ def _make_pairwise_judge_fn(
     """
     judge = resolve_model("judge", backend_id, cfg)
     scratch_dir = scratch_dir or scratch_cwd()
+    tally = _CallTally()
 
     def _pairwise(span_a: Span, span_b: Span, topic: str, judge_id: str, seed: int) -> PairwiseVerdict:
         model = judge.model
@@ -1062,6 +1126,7 @@ def _make_pairwise_judge_fn(
         )
         result = backend.call(AgentCall(
             role="selector",
+            model_role="judge",     # pairwise judges are judges: same provider pin
             prompt=prompt,
             system_prompt="Return JSON only with winner and rationale.",
             schema=PAIRWISE_VERDICT_SCHEMA,
@@ -1075,6 +1140,7 @@ def _make_pairwise_judge_fn(
             tools=CONSENSUS_TOOLS,
             max_turns=CONSENSUS_MAX_TURNS,
         ))
+        tally.add(result)
         parsed = result.parsed or {}
         winner = parsed.get("winner", "tie")
         if winner not in ("a", "b", "tie"):
@@ -1087,6 +1153,7 @@ def _make_pairwise_judge_fn(
             rationale=str(parsed.get("rationale", result.error or "")),
         )
 
+    _pairwise.tally = tally
     return _pairwise
 
 
@@ -1137,6 +1204,8 @@ async def _run_selector_synthesis(
     )
     ready = not result.final_text.startswith("[no ")
     final_text = result.final_text
+    tally = getattr(selector.pairwise_judge_fn, "tally", None)
+    telemetry = _CallTally.telemetry(tally.snapshot()) if tally is not None else {}
     dissent_lines: list[str] = []
     critique_lines: list[str] = []
     for o in feedback_outputs or []:
@@ -1172,6 +1241,7 @@ async def _run_selector_synthesis(
         "quality_vote": "ready" if ready else "needs_work",
         "quality_notes": "Selection-bottleneck synthesis completed." if ready else result.final_text,
         "dissent": "\n".join(dissent_lines),
+        **telemetry,
         "_selector_synth": True,
         "_selector_diagnostics": result.diagnostics,
     }
