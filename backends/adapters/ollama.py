@@ -62,6 +62,13 @@ class OllamaHTTPBackend:
                 model=None, text="", raw_stdout="", parsed=None, elapsed_s=0.0,
                 errored=True, error=NO_MODEL_ERROR,
             )
+        if call.tools:
+            # WP3: /api/generate has no tools to grant.
+            return AgentResult(
+                backend_id=self.backend_id, adapter_kind=self.adapter_kind,
+                model=model, text="", raw_stdout="", parsed=None, elapsed_s=0.0,
+                errored=True, error=f"ollama has no tools; call asked for {list(call.tools)}",
+            )
         payload = {
             "model": model,
             "prompt": combined_prompt(call),

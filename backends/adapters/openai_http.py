@@ -94,6 +94,9 @@ class OpenAIHTTPBackend:
         if not model:
             return self._error(None, NO_MODEL_ERROR)
 
+        if call.tools:
+            # WP3: a bare completion endpoint has no tools to grant.
+            return self._error(model, f"openai_http has no tools; call asked for {list(call.tools)}")
         messages = []
         if call.system_prompt:
             messages.append({"role": "system", "content": call.system_prompt})

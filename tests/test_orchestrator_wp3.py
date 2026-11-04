@@ -187,7 +187,12 @@ def _fake_claude(monkeypatch, *, help_text: str, calls: list, envelope: dict):
     def fake_run(cmd, **kwargs):
         calls.append((cmd, kwargs))
         if cmd[:2] == ["claude", "--help"]:
-            return subprocess.CompletedProcess(cmd, 0, stdout=help_text, stderr="")
+            # WP3: a build without --tools refuses no-tools calls, so the
+            # default fake build advertises it; tests about that refusal
+            # pass their own help text through `_fake_claude`.
+            text = help_text if "--tools" in help_text or help_text == "NO_TOOLS_FLAG" else help_text + " --tools"
+            text = "" if help_text == "NO_TOOLS_FLAG" else text
+            return subprocess.CompletedProcess(cmd, 0, stdout=text, stderr="")
         return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(envelope), stderr="")
 
     monkeypatch.setattr(cli_adapters.subprocess, "run", fake_run)
@@ -225,12 +230,18 @@ def test_claude_adapter_forwards_tools_and_max_turns_when_advertised(monkeypatch
 
 def test_claude_adapter_omits_flags_this_cli_build_does_not_advertise(monkeypatch):
     calls: list = []
-    _fake_claude(monkeypatch, help_text="Usage: claude [options]", calls=calls,
+    _fake_claude(monkeypatch, help_text="NO_TOOLS_FLAG", calls=calls,
                  envelope={"structured_output": {"a": 1}})
-    r = cli_adapters.ClaudeCLIBackend().call(AgentCall(role="r", prompt="p", model="m", max_turns=1))
+    # tools=[] (an explicit empty allowlist) is not a no-tools guarantee
+    # request, so the call proceeds without the flags this build lacks.
+    r = cli_adapters.ClaudeCLIBackend().call(AgentCall(role="r", prompt="p", model="m", max_turns=1, tools=[]))
     cmd = _model_cmds(calls)[0][0]
     assert "--tools" not in cmd and "--max-turns" not in cmd and not r.errored
     assert r.metadata["max_turns"] == 1 and r.metadata["tools"] == []
+    # and the no-tools form is refused on such a build (WP3)
+    calls.clear()
+    r2 = cli_adapters.ClaudeCLIBackend().call(AgentCall(role="r", prompt="p", model="m", tools=None))
+    assert r2.errored and "--tools" in r2.error and _model_cmds(calls) == []
 
 
 def test_claude_adapter_treats_is_error_envelope_as_errored(monkeypatch):

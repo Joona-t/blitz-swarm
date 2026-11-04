@@ -128,8 +128,17 @@ class CodexLocalBackend:
         if not model:
             return _error_result(self, None, NO_MODEL_ERROR)
 
-        sandbox = call.sandbox or self.sandbox
-        approval = call.approval_policy or self.approval_policy
+        # WP3 tool policy. Codex has no per-tool allowlist, only a sandbox.
+        # tools=None (no tools) -> the tightest sandbox and no approvals,
+        # whatever the provider default says; a tool list -> the configured
+        # sandbox (workspace-write at most). danger-full-access is refused.
+        if call.tools is None:
+            sandbox, approval = "read-only", "never"
+        else:
+            sandbox = call.sandbox or self.sandbox
+            approval = call.approval_policy or self.approval_policy
+        if sandbox == "danger-full-access":
+            return _error_result(self, model, "codex sandbox danger-full-access is not allowed (WP3 tool policy)")
         effort = call.reasoning_effort or self.reasoning_effort
         prompt = combined_prompt(call)
 
@@ -207,6 +216,8 @@ class CodexLocalBackend:
                     if proc.returncode != 0 else None
                 ),
                 strict_nulls=True,
+                metadata={"sandbox": sandbox, "approval": approval,
+                          "tools": list(call.tools or [])},
             )
 
 
@@ -305,6 +316,14 @@ class ClaudeCLIBackend:
         # comma-joined. `--max-turns` only when this CLI build advertises it.
         if claude_supports_flag("--tools"):
             cmd.extend(["--tools", ",".join(call.tools) if call.tools else ""])
+        elif call.tools is None:
+            # WP3: this CLI build cannot disable tools; running the prompt
+            # with tools would be AUDIT H4. Refuse instead of pretending.
+            return _error_result(
+                self, model,
+                "claude CLI build lacks --tools; cannot guarantee a no-tools call "
+                "(upgrade claude, or set allow_degrade = [\"no_tools\"] on the provider)",
+            )
         if call.max_turns is not None and claude_supports_flag("--max-turns"):
             cmd.extend(["--max-turns", str(call.max_turns)])
         if call.system_prompt:
