@@ -49,3 +49,10 @@ Numbered so other docs can cite them. Each item says what is true at commit 3676
 19. **`fable` is a CLI alias.** The Mythos default resolves to whatever `claude --model fable` routes to on your account; `blitz.toml` can pin `claude-fable-5-1` instead.
 
 20. **Solo-operator evaluation.** All design decisions and qualitative judgements are one person's; no external review of the architecture or the audit remediation has happened beyond the automated skeptic pass (WP7).
+
+20. **Per-call CLI overhead dominates token counts.** In the live smoke on 2026-11-04 a one-sentence,
+    no-tools, schema-enforced `claude -p` call reported 43,917 input tokens and $0.178 (no cache hit);
+    the same prompt through `codex exec` reported 20,252 input tokens. The harness's own system prompt
+    and tool context are billed on every agent call. Token totals in `metrics.jsonl` are therefore
+    mostly harness overhead, and a run's cost scales with the number of calls more than with prompt
+    length. Measured once each; not yet characterised across models or cache states.
