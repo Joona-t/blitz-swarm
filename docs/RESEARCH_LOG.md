@@ -138,3 +138,13 @@ What these two runs do and do not show: the provider layer routes roles as confi
 it; the mechanisms run end-to-end on real output; a Codex researcher at `high` effort does not fit a
 300 s budget about half the time. They say nothing about quality relative to a single agent
 (proposal Phase 1 is still unrun).
+
+**Run C** `20261104_231125` — "How do CRDTs guarantee convergence without coordination, and what can
+they not express?" — `balanced` profile, 2 rounds + selector synthesis, after `653747e` (hook
+routing/telemetry) and `623c834` (Codex effort `medium`). No timeouts: researchers 80–104 s,
+evaluators 23–37 s, judge ensemble 7.3 s per round. `providers_by_role` now shows
+`quality_judge → claude` in both rounds and `synthesizer → claude` (the selector's pairwise judges)
+with cost **reported** ($0.204); round costs $0.288 / $0.284; total `>= $0.78` (Codex still
+uncosted, no pricing table); 278,926 tokens; wall **258 s** (vs 696 s for run B). Guard promoted
+4 / 4 / 7 claims, 0 blocked. Consensus 1/3 then 2/3; judge dims 7.6/9.0/8.5/8.0 (avg 8.3). The
+320-line document has a "Critique and dissent" section. Same caveat: self-judged quality.
