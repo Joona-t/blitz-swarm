@@ -105,3 +105,36 @@ had zero callers (BUG-004), Mythos never ran its deep model (BUG-005), p-value `
 diagram false on staging/KS-stop/blackboard, 36 model literals in 12 files. Remediation WP1–WP6 → 745
 passed / 14 skipped (667 / 14 at 36767cd before WP5). Mythos defaults to Fable 5.1 on claude. **Still no live bench run.** Next:
 `docs/ROADMAP.md` item 1.
+
+## 2026-11-04 — first live cross-provider runs on `next/v0.4` (n=2, one topic each)
+
+Both runs: researchers on Codex (`gpt-6.1-sol`), critic / fact-checker / judges pinned to Claude
+(`sonnet`) through `[models] <role>_provider`, no Redis, heuristic planner, `BLITZ_CONFIG` copy of
+`blitz.toml`. Numbers are from `output/metrics.jsonl` and the run logs; quality is the swarm's own
+judge (same caveat as every earlier entry: not an independent measurement).
+
+**Run A** `20261104_224048` — "How does SQLite WAL mode change the write path, and what are its
+failure modes?" — `cheap` profile (guard/judge-ensemble/selector off), 1 round + synthesis.
+Round 1: 5/5 agents ok, `providers_by_role` = researcher→codex, critic/fact_checker/quality_judge→
+claude; consensus 0/3 ready; cost `>= $0.48` (Claude reported, Codex unknown); 166,492 input /
+29,339 output tokens; wall 549 s. Synthesis: Codex synthesizer **timed out at 300 s**; the document
+fell back to an empty findings section. Judge dims 6/8/7/6 (avg 6.8).
+→ fixes: `[swarm] synthesizer_timeout_seconds`, findings fallback to the last round with
+researchers, timeouts counted as timeouts (commit `938ea77`).
+
+**Run B** `20261104_225646` — "What does HTTP/3 change about head-of-line blocking compared with
+HTTP/2, and where does it not help?" — `balanced` profile (guard + judge ensemble + selector on),
+2 rounds + selector synthesis. One of two Codex researchers timed out at 300 s in **each** round
+(effort `high`; the other took 85 s / 122 s). Judge ensemble: one scoring per round (15.3 s, 10.6 s)
+— the persistence fix holds. Cascade guard promoted 2 / 2 / 9 Yellow claims to Green by
+corroboration across the phases; 0 blocked. Consensus 2/3 then 1/3 ready. Selector synthesis
+completed in 15.3 s and the document carries a "Critique and dissent" section. Cost `>= $0.47`;
+151,999 tokens; wall 696 s; judge dims 6.7/9.2/8.7/7.7 (avg 8.0).
+→ findings: the judge-ensemble and pairwise calls had no `model_role`, so they **bypassed the judge
+pin** (ran on Codex) and were invisible to metrics (synthesis `by_role={}`, cost None) — fixed in
+`653747e`; Codex provider effort lowered to `medium` (`623c834`).
+
+What these two runs do and do not show: the provider layer routes roles as configured and records
+it; the mechanisms run end-to-end on real output; a Codex researcher at `high` effort does not fit a
+300 s budget about half the time. They say nothing about quality relative to a single agent
+(proposal Phase 1 is still unrun).
