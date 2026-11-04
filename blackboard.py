@@ -27,7 +27,7 @@ from __future__ import annotations
 import json
 import time
 
-BLACKBOARD_META_KEY = "blackboard:meta"
+BLACKBOARD_META_KEY = "blackboard:meta"  # legacy default namespace
 FINDINGS_STREAM_KEY = "blackboard:findings"
 
 
@@ -41,7 +41,12 @@ def _round_trip(output: dict) -> dict:
 class Blackboard:
     """Redis-backed shared blackboard for the swarm."""
 
-    def __init__(self, host: str = "localhost", port: int = 6379, db: int = 0, *, client=None):
+    def __init__(self, host: str = "localhost", port: int = 6379, db: int = 0, *, client=None,
+                 namespace: str = "blackboard"):
+        # Keys are namespaced per run (AUDIT 2026-10-27 M10): two concurrent
+        # runs on one Redis used to share `blackboard:*` and cleanup() wiped
+        # them both. The orchestrator passes namespace=f"blackboard:{run_id}".
+        self.namespace = namespace.rstrip(":") or "blackboard"
         if client is None:
             import redis  # lazy: the in-memory mode must not need the package
 
@@ -52,6 +57,17 @@ class Blackboard:
             )
         self.redis = client
         self._verify_connection()
+
+    def _k(self, *parts: str) -> str:
+        return ":".join((self.namespace, *parts))
+
+    @property
+    def meta_key(self) -> str:
+        return self._k("meta")
+
+    @property
+    def findings_key(self) -> str:
+        return self._k("findings")
 
     def _verify_connection(self):
         """Verify Redis is reachable. Raises with clear error if not."""
@@ -76,7 +92,7 @@ class Blackboard:
         """
         self.cleanup()
 
-        self.redis.hset(BLACKBOARD_META_KEY, mapping={
+        self.redis.hset(self.meta_key, mapping={
             "topic": topic,
             "started_at": str(time.time()),
             "current_round": "0",
@@ -89,25 +105,25 @@ class Blackboard:
     def cleanup(self):
         """Remove all blackboard keys from prior runs."""
         pipe = self.redis.pipeline()
-        for key in self.redis.scan_iter("blackboard:*"):
+        for key in self.redis.scan_iter(self._k("*")):
             pipe.delete(key)
         pipe.execute()
 
     def finalize(self):
         """Mark the swarm run as complete."""
-        self.redis.hset(BLACKBOARD_META_KEY, "status", "complete")
+        self.redis.hset(self.meta_key, "status", "complete")
 
     # ------------------------------------------------------------------
     # Round management
     # ------------------------------------------------------------------
 
     def get_current_round(self) -> int:
-        val = self.redis.hget(BLACKBOARD_META_KEY, "current_round")
+        val = self.redis.hget(self.meta_key, "current_round")
         return int(val) if val else 0
 
     def advance_round(self) -> int:
         """Increment and return the new round number."""
-        return int(self.redis.hincrby(BLACKBOARD_META_KEY, "current_round", 1))
+        return int(self.redis.hincrby(self.meta_key, "current_round", 1))
 
     # ------------------------------------------------------------------
     # Agent output read/write
@@ -115,11 +131,11 @@ class Blackboard:
 
     def write_agent_output(self, round_n: int, agent_id: str, output: dict):
         """Write an agent's output to the blackboard for a given round."""
-        key = f"blackboard:round:{round_n}:{agent_id}"
+        key = self._k("round", str(round_n), agent_id)
         self.redis.set(key, json.dumps(output, default=str))
 
         # Also append to the findings stream for durability
-        self.redis.xadd(FINDINGS_STREAM_KEY, {
+        self.redis.xadd(self.findings_key, {
             "round": str(round_n),
             "agent_id": agent_id,
             "role": output.get("role", ""),
@@ -132,7 +148,7 @@ class Blackboard:
         """Read all agent outputs for a given round (sorted by key so the
         order is deterministic across scans)."""
         outputs = []
-        pattern = f"blackboard:round:{round_n}:*"
+        pattern = self._k("round", str(round_n), "*")
         for key in sorted(self.redis.scan_iter(pattern)):
             raw = self.redis.get(key)
             if raw:
@@ -153,7 +169,7 @@ class Blackboard:
 
     def set_agent_status(self, agent_id: str, status: str, role: str = ""):
         """Set agent status using Last-Writer-Wins timestamp."""
-        key = f"blackboard:agent:{agent_id}"
+        key = self._k("agent", agent_id)
         mapping = {
             "status": status,
             "last_updated": str(time.time()),
@@ -163,7 +179,7 @@ class Blackboard:
         self.redis.hset(key, mapping=mapping)
 
     def get_agent_status(self, agent_id: str) -> str:
-        key = f"blackboard:agent:{agent_id}"
+        key = self._k("agent", agent_id)
         return self.redis.hget(key, "status") or "unknown"
 
 

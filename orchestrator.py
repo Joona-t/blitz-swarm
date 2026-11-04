@@ -730,14 +730,15 @@ def save_output(topic: str, content: str) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def _open_blackboard(use_redis: bool, cfg=None):
+def _open_blackboard(use_redis: bool, cfg=None, *, run_id: str = ""):
     """The run's blackboard: Redis-backed (`[redis]` in blitz.toml) when
     requested and reachable, else the in-memory implementation of the same
     interface. Never None — every round is written here and read back."""
     cfg = cfg or _config
     if use_redis:
         try:
-            return Blackboard(host=cfg.redis.host, port=cfg.redis.port, db=cfg.redis.db)
+            return Blackboard(host=cfg.redis.host, port=cfg.redis.port, db=cfg.redis.db,
+                              namespace=f"blackboard:{run_id}" if run_id else "blackboard")
         except Exception as e:
             print(f"Warning: Redis unavailable ({e}). Using the in-memory blackboard.\n")
     return InMemoryBlackboard()
@@ -1081,9 +1082,18 @@ async def _run_selector_synthesis(
     provider,
     sandbox: str,
     scratch_dir: Path | None = None,
+    feedback_outputs: list[dict] | None = None,
+    warning: str = "",
 ) -> dict:
     """Selection-bottleneck synthesis. Every pairwise judgement fans out via
-    `asyncio.to_thread` + `gather` (SelectorSynth.synthesize_async)."""
+    `asyncio.to_thread` + `gather` (SelectorSynth.synthesize_async).
+
+    `feedback_outputs` (critic / fact-checker / judge outputs) and `warning`
+    (the no-consensus note) are appended to the selected text as a
+    "Critique and dissent" section, so the selector path keeps what the
+    synthesizer prompt always asked for (AUDIT 2026-10-27, PR #2 defect 2:
+    the selector assembled researcher spans only and dropped dissent).
+    """
     judge_model = resolve_model("judge", backend_id, cfg).model
     selector_cfg = MechanismSelectorConfig(
         granularity=cfg.selector.granularity,
@@ -1107,10 +1117,33 @@ async def _run_selector_synthesis(
         guard_filter=(lambda outs: _filter_guarded(guard, outs)) if guard else None,
     )
     ready = not result.final_text.startswith("[no ")
+    final_text = result.final_text
+    dissent_lines: list[str] = []
+    critique_lines: list[str] = []
+    for o in feedback_outputs or []:
+        aid = o.get("agent_id", "unknown")
+        role = o.get("role", "")
+        if o.get("_error") or o.get("_blocked"):
+            continue
+        note = (o.get("quality_notes") or "").strip()
+        if note:
+            critique_lines.append(f"- **{role} ({aid})**, vote `{o.get('quality_vote', '?')}`: {note[:400]}")
+        d = (o.get("dissent") or "").strip()
+        if d:
+            dissent_lines.append(f"- **{role} ({aid})**: {d[:600]}")
+    if ready and (critique_lines or dissent_lines or warning):
+        extra = ["", "## Critique and dissent", ""]
+        if warning:
+            extra += [f"> {warning.strip()}", ""]
+        if critique_lines:
+            extra += ["### Evaluator notes", *critique_lines, ""]
+        if dissent_lines:
+            extra += ["### Dissent (preserved verbatim)", *dissent_lines, ""]
+        final_text = final_text.rstrip() + "\n" + "\n".join(extra)
     return {
         "agent_id": "selector_synth",
         "role": "synthesizer",
-        "findings": result.final_text,
+        "findings": final_text,
         "key_points": [
             f"selected_spans={len(result.selected_span_ids)}",
             f"judge_calls={result.diagnostics.get('judge_calls', 0)}",
@@ -1119,7 +1152,7 @@ async def _run_selector_synthesis(
         "gaps_identified": [] if ready else ["Selector synthesis had no usable inputs"],
         "quality_vote": "ready" if ready else "needs_work",
         "quality_notes": "Selection-bottleneck synthesis completed." if ready else result.final_text,
-        "dissent": "",
+        "dissent": "\n".join(dissent_lines),
         "_selector_synth": True,
         "_selector_diagnostics": result.diagnostics,
     }
@@ -1296,7 +1329,7 @@ async def run_swarm(
     print()
 
     # The blackboard is the round store (Redis or in-memory, same interface).
-    bb = _open_blackboard(use_redis, runtime_cfg)
+    bb = _open_blackboard(use_redis, runtime_cfg, run_id=run_id)
     bb.initialize(topic, [a.id for a in agents])
     print("Blackboard: Redis connected" if isinstance(bb, Blackboard) else "Blackboard: in-memory")
 
@@ -1545,6 +1578,15 @@ async def run_swarm(
             provider=provider,
             sandbox=resolved_sandbox,
             scratch_dir=scratch_dir,
+            feedback_outputs=[
+                o for o in guarded_accumulated
+                if o.get("role") in ("critic", "fact_checker", "quality_judge")
+            ],
+            warning=(
+                "" if consensus_reached else
+                "The swarm did not reach full consensus"
+                + (f" (halted: {halt_reason})" if halt_reason else "") + "."
+            ),
         )
         synth_outputs = _apply_guard(guard, [synth_output], final_round_n + 1)
     else:
@@ -1796,7 +1838,10 @@ def _main():
     if args.dry_run:
         _dry_run(
             args.topic,
-            use_llm=not args.no_llm_plan,
+            # A dry run is model-free: heuristic planner always. The LLM
+            # planner (one fast-tier call) only runs in a real run unless
+            # --no-llm-plan (AUDIT 2026-10-27, PR #2 defect 5).
+            use_llm=False,
             backend_id=args.backend,
             quality_profile=args.quality_profile,
             sandbox=args.sandbox,
