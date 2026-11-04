@@ -1,0 +1,33 @@
+#!/bin/sh
+# blitz-swarm pre-commit: refuse a commit while the suite is red.
+# Keys off pytest's OWN exit status (never a grep's). Twice on 2026-11-04 a
+# red suite reached a commit because the guard was
+# `pytest | grep ... && git commit` and grep exits 0 when it prints FAILED.
+# Skip only with BLITZ_SKIP_TESTS=1 (say why in the commit message).
+set -u
+if [ "${BLITZ_SKIP_TESTS:-}" = "1" ]; then
+  echo "pre-commit: BLITZ_SKIP_TESTS=1 set; tests skipped" >&2
+  exit 0
+fi
+PY="${BLITZ_PYTHON:-$(git config blitz.python 2>/dev/null || echo python3)}"
+if ! "$PY" -c "import pytest" 2>/dev/null; then
+  for cand in .venv/bin/python venv/bin/python; do
+    [ -x "$cand" ] && "$cand" -c "import pytest" 2>/dev/null && PY="$cand" && break
+  done
+fi
+if ! "$PY" -c "import pytest" 2>/dev/null; then
+  echo "pre-commit: no python with pytest found (set BLITZ_PYTHON=/path/to/venv/bin/python)" >&2
+  exit 1
+fi
+log="$(mktemp)"
+"$PY" -m pytest -q -p no:cacheprovider -x >"$log" 2>&1
+rc=$?
+if [ $rc -ne 0 ]; then
+  echo "pre-commit: pytest exit $rc -- commit refused. Tail:" >&2
+  tail -15 "$log" >&2
+  rm -f "$log"
+  exit 1
+fi
+tail -1 "$log" >&2
+rm -f "$log"
+exit 0
