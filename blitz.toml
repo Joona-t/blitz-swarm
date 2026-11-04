@@ -78,9 +78,13 @@ sandbox = "read-only"
 approval_policy = "never"
 ephemeral = true
 [backend.providers.codex.tiers]
-fast = "gpt-5.5"
-standard = "gpt-5.5"
-deep = "gpt-5.5"
+# Live check 2026-11-04: this ChatGPT-account Codex (codex-cli 0.165) rejects
+# "gpt-5.5" ("not supported when using Codex with a ChatGPT account"); the
+# account's own ~/.codex/config.toml model is used for every tier until a
+# cheaper tier id is confirmed on the account.
+fast = "gpt-6.1-sol"
+standard = "gpt-6.1-sol"
+deep = "gpt-6.1-sol"
 
 # ---------------------------------------------------------------------------
 # Gemini CLI. Not installed on the reference machine; model ids unverified —

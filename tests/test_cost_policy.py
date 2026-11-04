@@ -13,7 +13,7 @@ from pathlib import Path
 
 from backends import AgentCall, COST_REPORTED, COST_UNKNOWN
 from backends.adapters import cli as cli_adapters
-from backends.adapters.cli import ClaudeCLIBackend, CodexLocalBackend, GeminiCLIBackend, _codex_usage
+from backends.adapters.cli import ClaudeCLIBackend, CodexLocalBackend, GeminiCLIBackend, _codex_error_message, _codex_usage
 
 
 def test_codex_usage_sums_jsonl_events():
@@ -97,3 +97,17 @@ def test_metrics_round_policy_and_lower_bound_flag(tmp_path):
     mc.start_round("r2")
     mc.end_round("r2", [{"_cost_usd": 0.25, "_input_tokens": 1, "_output_tokens": 1}])
     assert mc.run.rounds["r2"]["cost_policy"] == "reported"
+
+
+def test_codex_error_message_comes_from_jsonl_when_stderr_is_empty(monkeypatch):
+    stream = "\n".join([
+        json.dumps({"type": "turn.started"}),
+        json.dumps({"type": "error", "message": "The 'x' model is not supported when using Codex with a ChatGPT account."}),
+        json.dumps({"type": "turn.failed", "error": {"message": "The 'x' model is not supported when using Codex with a ChatGPT account."}}),
+    ])
+    assert "not supported" in _codex_error_message(stream)
+    monkeypatch.setattr(cli_adapters.shutil, "which", lambda name: "/usr/bin/codex")
+    monkeypatch.setattr(cli_adapters.subprocess, "run",
+                        lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, stdout=stream, stderr=""))
+    r = CodexLocalBackend(model="x").call(AgentCall(role="r", prompt="p", tools=[]))
+    assert r.errored and "not supported" in r.error

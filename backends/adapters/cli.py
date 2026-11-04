@@ -66,6 +66,31 @@ def _extract_last_codex_agent_message(stdout: str) -> str:
     return last
 
 
+def _codex_error_message(stdout: str) -> str:
+    """The last `{"type": "error"|"turn.failed", ...}` message in the JSONL
+    stream. codex exec prints these on stdout and exits 1 with an empty
+    stderr, so without this the error text is lost (live finding 2026-11-04:
+    "The 'x' model is not supported when using Codex with a ChatGPT account")."""
+    last = ""
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "error" and isinstance(event.get("message"), str):
+            last = event["message"]
+        elif event.get("type") == "turn.failed":
+            err = event.get("error") or {}
+            if isinstance(err, dict) and isinstance(err.get("message"), str):
+                last = err["message"]
+    return last
+
+
 def _codex_usage(stdout: str) -> tuple[int, int, int]:
     """(input_tokens, cached_input_tokens, output_tokens) summed over every
     JSONL event that carries a `usage` object (`turn.completed` in current
@@ -183,6 +208,12 @@ class CodexLocalBackend:
             cmd = [
                 "codex",
                 "exec",
+                # Live finding 2026-11-04: `codex exec` refuses to run in a
+                # directory that is not a trusted git checkout ("Not inside
+                # a trusted directory and --skip-git-repo-check was not
+                # specified", exit 1). Our scratch cwd is never a repo, by
+                # design (core-loop-04), so the check is skipped explicitly.
+                "--skip-git-repo-check",
                 "-c", f"approval_policy={json.dumps(approval)}",
                 "--model", model,
                 "--sandbox", sandbox,
@@ -240,7 +271,8 @@ class CodexLocalBackend:
                 elapsed_s=elapsed,
                 errored=proc.returncode != 0,
                 error=(
-                    f"codex exit {proc.returncode}: {(proc.stderr or '')[:500]}"
+                    f"codex exit {proc.returncode}: "
+                    f"{((proc.stderr or '').strip() or _codex_error_message(proc.stdout))[:500]}"
                     if proc.returncode != 0 else None
                 ),
                 strict_nulls=True,

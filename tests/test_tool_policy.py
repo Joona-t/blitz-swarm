@@ -39,6 +39,8 @@ def _codex_argv(monkeypatch, call: AgentCall) -> list[str]:
 def test_codex_no_tools_forces_read_only_and_never(monkeypatch):
     cmd = _codex_argv(monkeypatch, AgentCall(role="r", prompt="p", tools=None))
     assert cmd[cmd.index("--sandbox") + 1] == "read-only"
+    # scratch cwd is never a git repo; without this codex exec exits 1 (live finding)
+    assert "--skip-git-repo-check" in cmd
     assert '"never"' in cmd[cmd.index("-c") + 1]
 
 
