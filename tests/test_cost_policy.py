@@ -93,6 +93,7 @@ def test_metrics_round_policy_and_lower_bound_flag(tmp_path):
     ])
     rm = mc.run.rounds["r1"]
     assert rm["cost_policy"] == "unknown" and rm["cost_usd"] == 0.5
+    assert rm["providers"] == ["nobody"] and rm["providers_by_role"] == {"?": "nobody"}
     assert mc.run.cost_incomplete is True
     mc.start_round("r2")
     mc.end_round("r2", [{"_cost_usd": 0.25, "_input_tokens": 1, "_output_tokens": 1}])

@@ -57,6 +57,10 @@ class RoundMetrics:
     # table, "unknown" when any call has no cost at all (then cost_usd is a
     # lower bound and is printed as such).
     cost_policy: str = "unknown"
+    # WP7: provider ids that served this round's calls (role pins route
+    # judges/critics elsewhere); "role -> provider" is in `providers_by_role`.
+    providers: list[str] = field(default_factory=list)
+    providers_by_role: dict[str, str] = field(default_factory=dict)
     input_tokens: int = 0
     output_tokens: int = 0
     ready_votes: int = 0
@@ -139,6 +143,7 @@ class MetricsCollector:
         round_input_tokens = 0
         round_output_tokens = 0
         policies: set[str] = set()
+        providers: dict[str, str] = {}
 
         for o in outputs:
             if o.get("_error"):
@@ -167,6 +172,8 @@ class MetricsCollector:
             if cost is not None:
                 round_cost = (round_cost or 0.0) + float(cost)
             policies.add(policy)
+            if o.get("_backend_id"):
+                providers[str(o.get("role") or "?")] = str(o["_backend_id"])
             round_input_tokens += in_tok
             round_output_tokens += out_tok
 
@@ -181,6 +188,8 @@ class MetricsCollector:
             cost_usd=None if round_cost is None else round(round_cost, 6),
             cost_policy=("unknown" if "unknown" in policies or not policies
                          else "priced" if "priced" in policies else "reported"),
+            providers=sorted(set(providers.values())),
+            providers_by_role=providers,
             input_tokens=round_input_tokens,
             output_tokens=round_output_tokens,
         )
