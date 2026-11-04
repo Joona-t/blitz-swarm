@@ -13,6 +13,9 @@ import urllib.request
 from dataclasses import dataclass
 
 from backends.core import (
+    COST_PRICED,
+    SCHEMA_NATIVE,
+    TOOL_ALLOWLIST,
     AgentCall,
     AgentResult,
     BackendCapabilities,
@@ -38,6 +41,9 @@ class OllamaHTTPBackend:
         adapter_kind="ollama_http",
         structured_output=True,
         local=True,
+        schema_policy=SCHEMA_NATIVE,      # `format` accepts a JSON schema
+        tool_policy=TOOL_ALLOWLIST,       # /api/generate has no tools
+        cost_policy=COST_PRICED,          # eval counts; USD via pricing table
     )
 
     def is_available(self) -> bool:

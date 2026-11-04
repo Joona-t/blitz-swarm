@@ -400,14 +400,16 @@ def test_registry_builds_every_adapter_from_provider_tables(cfg):
         "codex_cli", "claude_cli", "gemini_cli", "ollama_http", "generic_cli", "openai_http",
     }
     tool = make_provider_backend("tool", cfg, with_fallback=False)
+    assert isinstance(tool, backends.PolicyBackend)   # WP1: every provider is policy-wrapped
+    tool = tool.inner
     assert isinstance(tool, backends.GenericCLIBackend)
     assert tool.command == ["tool", "{model}"] and tool.metadata == {"knob": "v"} and tool.backend_id == "tool"
 
-    srv = make_provider_backend("srv", cfg, with_fallback=False)
+    srv = make_provider_backend("srv", cfg, with_fallback=False).inner
     assert isinstance(srv, backends.OpenAIHTTPBackend)
     assert srv.base_url == "http://127.0.0.1:8080/v1" and srv.api_key_env == "SRV_TOKEN"
 
-    primary = make_provider_backend(None, cfg, with_fallback=False)
+    primary = make_provider_backend(None, cfg, with_fallback=False).inner
     assert isinstance(primary, backends.CodexLocalBackend)
     assert primary.model is None and primary.reasoning_effort == "high"
 
@@ -423,7 +425,7 @@ def test_make_provider_backend_wraps_fallback_chain(cfg):
     assert wrapped.backend_id == "primary"
     assert [fid for fid, _ in wrapped.fallbacks] == ["second", "third"]
     cfg.backend.fallback = []
-    assert isinstance(make_provider_backend("primary", cfg), backends.CodexLocalBackend)
+    assert isinstance(make_provider_backend("primary", cfg).inner, backends.CodexLocalBackend)
 
 
 # ---------------------------------------------------------------------------

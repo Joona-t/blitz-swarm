@@ -19,6 +19,9 @@ import urllib.request
 from dataclasses import dataclass, field
 
 from backends.core import (
+    COST_PRICED,
+    SCHEMA_NATIVE,
+    TOOL_ALLOWLIST,
     AgentCall,
     AgentResult,
     BackendCapabilities,
@@ -42,11 +45,18 @@ class OpenAIHTTPBackend:
     adapter_kind: str = "openai_http"
     metadata: dict = field(default_factory=dict)
 
+    # A bare chat endpoint has no tools at all, so "no tools" is met by
+    # construction (allowlist with an empty set); a call that ASKS for tools
+    # is refused by the adapter.
     capabilities = BackendCapabilities(
         adapter_kind="openai_http",
         structured_output=True,
         schema_enforcement=True,
         local=True,
+        schema_policy=SCHEMA_NATIVE,      # response_format json_schema strict
+        tool_policy=TOOL_ALLOWLIST,
+        cost_policy=COST_PRICED,          # usage tokens; USD via pricing table
+        effort=True,
     )
 
     def _headers(self) -> dict[str, str]:

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
@@ -16,6 +17,12 @@ from typing import Protocol
 
 DEFAULT_SANDBOX = "read-only"
 DEFAULT_APPROVAL = "never"
+
+# Capability vocabulary (WP1/WP2/WP4). Defined before the dataclasses that
+# use them as defaults.
+SCHEMA_NATIVE, SCHEMA_VALIDATE, SCHEMA_NONE = "native", "validate", "none"
+TOOL_ALLOWLIST, TOOL_SANDBOX, TOOL_NONE = "allowlist", "sandbox", "none"
+COST_REPORTED, COST_PRICED, COST_UNKNOWN = "reported", "priced", "unknown"
 
 # Error substrings that mean "this provider cannot serve right now" (CLI
 # missing, server down, rate-limited/overloaded). Timeouts and schema
@@ -80,6 +87,11 @@ class AgentCall:
     # Agentic turn cap forwarded when the CLI supports it; consensus roles
     # run with max_turns=1 (one answer, no tool loop).
     max_turns: int | None = None
+    # Capability requirements the caller insists on (WP1). Checked by
+    # `check_requirements` before any process is spawned; an unmet
+    # requirement is a `BackendCapabilityError`, never a silent degrade.
+    # Vocabulary: see REQUIREMENTS.
+    requires: frozenset[str] = frozenset()
     metadata: dict = field(default_factory=dict)
 
     @property
@@ -103,6 +115,13 @@ class AgentResult:
     output_tokens: int = 0
     validation_errors: list[str] = field(default_factory=list)
     adapter_kind: str = ""
+    # How `cost_usd` was obtained: "reported" (provider returned USD),
+    # "priced" (tokens x a pricing table), "unknown" (neither; cost_usd is
+    # None and must be printed as unknown, never $0). WP4.
+    cost_policy: str = COST_UNKNOWN
+    # Schema mode actually used for this call (WP2): "native", "validate"
+    # or "" when the call had no schema.
+    schema_mode: str = ""
     metadata: dict = field(default_factory=dict)
 
     @property
@@ -120,6 +139,69 @@ class BackendCapabilities:
     stateful: bool = False
     local: bool = True
     supports_ephemeral: bool = True
+    # WP1 negotiation fields. Adapters declare; callers require.
+    # schema_policy: "native"   = harness enforces the JSON schema itself
+    #                "validate" = prompt + client-side validation + 1 retry
+    #                "none"     = cannot produce schema-shaped output
+    schema_policy: str = SCHEMA_NONE
+    # tool_policy:   "allowlist" = per-tool allow/deny (or no tools at all,
+    #                             e.g. a bare chat endpoint)
+    #                "sandbox"   = coarse sandbox only (no per-tool control)
+    #                "none"      = tools cannot be restricted
+    tool_policy: str = TOOL_NONE
+    # cost_policy:   "reported" | "priced" | "unknown" (best case for this
+    #                adapter; the per-call AgentResult carries the actual)
+    cost_policy: str = COST_UNKNOWN
+    effort: bool = False        # forwards a reasoning-effort setting
+    max_turns: bool = False     # forwards an agentic turn cap
+
+    def satisfies(self, requirement: str) -> bool:
+        return requirement in REQUIREMENTS and REQUIREMENTS[requirement](self)
+
+
+# Requirement vocabulary for `AgentCall.requires`. Each maps to a predicate
+# over BackendCapabilities. Keep this table the single source of truth so
+# `--list-models` and the conformance suite print the same words.
+REQUIREMENTS: dict[str, "Callable[[BackendCapabilities], bool]"] = {
+    "schema": lambda c: c.schema_policy in (SCHEMA_NATIVE, SCHEMA_VALIDATE),
+    "schema:native": lambda c: c.schema_policy == SCHEMA_NATIVE,
+    "no_tools": lambda c: c.tool_policy in (TOOL_ALLOWLIST, TOOL_SANDBOX),
+    "tools:allowlist": lambda c: c.tool_policy == TOOL_ALLOWLIST,
+    "cost": lambda c: c.cost_policy in (COST_REPORTED, COST_PRICED),
+    "cost:reported": lambda c: c.cost_policy == COST_REPORTED,
+    "effort": lambda c: c.effort,
+    "max_turns": lambda c: c.max_turns,
+}
+
+
+class BackendCapabilityError(ValueError):
+    """A call required something the selected backend cannot provide."""
+
+
+def check_requirements(call: AgentCall, caps: BackendCapabilities | None) -> list[str]:
+    """Unmet requirements of `call` against `caps` (empty list = all met).
+
+    Unknown requirement words are reported as unmet, so a typo can never
+    pass silently. A backend with no capabilities object meets nothing.
+    """
+    unmet = []
+    for req in sorted(call.requires):
+        if caps is None or not caps.satisfies(req):
+            unmet.append(req)
+    return unmet
+
+
+def implied_requirements(call: AgentCall) -> frozenset[str]:
+    """Requirements implied by the call's own shape, merged with explicit
+    ones: a schema implies "schema"; `tools=None` (no tools) implies
+    "no_tools" because an adapter that cannot restrict tools would run the
+    prompt WITH tools, which is the failure AUDIT H4 describes."""
+    implied = set(call.requires)
+    if call.schema is not None:
+        implied.add("schema")
+    if call.tools is None:
+        implied.add("no_tools")
+    return frozenset(implied)
 
 
 class AgentBackend(Protocol):
@@ -128,6 +210,50 @@ class AgentBackend(Protocol):
     def is_available(self) -> bool: ...
 
     def call(self, call: AgentCall) -> AgentResult: ...
+
+
+# ---------------------------------------------------------------------------
+# Schema policy (WP2): one place decides how a schema is honoured.
+# ---------------------------------------------------------------------------
+
+SCHEMA_PROMPT_SUFFIX = (
+    "\n\n## Output contract\n"
+    "Respond with ONLY one JSON object (no prose, no markdown fence) that "
+    "validates against this JSON Schema:\n```json\n{schema}\n```"
+)
+
+SCHEMA_RETRY_NOTE = (
+    "\n\nIMPORTANT: your previous response did not validate against the "
+    "schema ({errors}). Respond with ONLY the JSON object."
+)
+
+
+def prepare_schema_call(call: AgentCall, caps: BackendCapabilities | None) -> tuple[AgentCall, str]:
+    """Return (call_to_send, mode). mode is "native", "validate" or "".
+
+    native:   the adapter forwards `call.schema` to the harness unchanged.
+    validate: the schema is appended to the prompt and `call.schema` is
+              kept so `normalize_result` validates the reply client-side.
+    """
+    if call.schema is None:
+        return call, ""
+    policy = caps.schema_policy if caps else SCHEMA_NONE
+    if policy == SCHEMA_NATIVE:
+        return call, SCHEMA_NATIVE
+    if policy == SCHEMA_VALIDATE:
+        import dataclasses
+        prompt = call.prompt + SCHEMA_PROMPT_SUFFIX.format(schema=json.dumps(call.schema, indent=1))
+        return dataclasses.replace(call, prompt=prompt), SCHEMA_VALIDATE
+    raise BackendCapabilityError(
+        f"backend cannot produce schema-shaped output (schema_policy={policy!r})"
+    )
+
+
+def schema_failed(result: AgentResult) -> bool:
+    """True when the only thing wrong with `result` is the schema."""
+    return bool(result.validation_errors) and (
+        not result.error or result.error == "; ".join(result.validation_errors[:3])
+    )
 
 
 def combined_prompt(call: AgentCall) -> str:
@@ -140,7 +266,14 @@ def combined_prompt(call: AgentCall) -> str:
 
 
 def parse_json_loose(text: str) -> dict | None:
-    """Parse direct JSON, fenced JSON, or the largest embedded object."""
+    """Parse direct JSON or one fenced ```json block.
+
+    WP2: the old third step (grab the text between the first `{` and the
+    last `}`) is gone. It turned prose-with-a-brace into a "parsed" object
+    and let unstructured replies pass as data (AUDIT H5). A reply that is
+    neither JSON nor a fenced JSON block is `None`, which the schema policy
+    turns into an explicit error.
+    """
     if not text or not text.strip():
         return None
     stripped = text.strip()
@@ -154,15 +287,6 @@ def parse_json_loose(text: str) -> dict | None:
     if fence:
         try:
             parsed = json.loads(fence.group(1))
-            return parsed if isinstance(parsed, dict) else None
-        except json.JSONDecodeError:
-            pass
-
-    start = stripped.find("{")
-    end = stripped.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        try:
-            parsed = json.loads(stripped[start:end + 1])
             return parsed if isinstance(parsed, dict) else None
         except json.JSONDecodeError:
             return None
@@ -331,11 +455,15 @@ def normalize_result(
     metadata: dict | None = None,
     parsed: dict | None = None,
     strict_nulls: bool = False,
+    cost_policy: str | None = None,
+    schema_mode: str = "",
 ) -> AgentResult:
     """Build an AgentResult from raw text.
 
     `parsed` short-circuits JSON extraction when the adapter already has the
     object; `strict_nulls=True` strips nulls a strict-mode schema forced in.
+    `cost_policy` defaults to "reported" when `cost_usd` is a number and
+    "unknown" otherwise (WP4).
     """
     if parsed is None:
         parsed = parse_json_loose(text)
@@ -345,6 +473,8 @@ def normalize_result(
     final_error = error
     if not final_error and validation_errors:
         final_error = "; ".join(validation_errors[:3])
+    if cost_policy is None:
+        cost_policy = COST_REPORTED if isinstance(cost_usd, (int, float)) else COST_UNKNOWN
     return AgentResult(
         backend_id=backend_id,
         adapter_kind=adapter_kind,
@@ -359,5 +489,7 @@ def normalize_result(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         validation_errors=validation_errors,
+        cost_policy=cost_policy,
+        schema_mode=schema_mode,
         metadata=metadata or {},
     )

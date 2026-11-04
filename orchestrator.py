@@ -364,16 +364,13 @@ def invoke_agent(
                 )
                 continue
 
-            if result.validation_errors:
-                output["_raw"] = True
-                output["gaps_identified"] = output.get("gaps_identified", []) + [
-                    "Backend result failed schema validation"
-                ]
-                output["quality_vote"] = output.get("quality_vote") or "needs_work"
-                output["quality_notes"] = (
-                    output.get("quality_notes", "")
-                    or "; ".join(result.validation_errors[:3])
-                )
+            # WP2: after the retry, an unstructured or schema-failing reply is
+            # an ERROR (excluded from votes and context), not a low-confidence
+            # `needs_work` vote that blocks consensus (AUDIT H5, M9).
+            if output.get("_raw") or result.validation_errors:
+                detail = "; ".join(result.validation_errors[:3]) or "unstructured output"
+                print(f"  {agent_label} ERROR: schema failure after retry ({detail[:120]})")
+                return _tag(_error_output(agent, f"schema failure after retry: {detail}"))
 
             if not output.get("_error"):
                 retry_note = f" (retry {attempt})" if attempt > 0 else ""
@@ -490,18 +487,7 @@ def _parse_agent_output(agent: BlitzAgent, stdout: str) -> dict:
         except json.JSONDecodeError:
             pass
 
-    # Try finding any JSON object in the output
-    brace_match = re.search(r"\{.*\}", stdout, re.DOTALL)
-    if brace_match:
-        try:
-            data = json.loads(brace_match.group(0))
-            if isinstance(data, dict):
-                data["agent_id"] = agent.id
-                data["role"] = agent.role
-                return data
-        except json.JSONDecodeError:
-            pass
-
+    # WP2: no brace-scan. Prose with a `{` in it is not data (AUDIT H5).
     # Last resort: wrap raw text as findings (flagged as _raw for retry)
     return {
         "agent_id": agent.id,

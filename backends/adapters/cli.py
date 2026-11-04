@@ -17,8 +17,16 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from backends.core import (
+    COST_PRICED,
+    COST_REPORTED,
+    COST_UNKNOWN,
     DEFAULT_APPROVAL,
     DEFAULT_SANDBOX,
+    SCHEMA_NATIVE,
+    SCHEMA_VALIDATE,
+    TOOL_ALLOWLIST,
+    TOOL_NONE,
+    TOOL_SANDBOX,
     AgentCall,
     AgentResult,
     BackendCapabilities,
@@ -104,6 +112,10 @@ class CodexLocalBackend:
         tool_sandbox=True,
         local=True,
         supports_ephemeral=True,
+        schema_policy=SCHEMA_NATIVE,      # --output-schema (strict mode)
+        tool_policy=TOOL_SANDBOX,         # --sandbox read-only / -a never; no per-tool list
+        cost_policy=COST_PRICED,          # tokens from JSONL; USD only via a pricing table
+        effort=True,
     )
 
     def is_available(self) -> bool:
@@ -262,6 +274,11 @@ class ClaudeCLIBackend:
         structured_output=True,
         schema_enforcement=True,
         local=True,
+        schema_policy=SCHEMA_NATIVE,      # --json-schema -> structured_output
+        tool_policy=TOOL_ALLOWLIST,       # --tools "" / --tools a,b
+        cost_policy=COST_REPORTED,        # total_cost_usd in the envelope
+        effort=True,
+        max_turns=True,
     )
 
     def is_available(self) -> bool:
@@ -380,7 +397,14 @@ class GeminiCLIBackend:
     backend_id: str = "gemini"
     adapter_kind: str = "gemini_cli"
 
-    capabilities = BackendCapabilities(adapter_kind="gemini_cli", local=True)
+    # Gemini headless has `--output-format json` ({response, stats, error})
+    # but no user schema and no documented tool allowlist, so: schema is
+    # prompt+validate, tools cannot be restricted (a no-tools call is
+    # refused unless the provider sets allow_degrade = ["no_tools"]).
+    capabilities = BackendCapabilities(
+        adapter_kind="gemini_cli", local=True,
+        schema_policy=SCHEMA_VALIDATE, tool_policy=TOOL_NONE, cost_policy=COST_UNKNOWN,
+    )
 
     def is_available(self) -> bool:
         return shutil.which("gemini") is not None
@@ -392,7 +416,10 @@ class GeminiCLIBackend:
         if not model:
             return _error_result(self, None, NO_MODEL_ERROR)
         prompt = combined_prompt(call)
-        cmd = ["gemini", "-m", model, "-p", prompt]
+        # `--output-format json` -> {"response": str, "stats": {...}, "error"?}
+        # (geminicli.com/docs/cli/headless). A build without the flag prints
+        # plain text; both shapes are handled below.
+        cmd = ["gemini", "-m", model, "--output-format", "json", "-p", prompt]
         start = time.monotonic()
         try:
             proc = subprocess.run(
@@ -410,17 +437,35 @@ class GeminiCLIBackend:
                 elapsed_s=time.monotonic() - start,
             )
         elapsed = time.monotonic() - start
+        text = proc.stdout.strip()
+        in_tok = out_tok = 0
+        env_error = None
+        envelope = parse_json_loose(proc.stdout)
+        if isinstance(envelope, dict) and "response" in envelope:
+            text = str(envelope.get("response") or "").strip()
+            stats = envelope.get("stats") or {}
+            if isinstance(stats, dict):
+                in_tok = int(stats.get("input_tokens", stats.get("prompt_tokens", 0)) or 0)
+                out_tok = int(stats.get("output_tokens", stats.get("candidates_tokens", 0)) or 0)
+            if envelope.get("error"):
+                env_error = f"gemini error: {str(envelope['error'])[:500]}"
+        error = None
+        if proc.returncode != 0:
+            error = f"gemini exit {proc.returncode}: {(proc.stderr or '')[:500]}"
+        elif env_error:
+            error = env_error
         return normalize_result(
             backend_id=self.backend_id,
             adapter_kind=self.adapter_kind,
             model=model,
-            text=proc.stdout.strip(),
+            text=text,
             raw_stdout=proc.stdout,
             schema=call.schema,
             elapsed_s=elapsed,
-            errored=proc.returncode != 0,
-            error=(
-                f"gemini exit {proc.returncode}: {(proc.stderr or '')[:500]}"
-                if proc.returncode != 0 else None
-            ),
+            errored=error is not None,
+            error=error,
+            input_tokens=in_tok,
+            output_tokens=out_tok,
+            cost_policy=COST_UNKNOWN,
+            schema_mode=SCHEMA_VALIDATE if call.schema else "",
         )

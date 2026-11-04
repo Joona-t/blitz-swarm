@@ -14,7 +14,21 @@ import dataclasses
 import sys
 from collections.abc import Callable
 
-from backends.core import DEFAULT_APPROVAL, DEFAULT_SANDBOX, AgentBackend, AgentCall, AgentResult, is_unavailable_error
+from backends.core import (
+    DEFAULT_APPROVAL,
+    DEFAULT_SANDBOX,
+    SCHEMA_RETRY_NOTE,
+    SCHEMA_VALIDATE,
+    AgentBackend,
+    AgentCall,
+    AgentResult,
+    BackendCapabilityError,
+    check_requirements,
+    implied_requirements,
+    is_unavailable_error,
+    prepare_schema_call,
+    schema_failed,
+)
 from backends.models import ModelResolutionError, resolve_model
 
 BackendFactory = Callable[..., AgentBackend]
@@ -69,13 +83,20 @@ def make_backend(
 
 
 def backend_from_provider(backend_id: str, provider, *, sandbox: str | None = None) -> AgentBackend:
-    """Build one adapter instance from a `BackendProviderConfig`."""
+    """Build one adapter instance from a `BackendProviderConfig`, wrapped in
+    `PolicyBackend` so every call is capability-checked (WP1) and schema-
+    policed (WP2). `[backend.providers.<id>] allow_degrade = ["no_tools"]`
+    names requirements that may be waived with a logged warning."""
     if not provider.adapter:
         raise ValueError(
             f"[backend.providers.{backend_id}] has no 'adapter' key; "
             f"registered adapters: {', '.join(registered_backends())}"
         )
-    return make_backend(
+    extras = dict(provider.metadata)
+    allow_degrade = extras.pop("allow_degrade", None) or []
+    if isinstance(allow_degrade, str):
+        allow_degrade = [allow_degrade]
+    raw = make_backend(
         backend_id,
         adapter=provider.adapter,
         model=provider.model or None,
@@ -86,8 +107,71 @@ def backend_from_provider(backend_id: str, provider, *, sandbox: str | None = No
         base_url=provider.base_url,
         api_key_env=provider.api_key_env,
         command=list(provider.command or []),
-        **provider.metadata,
+        **extras,
     )
+    return PolicyBackend(raw, allow_degrade=tuple(allow_degrade))
+
+
+class PolicyBackend:
+    """Capability check + schema policy around one adapter.
+
+    Order per call: (1) unmet requirements -> `BackendCapabilityError`
+    unless listed in `allow_degrade`, in which case one stderr line and
+    `metadata["degraded"]`; (2) `prepare_schema_call` picks native/validate;
+    (3) adapter call; (4) in validate mode a schema failure is retried
+    exactly once with the errors quoted, then returned as an error.
+    """
+
+    def __init__(self, inner: AgentBackend, *, allow_degrade: tuple[str, ...] = (), log=None):
+        self.inner = inner
+        self.backend_id = inner.backend_id
+        self.adapter_kind = getattr(inner, "adapter_kind", "")
+        self.allow_degrade = tuple(allow_degrade)
+        self._log = log or (lambda msg: print(msg, file=sys.stderr))
+
+    @property
+    def capabilities(self):
+        return getattr(self.inner, "capabilities", None)
+
+    def is_available(self) -> bool:
+        return self.inner.is_available()
+
+    def call(self, call: AgentCall) -> AgentResult:
+        caps = self.capabilities
+        probe = dataclasses.replace(call, requires=implied_requirements(call))
+        unmet = check_requirements(probe, caps)
+        degraded = [r for r in unmet if r in self.allow_degrade]
+        hard = [r for r in unmet if r not in self.allow_degrade]
+        if hard:
+            raise BackendCapabilityError(
+                f"backend {self.backend_id!r} ({self.adapter_kind}) cannot meet "
+                f"{', '.join(hard)} required by role {call.role!r}; "
+                f"capabilities: schema={getattr(caps, 'schema_policy', '?')} "
+                f"tools={getattr(caps, 'tool_policy', '?')} cost={getattr(caps, 'cost_policy', '?')}"
+            )
+        if degraded:
+            self._log(
+                f"[backend] {self.backend_id!r} DEGRADED: waiving {', '.join(degraded)} "
+                f"for role {call.role!r} (allow_degrade in blitz.toml)"
+            )
+        sent, mode = prepare_schema_call(call, caps)
+        result = self.inner.call(sent)
+        if mode == SCHEMA_VALIDATE and schema_failed(result):
+            retry = dataclasses.replace(
+                sent, prompt=sent.prompt + SCHEMA_RETRY_NOTE.format(
+                    errors="; ".join(result.validation_errors[:3])),
+            )
+            second = self.inner.call(retry)
+            second.metadata = {**(second.metadata or {}), "schema_retry": True,
+                               "first_errors": result.validation_errors[:3]}
+            result = second
+            if schema_failed(result):
+                result.errored = True
+                result.error = "schema: " + "; ".join(result.validation_errors[:3])
+        result.schema_mode = mode or result.schema_mode
+        if degraded:
+            result.metadata = {**(result.metadata or {}), "degraded": degraded}
+        return result
 
 
 def make_provider_backend(

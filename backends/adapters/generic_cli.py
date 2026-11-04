@@ -16,6 +16,10 @@ from pathlib import Path
 
 from backends.adapters.templates import placeholders_in, render_command
 from backends.core import (
+    COST_UNKNOWN,
+    SCHEMA_NATIVE,
+    SCHEMA_VALIDATE,
+    TOOL_NONE,
     AgentCall,
     AgentResult,
     BackendCapabilities,
@@ -38,7 +42,20 @@ class GenericCLIBackend:
     adapter_kind: str = "generic_cli"
     metadata: dict = field(default_factory=dict)
 
-    capabilities = BackendCapabilities(adapter_kind="generic_cli", local=True)
+    @property
+    def capabilities(self) -> BackendCapabilities:
+        """Declared from the argv template: a `{schema_file}` placeholder
+        means the tool enforces the schema itself (native); otherwise the
+        schema is prompted and validated. Tools can never be restricted
+        through a template we don't understand -> tool_policy none."""
+        used = placeholders_in(self.command)
+        return BackendCapabilities(
+            adapter_kind="generic_cli", local=True,
+            schema_policy=SCHEMA_NATIVE if "schema_file" in used else SCHEMA_VALIDATE,
+            tool_policy=TOOL_NONE,
+            cost_policy=COST_UNKNOWN,
+            effort="effort" in used,
+        )
 
     def is_available(self) -> bool:
         return bool(self.command) and shutil.which(self.command[0]) is not None
