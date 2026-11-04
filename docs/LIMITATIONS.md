@@ -4,7 +4,7 @@ Numbered so other docs can cite them. Each item says what is true at commit 3676
 
 ## Data
 
-1. **No n≥20 live bench run exists, on any version.** (2026-11-04: a 2-prompt smoke — `bench/runs/20261104T211647_f48cde461b11_v1`, s001 q=7.8 $0.84 158 s, s003 q=8.0 $0.29 115 s, 0 errors — proves the runner, budget accounting and aggregate work live; it is not a dataset.) `bench/runner.py` is `swarm_fn`-injectable and tested with fakes (160 tests); `bench/runs/` and `bench/reports/` are empty. No n≥20 slate run has been executed against Codex, Claude, Gemini, Ollama or a single-agent baseline. Every number in `docs/research/PHASE_0_BENCH.md` is a plan.
+1. **No n≥20 live bench run exists, on any version.** (2026-11-04: a 2-prompt smoke — `bench/runs/20261104T211647_f48cde461b11_v1`, s001 q=7.8 $0.84 158 s, s003 q=8.0 $0.29 115 s, 0 errors — proves the runner, budget accounting and aggregate work live; it is not a dataset. A 10-prompt swarm-only slate run `bench/runs/20261104T212924_4e57c4496ae2_v1` followed, stopped by the $30 budget gate; still no comparison arm.) `bench/runner.py` is `swarm_fn`-injectable and tested with fakes (160 tests); `bench/runs/` and `bench/reports/` are empty. No n≥20 slate run has been executed against Codex, Claude, Gemini, Ollama or a single-agent baseline. Every number in `docs/research/PHASE_0_BENCH.md` is a plan.
 
 2. **mythos-bench results are stale.** `mythos-bench/results/runs.jsonl` has 4 rows dated 2026-05-10, produced on the pre-v0.3 Claude `claude -p` path that the backend refactor replaced. They are kept as history. Regenerating them requires live LLM runs and was deferred (plan: "Explicitly deferred").
 

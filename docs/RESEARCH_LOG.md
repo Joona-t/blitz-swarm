@@ -163,3 +163,17 @@ mean Δ −0.0019, paired t = −1.0 (df 1), p = 0.5 (stdlib student-t fallback,
 Cohen's d_z = −0.71. At n=2 these numbers carry no information; the point is that the pairing,
 the p-method label and the cost block all appear. Run-to-run noise on identical prompts: Δq of
 +0.1 and −0.4, cost −16% / +11%.
+
+**Slate run (swarm arm only)** `20261104T212924_4e57c4496ae2_v1` — 30-prompt slate, `--max-rounds 2 --budget 30`,
+profile `max`, researchers Codex (`gpt-6.1-sol`, medium), evaluators + judges + selector Claude.
+Started 23:29, ended ~00:58 EET. **10 prompts scored, 20 stopped by the budget gate**
+(`budget_exhausted`, excluded from every mean). Reported cost $31.74 (the gate checks before a
+prompt starts, so the last one overshoots by its own cost); 22.2M input tokens. Self-judged quality
+mean 7.53 (SD 0.63, CI95 [7.13, 7.86]); functional composite mean 0.856 over 9 prompts with a
+composite. By tier: easy n=5 q 7.74 $2.47; medium n=4 q 7.28 $3.71; hard n=1 q 7.5 $4.54.
+Per prompt: s017 q=7.7 $5.21 360s, s011 q=7.7 $1.28 456s, s005 q=7.3 $1.38 489s, s030 q=7.5 $4.54 583s, s024 q=6.0 $4.59 541s, s018 q=7.4 $3.10 360s, s012 q=7.8 $1.86 222s, s006 q=7.5 $5.49 770s, s001 q=8.4 $2.35 259s, s025 q=8.0 $1.95 717s.
+What it is: the first baseline dataset for later `--baseline` pairing, from one configuration.
+What it is not: a comparison; there is no single-agent arm, and the judge is Claude on Codex text
+(cross-family, but still an LLM judge with no human calibration). The full slate at this
+configuration would cost roughly $90–100 reported; a cheaper profile or a cheaper judge tier is
+needed before n=30 is affordable per arm.
