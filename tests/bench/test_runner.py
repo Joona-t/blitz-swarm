@@ -430,4 +430,5 @@ def test_portable_paths_never_contain_the_home_directory(tmp_path):
     outside = Path.home() / "somewhere" / "x.md"
     assert _portable(outside) == "~/somewhere/x.md"
     assert _portable("") == ""
-    assert "/Users/" not in _portable(tmp_path / "a.md") or str(tmp_path).startswith("/Users/") is False or _portable(tmp_path / "a.md").startswith("~/")
+    # never the raw home directory, whatever it is on this machine
+    assert not _portable(tmp_path / "a.md").startswith(str(Path.home()))
