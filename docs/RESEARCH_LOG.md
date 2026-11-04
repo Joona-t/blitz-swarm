@@ -148,3 +148,10 @@ with cost **reported** ($0.204); round costs $0.288 / $0.284; total `>= $0.78` (
 uncosted, no pricing table); 278,926 tokens; wall **258 s** (vs 696 s for run B). Guard promoted
 4 / 4 / 7 claims, 0 blocked. Consensus 1/3 then 2/3; judge dims 7.6/9.0/8.5/8.0 (avg 8.3). The
 320-line document has a "Critique and dissent" section. Same caveat: self-judged quality.
+
+**Bench smoke** `bench/runs/20261104T211647_f48cde461b11_v1` — the first live `bench.runner` run on
+any version: `--filter-id s001 s003 --budget 3.0 --max-rounds 1`, same pinned config as run C,
+profile `max`. s001 q=7.8 cov 2/5 $0.841 158 s; s003 q=8.0 cov 3/5 $0.285 115 s; 0 errors / timeouts;
+total $1.13 (Claude-reported part only; Codex uncosted), 435k input tokens. `summary.json`,
+`stats.md`, `results.jsonl`, `config.json` committed (paths redacted to `~/`). n=2 proves the
+pipeline, not anything about quality.

@@ -43,7 +43,7 @@ Research-only until "implement it all" (2026-11-04). Trail: `BUGS_AND_ITERATIONS
   `avg_quality` counts reported zeros; Codex `--skip-git-repo-check` and JSONL error text; versioned
   pre-commit hook refusing a red suite. Trail: `BUGS_AND_ITERATIONS.md` ITER-V04b.
 
-Still true: no live bench run exists on any version. Nothing here changes that; it makes the next
+Still true: no n≥20 bench run exists on any version. A 2-prompt live smoke (`bench/runs/20261104T211647_f48cde461b11_v1`) now proves the runner end-to-end. Nothing here changes that; it makes the next
 one portable across providers.
 
 ## [0.3.0] — 2026-10-11 "Fable remediation"
