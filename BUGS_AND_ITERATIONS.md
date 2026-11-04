@@ -20,7 +20,16 @@ one gate (`tests/test_conformance.py`) that every adapter must pass to be called
 - A conformance test briefly spawned the real `codex` binary (a fake `subprocess.run` was missing in
   one test); fixed the test and added `spawned == []` assertions where no process may start.
 
-**Measured:** 845 passed, 16 skipped (7.2 s). Wheel: `blitz --list-models` and
+- **Repeat (same day):** commit `1d4f38a` was pushed with 3 red tests. The guard was
+  `pytest | grep -E "FAILED|passed" && git commit`; grep exits 0 when it *prints* FAILED, so
+  `&&` saw grep's status, not pytest's. Second occurrence of the class -> enforced instead of
+  re-documented: `scripts/hooks/pre-commit` (versioned; `sh scripts/install-hooks.sh` sets
+  `core.hooksPath`) runs pytest and refuses the commit on a non-zero **pytest** exit. Proof
+  (2026-11-04): with `tests/test_zz_red_proof.py` asserting False, `git commit` printed
+  `1 failed, 859 passed` and HEAD stayed at `938ea77`; after removing it, `f002882` landed.
+  Escape hatch `BLITZ_SKIP_TESTS=1` must be named in the commit message.
+
+**Measured:** 859 passed, 16 skipped (7.1 s) after the live-run fixes. Wheel: `blitz --list-models` and
 `blitz --dry-run --no-llm-plan` exit 0 in a clean venv with `PATH=/nonexistent`. No model was called.
 
 
