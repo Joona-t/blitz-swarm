@@ -493,3 +493,19 @@ def test_open_backs_up_legacy_db_once_before_migrating(tmp_path):
     store.db.close()
     MemoryStore.open(path, embedder=None, llm=None).db.close()   # second open: no re-copy
     assert backup.stat().st_mtime_ns == mtime
+
+
+def test_tier1_trace_excludes_synthesizer_and_errored_outputs(store):
+    """Karpathy P4 / PR #2 defect 3: the synthesizer's summary is not evidence."""
+    rounds = [
+        [{"role": "researcher", "agent_id": "r1", "findings": "WAL appends to a log file."},
+         {"role": "critic", "agent_id": "c1", "findings": "Missing checkpoint discussion."},
+         {"role": "researcher", "agent_id": "r2", "findings": "[ERROR] timeout", "_error": True}],
+        [{"role": "synthesizer", "agent_id": "synth", "findings": "Summary of everything."}],
+    ]
+    report = store.persist_task("SQLite WAL", "resolved", rounds)
+    rows = store.db.execute("SELECT agent_id, content FROM utterances WHERE query_id = ?", (report.query_id,)).fetchall()
+    agents = {r[0] for r in rows}
+    assert "synth" not in agents and "r2" not in agents
+    assert {"r1", "c1"} <= agents
+    assert report.n_utterances == 2

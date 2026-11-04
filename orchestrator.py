@@ -795,7 +795,7 @@ def _try_init_memory():
 
 def _persist_to_memory(
     mem_store, bb, topic, consensus_reached, override_applied,
-    all_round_outputs, agents,
+    all_round_outputs, agents, metrics_record: dict | None = None,
 ):
     """Persist the completed task to G-Memory (all three tiers, promotion
     gate, eviction cycle) and finalize the blackboard."""
@@ -806,6 +806,9 @@ def _persist_to_memory(
                 "resolved" if consensus_reached else "failed",
                 all_round_outputs,
                 n_agents=len(agents),
+                cost_usd=(metrics_record or {}).get("total_cost_usd"),
+                wall_clock_s=float((metrics_record or {}).get("total_wall_clock_s") or 0.0),
+                quality_score=(metrics_record or {}).get("avg_quality"),
                 tags=["swarm:consensus", f"meta:override={'yes' if override_applied else 'no'}"],
             )
             print(f"Memory: stored query {report.query_id[:8]} | "
@@ -1618,7 +1621,7 @@ async def run_swarm(
     try:
         _persist_to_memory(
             mem_writer, bb, topic, consensus_reached, override_applied,
-            all_round_outputs, agents,
+            all_round_outputs, agents, metrics_record=metrics_record,
         )
     except Exception as e:
         print(f"Warning: Memory persistence failed ({e})")

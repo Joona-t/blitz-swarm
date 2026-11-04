@@ -220,6 +220,7 @@ class MemoryStore:
         quality_score: float | None = None,
         tags: Sequence[str] = (),
         query_id: str | None = None,
+        trace_exclude_roles: Sequence[str] = ("synthesizer",),
     ) -> PersistReport:
         """Store one completed task across all three tiers.
 
@@ -233,12 +234,23 @@ class MemoryStore:
         if status not in ("resolved", "failed", "partial"):
             status = "failed"
         rounds = [list(r) for r in round_outputs]
+        # Tier 1 holds what the agents SAID, as evidence. The synthesizer's
+        # summary of that evidence is not more evidence (Karpathy P4,
+        # 2026-03; still open in PR #2): excluded from the trace, along with
+        # errored/blocked outputs. Tier 3 distillation still reads every
+        # round, so the synthesis informs insights without polluting traces.
+        trace_rounds = [
+            [o for o in r
+             if str(o.get("role") or "") not in set(trace_exclude_roles)
+             and not o.get("_error") and not o.get("_blocked")]
+            for r in rounds
+        ]
         qid = self.qg.add_task(
             topic, status, n_agents=n_agents, n_rounds=len(rounds), cost_usd=cost_usd,
             wall_clock_s=wall_clock_s, quality_score=quality_score, tags=tags, query_id=query_id,
         )
 
-        utterances, edges = build_trace(rounds)
+        utterances, edges = build_trace(trace_rounds)
         with self.db:
             self.db.executemany(
                 "INSERT OR IGNORE INTO utterances (id, query_id, agent_id, content, epoch, timestamp) "
