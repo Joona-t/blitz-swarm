@@ -75,6 +75,14 @@ class GuardConfig:
     max_claims_per_msg: int = 12
     yellow_release_threshold: float = 0.7
     cache_ttl_s: int = 600
+    # Root of trust (2026-11-04, AUDIT H7). A claim can only become Green by
+    # matching a prior Green anchor, and nothing ever created the first
+    # anchor, so the guard recorded 0 green / 0 red / 0 blocked on every
+    # run. Now, when a round closes, a Yellow claim stated independently by
+    # >= green_corroboration distinct agents (word overlap >= 0.6, same or
+    # earlier round) is promoted to Green. Corroboration is a structural
+    # rule, not verification; grounded checks (Phase 2) can replace it.
+    green_corroboration: int = 2
     max_lineage_size: int = 2000             # eviction cap
     block_on_red: bool = True
 
@@ -115,6 +123,7 @@ class GuardSummary:
 
     round_n: int
     green: int = 0
+    promoted: int = 0           # yellow -> green by corroboration at round close
     yellow: int = 0
     red: int = 0
     blocked_outputs: int = 0
@@ -437,6 +446,51 @@ class CascadeGuard:
             self._evict_oldest_non_green()
 
         return output
+
+    def close_round(self, round_n: int) -> int:
+        """Promote corroborated Yellow claims of `round_n` to Green.
+
+        Two claims corroborate when their word-set Jaccard overlap is >= 0.6
+        and they come from different agents. Claims that contain a negation
+        token never corroborate (a shared "X is not Y" is left for the
+        screen). Returns the number promoted. Idempotent."""
+        k = max(1, int(self.cfg.green_corroboration))
+        if k <= 1 or not self.cfg.is_active:
+            return 0
+        this_round = [c for c in self.lineage.values()
+                      if c.source_round == round_n and c.verdict == "yellow"]
+        others = [c for c in self.lineage.values()
+                  if c.source_round <= round_n and c.verdict in ("yellow", "green")]
+        neg_tokens = {"not", "no", "never", "false", "incorrect", "wrong"}
+        promoted = 0
+
+        def words(t: str) -> set[str]:
+            return set(re.findall(r"[a-z0-9]+", t.lower()))
+
+        for claim in this_round:
+            cw = words(claim.text)
+            if not cw or cw & neg_tokens:
+                continue
+            supporters = {claim.source_agent}
+            for o in others:
+                if o.id == claim.id or o.source_agent in supporters:
+                    continue
+                ow = words(o.text)
+                if not ow or ow & neg_tokens:
+                    continue
+                if len(cw & ow) / max(len(cw | ow), 1) >= 0.6:
+                    supporters.add(o.source_agent)
+                    if len(supporters) >= k:
+                        break
+            if len(supporters) >= k:
+                claim.verdict = "green"
+                promoted += 1
+        if promoted:
+            summary = self._summary_for(round_n)
+            summary.promoted += promoted
+            summary.green += promoted
+            summary.yellow = max(0, summary.yellow - promoted)
+        return promoted
 
     def on_agent_error(self, agent_id: str, round_n: int, reason: str) -> int:
         """Mark this agent (and its descendants) tainted.

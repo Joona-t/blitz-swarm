@@ -243,11 +243,15 @@ def _apply_guard(
             output.setdefault("_round", round_n)
         return outputs
     guarded = [guard.on_agent_output(output, round_n) for output in outputs]
+    # Round close: corroborated Yellow claims become the Green anchors the
+    # next round's screen needs (AUDIT H7: there were never any).
+    guard.close_round(round_n)
     summary = guard.round_summary(round_n)
-    if summary.blocked_outputs or summary.tainted_descendants:
+    if summary.blocked_outputs or summary.tainted_descendants or summary.promoted:
         print(
             f"  Cascade guard: blocked={summary.blocked_outputs} "
-            f"tainted_descendants={summary.tainted_descendants}"
+            f"tainted_descendants={summary.tainted_descendants} "
+            f"promoted_green={summary.promoted}"
         )
     return guarded
 
