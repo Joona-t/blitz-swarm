@@ -305,6 +305,7 @@ def _ensure_builtins() -> None:
         CodexLocalBackend,
         GeminiCLIBackend,
     )
+    from backends.adapters.acp import ACPBackend
     from backends.adapters.generic_cli import GenericCLIBackend
     from backends.adapters.ollama import OllamaHTTPBackend
     from backends.adapters.openai_http import OpenAIHTTPBackend
@@ -367,6 +368,21 @@ def _ensure_builtins() -> None:
                 "approval_policy", "ephemeral", "base_url", "api_key_env",
             ),
         ),
+        replace=True,
+    )
+    register_backend(
+        "acp",
+        lambda **kw: ACPBackend(
+            backend_id=kw.get("backend_id", "acp"),
+            command=list(kw.get("command") or []),
+            model=kw.get("model") or None,
+            reasoning_effort=kw.get("reasoning_effort") or None,
+            metadata=_extras(
+                kw, "command", "model", "reasoning_effort", "sandbox",
+                "approval_policy", "ephemeral", "base_url", "api_key_env",
+            ),
+        ),
+        aliases=("acp_stdio",),
         replace=True,
     )
     register_backend(

@@ -39,6 +39,7 @@ from backends.models import (
     pricing_for,
     resolve_model,
 )
+from backends.adapters.acp import ACPBackend
 from backends.adapters.cli import ClaudeCLIBackend, CodexLocalBackend, GeminiCLIBackend
 from backends.adapters.generic_cli import GenericCLIBackend
 from backends.adapters.ollama import OllamaHTTPBackend
@@ -92,6 +93,7 @@ __all__ = [
     "list_models",
     "pricing_for",
     "resolve_model",
+    "ACPBackend",
     "ClaudeCLIBackend",
     "CodexLocalBackend",
     "GeminiCLIBackend",

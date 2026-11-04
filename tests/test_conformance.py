@@ -10,6 +10,8 @@ adapter is "supported" when it is added to ADAPTERS here and passes.
 from __future__ import annotations
 
 import dataclasses
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -21,6 +23,7 @@ from backends import (
     PolicyBackend,
     is_unavailable_error,
 )
+from backends.adapters.acp import ACPBackend
 from backends.adapters.cli import ClaudeCLIBackend, CodexLocalBackend, GeminiCLIBackend
 from backends.adapters.generic_cli import GenericCLIBackend
 from backends.adapters.ollama import OllamaHTTPBackend
@@ -37,9 +40,13 @@ ADAPTERS = {
     "generic_cli[native-schema]": lambda: GenericCLIBackend(command=["tool", "{model}", "{prompt_file}", "{schema_file}"], model="m"),
     "ollama_http": lambda: OllamaHTTPBackend(model="m"),
     "openai_http": lambda: OpenAIHTTPBackend(base_url="http://127.0.0.1:9/v1", model="m"),
+    # real subprocess: the fake ACP agent (ACP_FAKE_MODE is set by tests.fakes.install)
+    "acp": lambda: ACPBackend(command=[sys.executable, str(FAKE_ACP), "{model}"], model="m"),
 }
 # Adapters that cannot restrict tools get the waiver a provider would set.
 DEGRADE = {"gemini_cli": ("no_tools",), "generic_cli": ("no_tools",), "generic_cli[native-schema]": ("no_tools",)}
+
+FAKE_ACP = Path(__file__).parent / "fakes" / "acp_agent.py"
 
 VOCAB_SCHEMA = {backends.SCHEMA_NATIVE, backends.SCHEMA_VALIDATE, ""}
 VOCAB_COST = {backends.COST_REPORTED, backends.COST_PRICED, backends.COST_UNKNOWN}

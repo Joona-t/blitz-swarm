@@ -148,3 +148,7 @@ def install(monkeypatch, world: FakeWorld) -> None:
         monkeypatch.setattr(mod.urllib.request, "urlopen", world.urlopen)
     monkeypatch.setattr(shutil, "which", world.which)
     monkeypatch.setattr(urllib.request, "urlopen", world.urlopen)
+    # the ACP adapter spawns tests/fakes/acp_agent.py for real; it reads the mode from env
+    from backends.adapters import acp as acp_mod
+    monkeypatch.setattr(acp_mod.shutil, "which", world.which)
+    monkeypatch.setenv("ACP_FAKE_MODE", world.mode)
