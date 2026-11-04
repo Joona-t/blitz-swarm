@@ -83,7 +83,7 @@ The repo describes a v0.2 "frontier" architecture, but none of it runs on `main`
 3. **Synthesizer output still goes into Tier-1 memory.** The swarm's own summary feeds back in as interaction evidence; this was flagged in March and is still open.
 4. **Packaging works only as an editable install.** `prompts/` isn't in `packages`, the `.toml` configs aren't shipped, and top-level module names like `agents`, `config` and `metrics` go straight into site-packages. CI only tests `-e`. `pyproject.toml [tool.setuptools]` [read]
 5. **`--dry-run` calls the LLM planner** unless `--no-llm-plan` is passed.
-6. **New hard-coded absolute path:** `/Users/darkfire/Claude x LoveSpark/research-swarm/...`. `jobs/blitz_upgrade.py:644-648` [read]
+6. **New hard-coded absolute path:** an absolute path under the author's home folder (`~/.../research-swarm/...`). `jobs/blitz_upgrade.py:644-648` [read]
 7. **Defaults are maximal** (`quality_profile="max"`, with guard, judge and selector all on, and codex/gpt-5.5 as the default backend). That is the most expensive configuration, and it has never been measured.
 8. The diff is about 19.6k lines, including a 2,282-line `jobs/blitz_upgrade.py`, so review cost is high.
 

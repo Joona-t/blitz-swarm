@@ -35,7 +35,7 @@ Every item has a test that fails before the fix and passes after.
 | Enforce the output schema: pass `--json-schema` and read `structured_output`. Count a schema failure as an *error*, not as a `needs_work` vote. | H5, H3 | Use the same fix for the planner (`agents.py:_llm_plan`, `_split_subtopics_llm`). |
 | Rewrite `build_context`: newest round first, a separate budget per role, the final round passed in full, and critic text never truncated to zero. | H2 | Add a test asserting the synthesizer context contains the last round and at least one critique. |
 | Persist the judge ensemble across swarm rounds: one scoring per swarm round, with no inner `while` loop. | PR #2 #1, M1 | Until it is validated, record the KS statistic as a diagnostic only and never halt on it. |
-| Packaging: add `prompts` and the `.toml` configs, add a `blitz` console script, test a wheel install in CI. Remove the `/Users/darkfire/...` path. Make `--dry-run` fully model-free. | PR #2 #4–6 | |
+| Packaging: add `prompts` and the `.toml` configs, add a `blitz` console script, test a wheel install in CI. Remove the the hard-coded home-folder path. Make `--dry-run` fully model-free. | PR #2 #4–6 | |
 | Namespace blackboard keys per `run_id`. | M10 | |
 | **Docs truth pass:** README badge and version, RESEARCH_LOG vs `metrics.jsonl`, the stale LIMITATIONS #10, the AFlow first author, the Maryanskyy framing, the BCa claim, the power table. | AUDIT §Low | Use the cheapest honest wording: "implemented, not yet evaluated". |
 
