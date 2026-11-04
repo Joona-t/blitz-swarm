@@ -35,6 +35,14 @@ Research-only until "implement it all" (2026-11-04). Trail: `BUGS_AND_ITERATIONS
 - **WP9 docs truth.** README "Supported harnesses" table generated from the declarations and guarded
   by `tests/test_docs_truth.py`; Gemini marked conformance-tested, not live-verified.
 
+- **Post-WP9 (same day), from the first live cross-provider run:** judge ensemble persists across
+  rounds (one scoring per round); per-section context budgets, newest round first; selector keeps
+  critique and dissent; `--dry-run` is model-free; Redis blackboard keys per run; synthesizer output
+  excluded from Tier-1 memory; `[swarm] synthesizer_timeout_seconds`; findings fallback; cascade
+  guard corroboration root of trust (`green_corroboration`); selector clusters by normalised heading;
+  `avg_quality` counts reported zeros; Codex `--skip-git-repo-check` and JSONL error text; versioned
+  pre-commit hook refusing a red suite. Trail: `BUGS_AND_ITERATIONS.md` ITER-V04b.
+
 Still true: no live bench run exists on any version. Nothing here changes that; it makes the next
 one portable across providers.
 

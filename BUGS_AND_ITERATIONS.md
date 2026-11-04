@@ -1,5 +1,31 @@
 # Bugs & Iterations
 
+## 2026-11-04 (evening): ITER-V04b — audited core-loop defects fixed after the first live run
+
+**Trigger:** the first live cross-provider run (researchers on Codex, evaluators on Claude,
+1 round, `cheap` profile; `metrics.jsonl` run `20261104_224048`): consensus 0/3, Codex
+synthesizer timed out at 300 s, the final document had an empty findings section, cost printed
+as `>= $0.48 (some calls reported no cost)`. Each item below is a bounded fix of a defect named
+in `docs/audit/2026-10-27/AUDIT.md`, with a failing-then-passing test, one commit each.
+
+| Defect | Fix | Commit |
+|---|---|---|
+| PR #2 defect 1: judge ensemble re-scored the same text in a `while not is_stable()` loop (6–15 calls/round) | ensemble persists across swarm rounds; exactly `n_judges` calls per round | `f51e0cf` |
+| AUDIT H2: synthesizer lost the final round and all critique to an 8,000-char oldest-first cut | per-section budgets, newest round first, equal slices for the newest round | `d28f77c` |
+| PR #2 defect 2: selector path dropped critique and dissent | "Critique and dissent" section + `dissent` field on the selector output | `4d75b3a` |
+| PR #2 defect 5: `--dry-run` called the LLM planner | dry run is heuristic-only | `4d75b3a` |
+| AUDIT M10: Redis blackboard keys shared across runs, `cleanup()` wiped them all | keys namespaced `blackboard:<run_id>:*` | `4d75b3a` |
+| Karpathy P4 / PR #2 defect 3: synthesizer output written to Tier-1 memory as evidence | trace excludes synthesizer and errored outputs; cost/time/quality passed to the query node | `1d4f38a`, `938ea77` |
+| Live: synthesizer timeout, empty findings fallback, timeouts counted as errors | `[swarm] synthesizer_timeout_seconds`; fallback to last round with researchers; case-insensitive timeout match | `938ea77` |
+| AUDIT H7: cascade guard had no root of trust (0 green / 0 red / 0 blocked ever) | corroboration promotion at round close (`green_corroboration = 2`) | `1d52036` |
+| AUDIT M2: selector clustered by exact heading text (clusters of one, no judging) | normalised heading keys, Jaccard ≥ 0.5 | `1e79fc2` |
+| AUDIT metrics: `avg_quality` dropped zero dimensions | averages the reported dimensions | `1e79fc2` |
+| Live: `codex exec` refused the scratch cwd; `gpt-5.5` rejected on a ChatGPT account; JSONL error text lost | `--skip-git-repo-check`; account model in tiers; error from JSONL events | `f0506ea` |
+
+**Still open from the audit on this branch:** KS halting is inert at N=3 (documented in
+`blitz.toml`; EMS/CITE stopping is proposal Phase 3); MAST detectors remain keyword heuristics;
+no n≥20 bench run exists on any version.
+
 ## 2026-11-04: ITER-V04 — any harness, any provider (plan WP1–WP9)
 
 **What hurt (audit 2026-10-27):** every v0.2 mechanism was unit-tested but the adapters each
