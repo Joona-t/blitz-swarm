@@ -146,7 +146,7 @@ def _provider_options(blitz_cfg, provider_id: str) -> dict:
         meta = dict(blitz_cfg.backend.get_provider(provider_id).metadata or {})
     except (KeyError, AttributeError):
         return {}
-    return {k: v for k, v in sorted(meta.items()) if isinstance(v, (str, int, float, bool, list))}
+    return {k: v for k, v in sorted(meta.items()) if isinstance(v, (str, int, float, bool, list, dict))}
 
 def _arm_record(result: Any) -> dict | None:
     """The metrics record a baseline arm returns as the third tuple item

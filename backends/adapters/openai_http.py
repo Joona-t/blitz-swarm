@@ -114,6 +114,13 @@ class OpenAIHTTPBackend:
         effort = call.reasoning_effort or self.reasoning_effort
         if effort:
             payload["reasoning_effort"] = effort
+        # `extra_body` in the provider table: server-specific request fields,
+        # e.g. vLLM's {chat_template_kwargs = {enable_thinking = false}}.
+        # It cannot replace the fields this adapter owns.
+        extra = self.metadata.get("extra_body") if isinstance(self.metadata, dict) else None
+        if isinstance(extra, dict):
+            for key, value in extra.items():
+                payload.setdefault(key, value)
 
         req = urllib.request.Request(
             self._url("chat/completions"),
@@ -159,10 +166,15 @@ class OpenAIHTTPBackend:
         except json.JSONDecodeError:
             envelope = {}
         text = ""
+        finish_reason = None
+        thinking_chars = 0
         if isinstance(envelope, dict):
             choices = envelope.get("choices") or []
             if choices and isinstance(choices[0], dict):
+                finish_reason = choices[0].get("finish_reason")
                 message = choices[0].get("message") or {}
+                reasoning = message.get("reasoning_content") or message.get("reasoning")
+                thinking_chars = len(reasoning) if isinstance(reasoning, str) else 0
                 content = message.get("content")
                 if isinstance(content, str):
                     text = content
@@ -185,7 +197,7 @@ class OpenAIHTTPBackend:
             error=f"openai_http HTTP {status}" if errored else None,
             input_tokens=int(usage.get("prompt_tokens", 0) or 0),
             output_tokens=int(usage.get("completion_tokens", 0) or 0),
-            metadata={"effort": effort},
+            metadata={"effort": effort, "finish_reason": finish_reason, "thinking_chars": thinking_chars},
             strict_nulls=True,
         )
 

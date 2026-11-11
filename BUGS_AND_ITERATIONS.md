@@ -403,3 +403,15 @@ Not fixed, by decision: live bench slate run and mythos-bench regeneration (need
   call errors. That machine was found to have a hardware fault later the same night, so the live
   runs are a pipeline check only (each carries a `CAVEAT.md`) and the options need re-verifying on
   sound hardware.
+
+### ITER-P1c — openai_http `extra_body` for a vLLM server (2026-11-12)
+
+- **What:** `[backend.providers.<id>.extra_body]` is merged into the chat/completions request
+  (it cannot replace `model`, `messages` or other fields the adapter sets). The result metadata
+  now carries `finish_reason` and `thinking_chars`.
+- **Why:** the local model moved from Ollama to an OpenAI-compatible vLLM server where thinking is
+  on by default and is switched off with `chat_template_kwargs`. Same reason as ITER-P1b: thinking
+  tokens would inflate the output-token budgets the arms are matched on. `finish_reason` shows a
+  report cut off at the token limit.
+- **Check:** `tests/test_openai_http_extra_body.py` (2 tests, config file to request body).
+- **Status:** unit-tested. **Not verified live.**
