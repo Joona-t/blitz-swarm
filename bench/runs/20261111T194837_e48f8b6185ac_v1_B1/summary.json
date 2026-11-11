@@ -1,0 +1,108 @@
+{
+  "schema_version": 1,
+  "run_id": "20261111T194837_e48f8b6185ac_v1_B1",
+  "started_utc": "2026-11-11T19:48:37+00:00",
+  "ended_utc": "2026-11-11T19:58:47+00:00",
+  "code": {
+    "git_sha": "e48f8b6185ac",
+    "blitz_swarm_version": "0.4.0",
+    "python_version": "3.14.4"
+  },
+  "config": {
+    "slate_path": "bench/slate_v1.toml",
+    "max_rounds": 4,
+    "use_redis": false,
+    "seed": 42,
+    "total_budget_usd": 8.0,
+    "per_prompt_timeout_s": 3600
+  },
+  "slate": {
+    "slate_id": "v1",
+    "sha256": "f14ac96dbcf481b133e02601e901e83b06be7af44fef27bcda483545a7bd820b",
+    "prompt_count": 30,
+    "prompts_run": 1,
+    "prompts_skipped": 0,
+    "prompts_timed_out": 0,
+    "prompts_errored": 0
+  },
+  "functional_composite": {
+    "mean": 0.7098,
+    "per_prompt": {
+      "s001": 0.7098
+    },
+    "missing": []
+  },
+  "timeouts": [],
+  "aggregate_quality": {
+    "avg": {
+      "mean": 0.0,
+      "stddev": 0.0,
+      "ci95": [
+        0.0,
+        0.0
+      ]
+    },
+    "coverage": {
+      "mean": 0.0,
+      "stddev": 0.0,
+      "ci95": [
+        0.0,
+        0.0
+      ]
+    },
+    "accuracy": {
+      "mean": 0.0,
+      "stddev": 0.0,
+      "ci95": [
+        0.0,
+        0.0
+      ]
+    },
+    "clarity": {
+      "mean": 0.0,
+      "stddev": 0.0,
+      "ci95": [
+        0.0,
+        0.0
+      ]
+    },
+    "depth": {
+      "mean": 0.0,
+      "stddev": 0.0,
+      "ci95": [
+        0.0,
+        0.0
+      ]
+    }
+  },
+  "by_tier": {
+    "easy": {
+      "n": 1,
+      "avg_quality": 0.0,
+      "avg_cost": 0.0
+    },
+    "medium": {
+      "n": 0,
+      "avg_quality": 0,
+      "avg_cost": 0
+    },
+    "hard": {
+      "n": 0,
+      "avg_quality": 0,
+      "avg_cost": 0
+    }
+  },
+  "consensus": {
+    "rate": 0.0,
+    "avg_rounds_to_consensus": 0
+  },
+  "cost": {
+    "total_usd": 0.0,
+    "input_tokens_total": 21737,
+    "output_tokens_total": 17628
+  },
+  "mast_flags_summary": {
+    "FM-2.4": 1
+  },
+  "mast_detectors_ran": 1
+}

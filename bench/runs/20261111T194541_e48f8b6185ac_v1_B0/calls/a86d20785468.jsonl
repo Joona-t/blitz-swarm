@@ -1,0 +1,1 @@
+{"kind": "draft", "provider": "ollama", "model": "qwen3.8:27b-q8_0", "input_tokens": 314, "output_tokens": 4136, "elapsed_s": 140.2, "cost_usd": null, "cost_policy": "unknown", "errored": false, "error": null}

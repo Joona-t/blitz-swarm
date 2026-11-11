@@ -1,0 +1,86 @@
+[
+ {
+  "role": "critic",
+  "backend": "ollama",
+  "tier": "standard",
+  "model": "qwen3.8:27b-q8_0",
+  "effort": "-"
+ },
+ {
+  "role": "executor",
+  "backend": "ollama",
+  "tier": "fast",
+  "model": "qwen3.8:27b-q8_0",
+  "effort": "-"
+ },
+ {
+  "role": "fact_checker",
+  "backend": "ollama",
+  "tier": "standard",
+  "model": "qwen3.8:27b-q8_0",
+  "effort": "-"
+ },
+ {
+  "role": "guard",
+  "backend": "ollama",
+  "tier": "fast",
+  "model": "qwen3.8:27b-q8_0",
+  "effort": "-"
+ },
+ {
+  "role": "judge",
+  "backend": "ollama",
+  "tier": "standard",
+  "model": "qwen3.8:27b-q8_0",
+  "effort": "-"
+ },
+ {
+  "role": "memory_ops",
+  "backend": "ollama",
+  "tier": "fast",
+  "model": "qwen3.8:27b-q8_0",
+  "effort": "-"
+ },
+ {
+  "role": "planner",
+  "backend": "ollama",
+  "tier": "deep",
+  "model": "qwen3.8:27b-q8_0",
+  "effort": "-"
+ },
+ {
+  "role": "quality_judge",
+  "backend": "ollama",
+  "tier": "standard",
+  "model": "qwen3.8:27b-q8_0",
+  "effort": "-"
+ },
+ {
+  "role": "researcher",
+  "backend": "ollama",
+  "tier": "standard",
+  "model": "qwen3.8:27b-q8_0",
+  "effort": "-"
+ },
+ {
+  "role": "synthesizer",
+  "backend": "ollama",
+  "tier": "deep",
+  "model": "qwen3.8:27b-q8_0",
+  "effort": "-"
+ },
+ {
+  "role": "verifier",
+  "backend": "ollama",
+  "tier": "deep",
+  "model": "qwen3.8:27b-q8_0",
+  "effort": "-"
+ },
+ {
+  "role": "*",
+  "backend": "ollama",
+  "tier": "standard",
+  "model": "qwen3.8:27b-q8_0",
+  "effort": "-"
+ }
+]

@@ -1,0 +1,5 @@
+{"kind": "draft", "provider": "ollama", "model": "qwen3.8:27b-q8_0", "input_tokens": 314, "output_tokens": 3300, "elapsed_s": 111.6, "cost_usd": null, "cost_policy": "unknown", "errored": false, "error": null}
+{"kind": "critique", "provider": "ollama", "model": "qwen3.8:27b-q8_0", "input_tokens": 3610, "output_tokens": 2216, "elapsed_s": 76.8, "cost_usd": null, "cost_policy": "unknown", "errored": false, "error": null}
+{"kind": "revise", "provider": "ollama", "model": "qwen3.8:27b-q8_0", "input_tokens": 5816, "output_tokens": 4483, "elapsed_s": 155.7, "cost_usd": null, "cost_policy": "unknown", "errored": false, "error": null}
+{"kind": "critique", "provider": "ollama", "model": "qwen3.8:27b-q8_0", "input_tokens": 4793, "output_tokens": 2421, "elapsed_s": 84.5, "cost_usd": null, "cost_policy": "unknown", "errored": false, "error": null}
+{"kind": "revise", "provider": "ollama", "model": "qwen3.8:27b-q8_0", "input_tokens": 7204, "output_tokens": 5208, "elapsed_s": 181.6, "cost_usd": null, "cost_policy": "unknown", "errored": false, "error": null}

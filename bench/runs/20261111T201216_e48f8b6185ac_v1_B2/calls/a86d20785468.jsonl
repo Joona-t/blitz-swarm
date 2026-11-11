@@ -1,0 +1,9 @@
+{"kind": "draft", "provider": "ollama", "model": "qwen3.8:27b-q8_0", "input_tokens": 314, "output_tokens": 4290, "elapsed_s": 154.0, "cost_usd": null, "cost_policy": "unknown", "errored": false, "error": null}
+{"kind": "draft", "provider": "ollama", "model": "qwen3.8:27b-q8_0", "input_tokens": 314, "output_tokens": 4530, "elapsed_s": 153.7, "cost_usd": null, "cost_policy": "unknown", "errored": false, "error": null}
+{"kind": "draft", "provider": "ollama", "model": "qwen3.8:27b-q8_0", "input_tokens": 314, "output_tokens": 4220, "elapsed_s": 142.9, "cost_usd": null, "cost_policy": "unknown", "errored": false, "error": null}
+{"kind": "judge", "provider": "ollama", "model": "qwen3.8:27b-q8_0", "input_tokens": 9084, "output_tokens": 435, "elapsed_s": 18.2, "cost_usd": null, "cost_policy": "unknown", "errored": false, "error": null}
+{"kind": "judge", "provider": "ollama", "model": "qwen3.8:27b-q8_0", "input_tokens": 9084, "output_tokens": 563, "elapsed_s": 22.6, "cost_usd": null, "cost_policy": "unknown", "errored": false, "error": null}
+{"kind": "judge", "provider": "ollama", "model": "qwen3.8:27b-q8_0", "input_tokens": 8774, "output_tokens": 346, "elapsed_s": 15.1, "cost_usd": null, "cost_policy": "unknown", "errored": false, "error": null}
+{"kind": "judge", "provider": "ollama", "model": "qwen3.8:27b-q8_0", "input_tokens": 8774, "output_tokens": 375, "elapsed_s": 16.1, "cost_usd": null, "cost_policy": "unknown", "errored": false, "error": null}
+{"kind": "judge", "provider": "ollama", "model": "qwen3.8:27b-q8_0", "input_tokens": 9015, "output_tokens": 503, "elapsed_s": 20.6, "cost_usd": null, "cost_policy": "unknown", "errored": false, "error": null}
+{"kind": "judge", "provider": "ollama", "model": "qwen3.8:27b-q8_0", "input_tokens": 9015, "output_tokens": 693, "elapsed_s": 27.1, "cost_usd": null, "cost_policy": "unknown", "errored": false, "error": null}

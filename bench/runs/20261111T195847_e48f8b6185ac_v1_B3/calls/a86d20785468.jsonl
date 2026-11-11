@@ -1,0 +1,4 @@
+{"kind": "draft", "provider": "ollama", "model": "qwen3.8:27b-q8_0", "input_tokens": 314, "output_tokens": 3664, "elapsed_s": 124.4, "cost_usd": null, "cost_policy": "unknown", "errored": false, "error": null}
+{"kind": "draft", "provider": "ollama", "model": "qwen3.8:27b-q8_0", "input_tokens": 314, "output_tokens": 4274, "elapsed_s": 144.9, "cost_usd": null, "cost_policy": "unknown", "errored": false, "error": null}
+{"kind": "draft", "provider": "ollama", "model": "qwen3.8:27b-q8_0", "input_tokens": 314, "output_tokens": 3621, "elapsed_s": 122.7, "cost_usd": null, "cost_policy": "unknown", "errored": false, "error": null}
+{"kind": "merge", "provider": "ollama", "model": "qwen3.8:27b-q8_0", "input_tokens": 11917, "output_tokens": 7478, "elapsed_s": 264.4, "cost_usd": null, "cost_policy": "unknown", "errored": false, "error": null}
