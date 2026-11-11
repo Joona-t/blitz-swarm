@@ -120,3 +120,23 @@ standard = "some-model"
     cfg = load_config(p)
     inner = backend_from_provider("ollama", cfg.backend.get_provider("ollama")).inner
     assert inner.think is False and inner.max_parallel == 1
+
+
+def test_run_records_provider_options(tmp_path):
+    from bench.runner import _provider_options
+    p = tmp_path / "blitz.toml"
+    p.write_text('''
+[models]
+default = "standard"
+[backend]
+default = "ollama"
+[backend.providers.ollama]
+adapter = "ollama_http"
+think = false
+max_parallel = 1
+[backend.providers.ollama.tiers]
+standard = "some-model"
+''', encoding="utf-8")
+    cfg = load_config(p)
+    assert _provider_options(cfg, "ollama") == {"max_parallel": 1, "think": False}
+    assert _provider_options(cfg, "missing") == {}

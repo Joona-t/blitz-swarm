@@ -138,6 +138,16 @@ class PromptResult:
 SwarmFn = Callable[..., Awaitable["Path | tuple[Path, list[list[dict]]]"]]
 
 
+def _provider_options(blitz_cfg, provider_id: str) -> dict:
+    """Open-ended provider settings that change what a call does (for
+    example an Ollama `think = false`). Recorded per run: two runs of the
+    same model with different options are not the same condition."""
+    try:
+        meta = dict(blitz_cfg.backend.get_provider(provider_id).metadata or {})
+    except (KeyError, AttributeError):
+        return {}
+    return {k: v for k, v in sorted(meta.items()) if isinstance(v, (str, int, float, bool, list))}
+
 def _arm_record(result: Any) -> dict | None:
     """The metrics record a baseline arm returns as the third tuple item
     (bench/arms.py); None for the swarm, whose record is in metrics.jsonl."""
@@ -957,9 +967,11 @@ async def run_bench(
         try:
             from backends.models import list_models
             from config import load_config as _load
-            rows = list_models(_load(), cfg.backend_id)
+            _cfg = _load()
+            rows = list_models(_cfg, cfg.backend_id)
             (run_dir / "providers.json").write_text(json.dumps(
-                [{k: r[k] for k in ("role", "backend", "tier", "model", "effort")} for r in rows], indent=1,
+                [{**{k: r[k] for k in ("role", "backend", "tier", "model", "effort")},
+                  "options": _provider_options(_cfg, r["backend"])} for r in rows], indent=1,
             ) + "\n", encoding="utf-8")
         except Exception as exc:
             print(f"[bench] providers.json not written: {exc!r}", flush=True)
