@@ -399,5 +399,7 @@ Not fixed, by decision: live bench slate run and mythos-bench regeneration (need
   ungated calls are inside the server at once; with `max_parallel = 1` the peak is 1 and queue time
   is not billed to the call. First version of that test asserted on wall-clock thresholds and failed
   1 run in 4 under load; rewritten on a barrier and an interval identity before commit.
-- **Status:** unit-tested. **Not yet verified live**: the machine went off the network before the
-  first locked call ran.
+- **Status:** unit-tested, then used live for four one-prompt baseline runs (2026-11-11) with no
+  call errors. That machine was found to have a hardware fault later the same night, so the live
+  runs are a pipeline check only (each carries a `CAVEAT.md`) and the options need re-verifying on
+  sound hardware.

@@ -113,3 +113,16 @@ It reached this branch's session second-hand; it was not typed here.
   seconds.
 - **Shared GPU:** every generating command runs under the machine's GPU lock, one prompt x one arm
   per hold. A pilot size is proposed from measured smoke timings before anything long is queued.
+
+### Status 2026-11-11, end of night
+
+- Smoke on Qwen, one prompt (s001): B0, B1, B2 (same-family judge, flagged), B3 completed without
+  errors. The swarm arm was stopped on the owner's instruction about seven minutes in; no result.
+- **The machine was later found to have a hardware-level fault** (transient memory errors in a
+  CPU-only test). The four smoke runs carry a `CAVEAT.md` and count as a pipeline check only. No
+  score or timing from them is a result. All arms are re-run after the hardware is checked.
+- Work on that machine is paused until the owner says to resume. The serving stack may change from
+  Ollama to an OpenAI-compatible server; runs from a different server are a different condition.
+- Seen in the smoke and still to be confirmed on sound hardware: with thinking on, a 120-word answer
+  used 2,002 output tokens against 167 with it off; the model cited 0 to 3 sources per report
+  without tools, so M1 will rest on few citations per report.
