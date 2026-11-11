@@ -27,7 +27,7 @@ Effort: `[backend.providers.<id>.effort].<tier>` if set, else the provider-wide 
 
 ### Backend selection
 
-- Consensus mode: `--backend <id>` / `BLITZ_BACKEND` > `blitz.toml [backend] default` (`codex` as shipped).
+- Consensus mode: `--backend <id>` / `BLITZ_BACKEND` > `blitz.toml [backend] default` (`claude` as shipped since 2026-11-11).
 - Mythos mode: `--backend` / `BLITZ_BACKEND` > `mythos.toml [models] backend` (`"claude"` as shipped) > `blitz.toml [backend] default` (`mythos/_invoke.py:55-70`).
 - `[backend] fallback = [...]`: on an errored result of the "unavailable" class (CLI missing, server down, rate-limited) the first available fallback provider is called **once**, with the model re-resolved for *that* provider through its own tier table (`backends/registry.py`, `FallbackBackend`). Timeouts and schema failures never fall back. The result carries `fallback_used=True`.
 

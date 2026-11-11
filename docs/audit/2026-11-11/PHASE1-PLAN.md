@@ -59,3 +59,25 @@ Retrieval / search tools for agents (Phase 2), claim-level support against sourc
 2. **Swarm profile for S.** The existing 10 runs used profile `max` (guard + judge ensemble + selector). Keep `max` so they can be reused, or re-run S at `balanced`?
 3. **Labelling.** 30 pairs of long reports is 2–3 hours of your reading. Acceptable, or should the tool show only the first ~150 lines of each report to cut it down (with that limitation stated)?
 4. **Cache in git.** `bench/cache/citations.json` holds only identifiers and titles from arXiv/Crossref. Commit it (reproducible offline) or keep it local?
+
+## Amendment 2026-11-11 (evening): no Codex, Claude generates
+
+Owner decision: Codex/OpenAI is out as a provider, permanently. Consequences for this plan:
+
+- **Generator:** Claude, `standard` tier, for every arm. `blitz.toml [backend] default` is now `claude`.
+- **The 10 swarm runs of 2026-11-04 cannot be reused.** Their researchers ran on Codex; pairing them
+  against Claude baselines would compare models, not architectures. S is re-run on Claude. They stay
+  in the repo as history.
+- **No second model family is installed** (no Codex, no Gemini, no Ollama). So M2 cannot be the
+  cross-family judgement the research called for. Two honest options:
+  1. *Same-family judge, flagged.* A different Claude tier judges (`--allow-same-family`). Known
+     bias: self-preference and preference leakage. M2 is then reported as **secondary and biased**;
+     it cannot decide the outcome on its own.
+  2. *Local open-weights judge* through Ollama (`ollama_http` adapter already exists). A real second
+     family, but on a 17 GB Mac only a small model fits, and weak judges are unreliable
+     (Carro 2610.28539). Needs Ollama installed and a model pulled.
+- **Decision rule, tightened to match:** S beats B1 only on **M1 (resolved citations) or composite
+  v2**, both of which involve no model. M2 is supporting evidence. The **human labels** (WP9) become
+  the check on M2 that matters: if judge-human kappa is below ~0.6, M2 is dropped from the write-up.
+- **Upside:** Claude reports cost, so every arm's cost is `reported`, not a lower bound.
+- **B2** (best-of-N picked by the judge) inherits the same-family caveat; B3 does not use a judge.

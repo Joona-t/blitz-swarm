@@ -178,7 +178,7 @@ pytest -q                        # 745 passed, 14 skipped, ~6 s, no model call
 Optional extras (graceful degradation when absent): `redis` (Redis blackboard, otherwise in-memory), `lancedb` + `sentence-transformers` (vector retrieval, otherwise FTS5 only), `scipy` (bench uses it when present; exact Student-t otherwise), `gepa` (only for the gated `scripts/optimize_prompts.py`). `anthropic` is not an extra: install it by hand only for `contrib/managed_agents` (paid, opt-in). Declared extras: `redis`, `memory`, `bench`, `gepa`, `dev` in `pyproject.toml`.
 
 ```bash
-# Consensus mode on Codex (blitz.toml default). Agents are subprocesses of your own CLI.
+# Consensus mode on the default provider (blitz.toml: claude). Agents are subprocesses of your own CLI.
 python orchestrator.py "Explain SQLite WAL mode internals" --no-redis
 
 # Same on Claude CLI; synthesizer on Fable 5.1

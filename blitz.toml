@@ -46,7 +46,7 @@ memory_ops    = "fast"         # gmemory LLM helpers
 guard         = "fast"         # cascade_guard LLM hooks (when enabled)
 
 [backend]
-default = "codex"
+default = "claude"       # 2026-11-11: Codex is no longer a provider here (owner decision); the adapter stays for other users
 # Leave empty to fail clearly when the default provider is unavailable. Add
 # provider ids like ["claude", "ollama"] to retry ONCE on the next provider
 # when a call errors for an "unavailable"-class reason (CLI missing, server
