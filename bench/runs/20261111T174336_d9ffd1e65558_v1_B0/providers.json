@@ -1,0 +1,86 @@
+[
+ {
+  "role": "critic",
+  "backend": "claude",
+  "tier": "standard",
+  "model": "sonnet",
+  "effort": "high"
+ },
+ {
+  "role": "executor",
+  "backend": "claude",
+  "tier": "fast",
+  "model": "haiku",
+  "effort": "high"
+ },
+ {
+  "role": "fact_checker",
+  "backend": "claude",
+  "tier": "standard",
+  "model": "sonnet",
+  "effort": "high"
+ },
+ {
+  "role": "guard",
+  "backend": "claude",
+  "tier": "fast",
+  "model": "haiku",
+  "effort": "high"
+ },
+ {
+  "role": "judge",
+  "backend": "claude",
+  "tier": "standard",
+  "model": "sonnet",
+  "effort": "high"
+ },
+ {
+  "role": "memory_ops",
+  "backend": "claude",
+  "tier": "fast",
+  "model": "haiku",
+  "effort": "high"
+ },
+ {
+  "role": "planner",
+  "backend": "claude",
+  "tier": "deep",
+  "model": "fable",
+  "effort": "max"
+ },
+ {
+  "role": "quality_judge",
+  "backend": "claude",
+  "tier": "standard",
+  "model": "sonnet",
+  "effort": "high"
+ },
+ {
+  "role": "researcher",
+  "backend": "claude",
+  "tier": "standard",
+  "model": "sonnet",
+  "effort": "high"
+ },
+ {
+  "role": "synthesizer",
+  "backend": "claude",
+  "tier": "deep",
+  "model": "fable",
+  "effort": "max"
+ },
+ {
+  "role": "verifier",
+  "backend": "claude",
+  "tier": "deep",
+  "model": "fable",
+  "effort": "max"
+ },
+ {
+  "role": "*",
+  "backend": "claude",
+  "tier": "standard",
+  "model": "sonnet",
+  "effort": "high"
+ }
+]

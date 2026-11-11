@@ -1,0 +1,1 @@
+{"kind": "draft", "provider": "claude", "model": "sonnet", "input_tokens": 0, "output_tokens": 0, "elapsed_s": 1.0, "cost_usd": 0.0, "cost_policy": "reported", "errored": true, "error": "claude exit 1: "}

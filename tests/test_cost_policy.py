@@ -112,3 +112,21 @@ def test_codex_error_message_comes_from_jsonl_when_stderr_is_empty(monkeypatch):
                         lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, stdout=stream, stderr=""))
     r = CodexLocalBackend(model="x").call(AgentCall(role="r", prompt="p", tools=[]))
     assert r.errored and "not supported" in r.error
+
+
+def test_claude_nonzero_exit_reports_the_envelope_reason(monkeypatch):
+    """Live 2026-11-11: exit 1, empty stderr, reason only in the envelope."""
+    env = {"is_error": True, "result": "Failed to authenticate: OAuth session expired and could not be refreshed",
+           "total_cost_usd": 0, "usage": {}}
+    monkeypatch.setattr(cli_adapters.shutil, "which", lambda name: "/usr/bin/claude")
+    cli_adapters.reset_claude_probe_cache()
+
+    def fake_run(cmd, **kw):
+        if cmd[:2] == ["claude", "--help"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="--tools", stderr="")
+        return subprocess.CompletedProcess(cmd, 1, stdout=json.dumps(env), stderr="")
+
+    monkeypatch.setattr(cli_adapters.subprocess, "run", fake_run)
+    r = ClaudeCLIBackend(model="m").call(AgentCall(role="r", prompt="p"))
+    cli_adapters.reset_claude_probe_cache()
+    assert r.errored and "OAuth session expired" in r.error

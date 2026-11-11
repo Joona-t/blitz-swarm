@@ -952,6 +952,17 @@ async def run_bench(
                 }
                 print(f"[bench] B1 output-token budgets by tier from {cfg.budget_from}: {budgets}", flush=True)
         swarm_fn = make_arm(cfg.arm, arm_ctx)
+        # Which provider and model served each role in this run: the bench
+        # config alone does not say (pins live in blitz.toml / BLITZ_CONFIG).
+        try:
+            from backends.models import list_models
+            from config import load_config as _load
+            rows = list_models(_load(), cfg.backend_id)
+            (run_dir / "providers.json").write_text(json.dumps(
+                [{k: r[k] for k in ("role", "backend", "tier", "model", "effort")} for r in rows], indent=1,
+            ) + "\n", encoding="utf-8")
+        except Exception as exc:
+            print(f"[bench] providers.json not written: {exc!r}", flush=True)
 
     # Resume detection
     done_ids = _resumable_ids(run_dir)

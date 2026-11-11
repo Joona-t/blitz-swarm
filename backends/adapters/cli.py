@@ -460,7 +460,13 @@ class ClaudeCLIBackend:
         validation_errors = validate_json_schema(parsed, call.schema)
         error = None
         if proc.returncode != 0:
-            error = f"claude exit {proc.returncode}: {(proc.stderr or '')[:500]}"
+            # The CLI exits 1 with an EMPTY stderr and the reason in the JSON
+            # envelope's `result` (live 2026-11-11: "Failed to authenticate:
+            # OAuth session expired"); without this the error read "claude exit 1: ".
+            detail = (proc.stderr or "").strip()
+            if not detail and envelope and isinstance(envelope.get("result"), str):
+                detail = envelope["result"]
+            error = f"claude exit {proc.returncode}: {detail[:500]}"
         elif is_error:
             detail = envelope.get("result") if isinstance(envelope.get("result"), str) else ""
             error = f"claude is_error: {detail[:500] or envelope.get('subtype') or 'unspecified'}"

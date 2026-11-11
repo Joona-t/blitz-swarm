@@ -1,5 +1,30 @@
 # Bugs & Iterations
 
+## 2026-11-11: ITER-P1 — Phase 1 measuring stick built; live pilot blocked by the machine, not the code
+
+**What hurt:** the bench's primary score gave 30% for citations that were only well-formed; the
+tool-less swarm averaged 0.90 on it (run `20261104T212924`). No arm other than the swarm existed, so
+nothing could be compared.
+
+**Built (plan `docs/audit/2026-11-11/PHASE1-PLAN.md`, WP1-10):** `bench/arms.py` (S, B0, B1
+budget-matched on output tokens, B2 best-of-N, B3 merge-of-N), `bench/citations.py` (arXiv / Crossref /
+URL existence + title check, cached; known-bad fixture; one opt-in live arXiv test passed),
+`composite_v2`, `beta_coverage`, `bench/judge.py` (both-order blind pairwise, same-family refusal),
+`bench/compare.py`, `bench/label.py`, `bench/preflight.py`, token gate, `providers.json` per run.
+902 tests.
+
+**Live smoke (WP10) did not run, for two environment reasons found by the smoke itself:**
+1. `codex` is no longer installed on the reference machine (preflight failed with
+   "provider 'codex' needs `codex` on PATH" before any call, which is what preflight is for).
+2. The `claude` CLI's OAuth session had expired. This surfaced a real bug: the adapter reported
+   `claude exit 1: ` with no reason, because the CLI exits 1 with an empty stderr and the message
+   in the envelope. Fixed (`backends/adapters/cli.py`), with a test built from the live envelope.
+
+**State:** every Phase 1 code path is tested against fakes; **no baseline arm has made a live call
+yet**. WP11 (pilot) is not started. To resume: reinstall or re-point the generator provider, run
+`claude` once to log in, then `python -m bench.runner --arm B0 --filter-id s001` as the smoke.
+
+
 ## 2026-11-04 (evening): ITER-V04b — audited core-loop defects fixed after the first live run
 
 **Trigger:** the first live cross-provider run (researchers on Codex, evaluators on Claude,
