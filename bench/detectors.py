@@ -266,6 +266,7 @@ def research_quality_composite(
     output_md: str,
     slate_entry: dict,
     prior: Sequence[str] = (),
+    citation_check: dict | None = None,
 ) -> dict:
     """Deterministic research-quality scorecard for one produced artifact.
 
@@ -323,6 +324,22 @@ def research_quality_composite(
     # Clamp against floating-point drift so callers always get [0, 1].
     composite = max(0.0, min(1.0, composite))
 
+    # composite_v2 (Phase 1, 2026-11-11): the citation term is EARNED by
+    # resolution (bench/citations.py M1: the cited thing exists and is the
+    # paper the text says it is), not by format. None when no check was
+    # supplied or nothing was verifiable, so an offline run never reads as 0.
+    from bench.citations import citations_v2_score
+    citations_v2 = citations_v2_score(citation_check)
+    composite_v2 = None
+    if citations_v2 is not None:
+        composite_v2 = max(0.0, min(1.0, (
+            _RQ_WEIGHTS["coverage"] * coverage
+            + _RQ_WEIGHTS["citations"] * citations_v2
+            + _RQ_WEIGHTS["novelty"] * novelty
+            + _RQ_WEIGHTS["low_dedup"] * (1.0 - dedup)
+        )))
+    chars = len(output_md or "")
+
     return {
         "arxiv_validity": arxiv,
         "citation_grounding": grounding,
@@ -331,6 +348,31 @@ def research_quality_composite(
         "dedup_overlap": dedup,
         "novelty": novelty,
         "composite": composite,
+        "citations_v2": citations_v2,
+        "composite_v2": composite_v2,
+        "length_chars": chars,
+        "length_words": len((output_md or "").split()),
+        "coverage_per_1k_chars": (coverage / (chars / 1000.0)) if chars else 0.0,
+    }
+
+
+def beta_coverage(drafts: list[str], expected: list[str]) -> dict:
+    """M4 co-failure on coverage items (Chen J., co-failure ceiling).
+
+    beta = share of expected items that NO draft mentions. `miss_rates` is
+    each draft's own miss share. If beta is close to a single draft's miss
+    rate, more drafts cannot buy coverage on this prompt. Same matcher as
+    the runner's coverage count (case-insensitive substring)."""
+    expected = [e for e in (expected or []) if e]
+    if not expected or not drafts:
+        return {"beta": None, "miss_rates": [], "n_items": len(expected), "n_drafts": len(drafts or [])}
+    lowered = [(d or "").lower() for d in drafts]
+    all_miss = sum(1 for e in expected if not any(e.lower() in d for d in lowered))
+    return {
+        "beta": all_miss / len(expected),
+        "miss_rates": [sum(1 for e in expected if e.lower() not in d) / len(expected) for d in lowered],
+        "n_items": len(expected),
+        "n_drafts": len(drafts),
     }
 
 

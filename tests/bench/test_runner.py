@@ -432,3 +432,35 @@ def test_portable_paths_never_contain_the_home_directory(tmp_path):
     assert _portable("") == ""
     # never the raw home directory, whatever it is on this machine
     assert not _portable(tmp_path / "a.md").startswith(str(Path.home()))
+
+
+async def test_arm_record_drives_cost_tokens_and_token_cap(tmp_path, slate_path, monkeypatch):
+    """Phase 1: a baseline arm returns (path, rounds, record); the runner
+    takes cost/tokens/calls from it, computes beta from the drafts, tags the
+    arm in the run id, and the token cap stops later prompts."""
+    from bench.runner import run_bench
+    monkeypatch.setattr("bench.runner.RUNS_DIR", tmp_path / "runs")
+
+    async def arm(topic: str, **kw):
+        out = tmp_path / f"{abs(hash(topic))}.md"
+        out.write_text("wal file structure and checkpointing", encoding="utf-8")
+        rounds = [[{"role": "researcher", "agent_id": "d0", "findings": "WAL file structure"},
+                   {"role": "researcher", "agent_id": "d1", "findings": "checkpointing"}]]
+        return out, rounds, {"total_cost_usd": None, "cost_incomplete": True, "total_input_tokens": 10,
+                             "total_output_tokens": 700, "generation_output_tokens": 600, "calls": 4}
+
+    cfg = make_cfg(slate_path, slate_filter_ids=("s001", "s002", "s003"), parallel_prompts=1,
+                   arm="B3", output_token_cap=1000)
+    run_dir = await run_bench(cfg, swarm_fn=arm, metrics_path=tmp_path / "none.jsonl")
+    assert run_dir.name.endswith("_B3")
+    rows = [json.loads(l) for l in (run_dir / "results.jsonl").read_text().splitlines()]
+    ok = [r for r in rows if not r["error"]]
+    assert len(ok) == 2, "700 + 700 >= 1000 -> the third prompt is not started"
+    assert [r["error"] for r in rows if r["error"]] == ["token_budget_exhausted"]
+    first = ok[0]
+    assert (first["arm"], first["calls"], first["output_tokens"], first["generation_output_tokens"]) == ("B3", 4, 700, 600)
+    assert first["cost_incomplete"] is True and first["cost_usd"] == 0.0
+    if first["prompt_id"] == "s001":
+        assert first["beta"]["n_drafts"] == 2 and first["beta"]["beta"] == pytest.approx(3 / 5)
+    assert first["functional_composite"]["composite_v2"] is None, "citations off -> v2 not computed"
+    assert first["functional_composite"]["length_chars"] > 0

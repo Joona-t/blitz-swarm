@@ -81,6 +81,14 @@ class BenchConfig:
     backend_id: str | None = None  # swarm backend (e.g. "claude"); None = blitz default
     started_utc: str = ""
     git_sha: str = ""
+    # Phase 1 (2026-11-11): comparison arms and metrics that can lose.
+    arm: str = "S"                      # bench/arms.py: S | B0 | B1 | B2 | B3
+    output_token_budget: int = 0        # B1 stop rule (flat); see budget_from
+    budget_from: str = ""               # S run dir: per-tier median output tokens become B1's budget
+    n_drafts: int = 0                   # B2/B3; 0 = the planner's researcher count
+    allow_same_family: bool = False     # let B2's judge share the generator's provider (biased)
+    citations: str = "off"              # M1: off | offline (cache only) | live
+    output_token_cap: int = 0           # stop starting prompts once the run has generated this many
 
     def filter_slate(self, slate: BenchSlate) -> list[BenchPrompt]:
         return slate.filter(
@@ -117,6 +125,12 @@ class PromptResult:
     # bench-01: True only when detect_all actually ran on per-agent outputs.
     # An empty mast_flags with this False means "not checked", not "clean".
     mast_detectors_ran: bool = False
+    arm: str = "S"
+    calls: int = 0                       # model calls (baseline arms; 0 = not recorded for S)
+    generation_output_tokens: int = 0    # output tokens excluding judge calls
+    cost_incomplete: bool = False        # some call reported no cost -> cost_usd is a lower bound
+    citation_check: dict | None = None   # bench/citations.py M1 block (None = not run)
+    beta: dict | None = None             # detectors.beta_coverage over the arm's drafts
 
 
 # Type alias for the swarm function (injected for testing). Returns either
@@ -124,8 +138,18 @@ class PromptResult:
 SwarmFn = Callable[..., Awaitable["Path | tuple[Path, list[list[dict]]]"]]
 
 
+def _arm_record(result: Any) -> dict | None:
+    """The metrics record a baseline arm returns as the third tuple item
+    (bench/arms.py); None for the swarm, whose record is in metrics.jsonl."""
+    if isinstance(result, tuple) and len(result) == 3 and isinstance(result[2], dict):
+        return result[2]
+    return None
+
+
 def _split_swarm_result(result: Any) -> tuple[Any, list[list[dict]]]:
     """Normalise a swarm_fn return value into (out_path, rounds)."""
+    if isinstance(result, tuple) and len(result) == 3:
+        result = result[:2]
     if isinstance(result, tuple) and len(result) == 2:
         out_path, rounds = result
         if _valid_rounds(rounds):
@@ -210,7 +234,8 @@ def _blitz_swarm_version() -> str:
 def _run_id(cfg: BenchConfig, slate: BenchSlate) -> str:
     """Deterministic run_id: started_utc + git_sha + slate_id."""
     timestamp = cfg.started_utc.replace(":", "").replace("-", "").split("+")[0]
-    return f"{timestamp}_{cfg.git_sha}_{slate.slate_id}"
+    arm = "" if cfg.arm == "S" else f"_{cfg.arm}"
+    return f"{timestamp}_{cfg.git_sha}_{slate.slate_id}{arm}"
 
 
 def _resumable_ids(run_dir: Path) -> set[str]:
@@ -425,12 +450,15 @@ async def run_one_prompt(
     out_path, returned_rounds = _split_swarm_result(swarm_result)
     elapsed = round(time.monotonic() - started, 1)
 
-    record = _find_metrics_record_for_topic(
+    arm_record = _arm_record(swarm_result)
+    record = arm_record or _find_metrics_record_for_topic(
         prompt.text, metrics_path=metrics_path, after_timestamp=pre_run_timestamp,
     )
     # H4: one loud line per prompt so a metrics miss is never silent. A miss
     # must not crash the run — cost/tokens stay 0 — but it must be visible.
-    if record is not None:
+    if arm_record is not None:
+        print(f"[bench] arm {cfg.arm} record for {prompt.id}: {arm_record.get('calls')} calls", flush=True)
+    elif record is not None:
         print(f"[bench] metrics record MATCHED for {prompt.id}", flush=True)
     else:
         print(
@@ -468,7 +496,25 @@ async def run_one_prompt(
     coverage_hits = _coverage_count(md, prompt.expected_coverage)
 
     # ---- G1: PRIMARY functional research-quality composite ----------------
-    functional = research_quality_composite(md, _slate_entry_for(prompt), prior=list(prior))
+    # ---- M1: citation resolution (off | offline | live) --------------------
+    citation_check = None
+    if cfg.citations in ("offline", "live") and md:
+        from bench.citations import check_report
+        try:
+            citation_check = check_report(md, offline=cfg.citations == "offline")
+        except Exception as exc:      # the bench never dies on a metric
+            print(f"[bench] citation check failed for {prompt.id}: {exc!r}", flush=True)
+    functional = research_quality_composite(
+        md, _slate_entry_for(prompt), prior=list(prior), citation_check=citation_check,
+    )
+    # ---- M4: co-failure on coverage items across the arm's drafts ----------
+    beta = None
+    first_round = rounds_list[0] if rounds_list else []
+    drafts = [str(o.get("findings") or "") for o in first_round
+              if o.get("role") == "researcher" and not o.get("_error")]
+    if len(drafts) >= 2:
+        from bench.detectors import beta_coverage
+        beta = beta_coverage(drafts, list(prompt.expected_coverage))
 
     return PromptResult(
         prompt_id=prompt.id,
@@ -491,6 +537,14 @@ async def run_one_prompt(
         error=None,
         mast_flags=flags,
         mast_detectors_ran=detectors_ran,
+        arm=cfg.arm,
+        calls=int(record.get("calls", 0) or 0) if record else 0,
+        generation_output_tokens=int(
+            record.get("generation_output_tokens", record.get("total_output_tokens", 0)) or 0
+        ) if record else 0,
+        cost_incomplete=bool(record.get("cost_incomplete", False)) if record else False,
+        citation_check=citation_check,
+        beta=beta,
     )
 
 
@@ -868,11 +922,6 @@ async def run_bench(
     `baseline_run_dir`: an earlier run dir; its summary.json is paired against
     this run's per-prompt composites in stats.md (+ comparison.json).
     """
-    if swarm_fn is None:
-        # Lazy import: only require orchestrator when actually running.
-        from orchestrator import run_swarm
-        swarm_fn = run_swarm
-
     cfg.git_sha = cfg.git_sha or _git_sha()
     cfg.started_utc = cfg.started_utc or _utc()
     slate = load_slate(cfg.slate_path)
@@ -881,6 +930,28 @@ async def run_bench(
     run_id = _run_id(cfg, slate)
     run_dir = RUNS_DIR / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
+
+    arm_ctx = None
+    if swarm_fn is None:
+        # Lazy imports: only require the orchestrator / backends when running live.
+        from bench.arms import ArmContext, make_arm, prompt_key, tier_budgets
+        if cfg.arm != "S":
+            from backends import make_role_router
+            from config import load_config
+            blitz_cfg = load_config()
+            arm_ctx = ArmContext(
+                run_dir=run_dir, cfg=blitz_cfg,
+                backend=make_role_router(cfg.backend_id, blitz_cfg),
+                backend_id=cfg.backend_id, output_token_budget=cfg.output_token_budget,
+                n_drafts=cfg.n_drafts, allow_same_family=cfg.allow_same_family,
+            )
+            if cfg.budget_from:
+                budgets = tier_budgets(Path(cfg.budget_from), slate)
+                arm_ctx.budget_by_key = {
+                    prompt_key(p.text): budgets.get(p.tier, cfg.output_token_budget) for p in pending_all
+                }
+                print(f"[bench] B1 output-token budgets by tier from {cfg.budget_from}: {budgets}", flush=True)
+        swarm_fn = make_arm(cfg.arm, arm_ctx)
 
     # Resume detection
     done_ids = _resumable_ids(run_dir)
@@ -893,6 +964,7 @@ async def run_bench(
 
     sem = asyncio.Semaphore(max(cfg.parallel_prompts, 1))
     budget_remaining = [cfg.total_budget_usd]
+    tokens_spent = [0]
     budget_lock = asyncio.Lock()
     results_path = run_dir / "results.jsonl"
 
@@ -920,6 +992,13 @@ async def run_bench(
                         p, run_dir, time.monotonic(), _utc(),
                         "budget_exhausted",
                     )
+                # Token gate: Codex and local providers report no dollars, so a
+                # USD cap alone cannot stop a run on them.
+                if cfg.output_token_cap and tokens_spent[0] >= cfg.output_token_cap:
+                    return _error_result(
+                        p, run_dir, time.monotonic(), _utc(),
+                        "token_budget_exhausted",
+                    )
                 budget_remaining[0] -= p.budget_usd
             async with prior_lock:
                 prior_snapshot = list(prior_outputs)
@@ -937,6 +1016,7 @@ async def run_bench(
                 # ~10x (AUDIT M5). Unknown cost keeps the planned deduction.
                 if isinstance(result.cost_usd, (int, float)):
                     budget_remaining[0] += p.budget_usd - float(result.cost_usd)
+                tokens_spent[0] += int(result.output_tokens or 0)
             # Record this artifact so later prompts can score novelty against it.
             if result.output_md_path and Path(result.output_md_path).exists():
                 async with prior_lock:
@@ -991,6 +1071,20 @@ def main():
     ap.add_argument("--use-redis", action="store_true")
     ap.add_argument("--baseline", default=None,
                     help="earlier bench run dir to pair against (paired t / Cohen's d in stats.md)")
+    ap.add_argument("--arm", default="S", choices=["S", "B0", "B1", "B2", "B3"],
+                    help="S swarm | B0 one call | B1 self-revising agent | B2 best-of-N | B3 merge-of-N")
+    ap.add_argument("--output-token-budget", type=int, default=0,
+                    help="B1: keep revising until this many output tokens were generated (3-9 calls)")
+    ap.add_argument("--budget-from", default="",
+                    help="B1: an S run dir; its per-tier median output tokens become the budget")
+    ap.add_argument("--n-drafts", type=int, default=0, help="B2/B3 drafts (0 = planner's researcher count)")
+    ap.add_argument("--allow-same-family", action="store_true",
+                    help="B2: let the judge run on the generator's provider (biased; off by default)")
+    ap.add_argument("--citations", default="live", choices=["off", "offline", "live"],
+                    help="M1 citation resolution: live network, cache only, or off")
+    ap.add_argument("--output-token-cap", type=int, default=0,
+                    help="stop starting prompts once the run has generated this many output tokens")
+    ap.add_argument("--skip-preflight", action="store_true")
     args = ap.parse_args()
 
     cfg = BenchConfig(
@@ -1004,7 +1098,22 @@ def main():
         max_rounds=args.max_rounds,
         use_redis=args.use_redis,
         seed=args.seed,
+        arm=args.arm,
+        output_token_budget=args.output_token_budget,
+        budget_from=args.budget_from,
+        n_drafts=args.n_drafts,
+        allow_same_family=args.allow_same_family,
+        citations=args.citations,
+        output_token_cap=args.output_token_cap,
     )
+    if not args.skip_preflight:
+        from bench.preflight import run_preflight
+        problems = run_preflight(cfg)
+        if problems:
+            for line in problems:
+                print(f"[preflight] FAIL: {line}")
+            raise SystemExit(2)
+        print("[preflight] ok")
     run_dir = asyncio.run(run_bench(
         cfg, baseline_run_dir=Path(args.baseline) if args.baseline else None,
     ))
