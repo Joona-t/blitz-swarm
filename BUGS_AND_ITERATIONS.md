@@ -387,3 +387,17 @@ Not fixed, by decision: live bench slate run and mythos-bench regeneration (need
 **Prevention rule:** every claim in README/docs must point at a `file:line` or say "not measured" (`docs/CLAIMS_AND_EVIDENCE.md` is the register). A library that ships without an orchestrator call site is labelled EXPERIMENTAL, UNWIRED in its `__init__` docstring and in the README until it is wired. Model names live in `blitz.toml` only; the grep guard is the gate.
 
 **Commits:** 88cd49f (WP1), 36767cd (WP2-4); WP5/WP6 committed by the orchestrating session.
+
+### ITER-P1b — Ollama adapter options for a local-model pilot (2026-11-11)
+
+- **What:** `think` and `max_parallel` on `[backend.providers.<ollama id>]`.
+- **Why:** Phase 1 moves to a local Qwen 27B on a shared dual-GPU machine (plan amendment of the
+  same date). Two things would have corrupted the measurements silently: a thinking model's
+  reasoning is counted as output tokens (the arms are budget-matched on output tokens), and a
+  one-slot server makes parallel calls wait inside each call's timeout.
+- **Check:** `tests/test_ollama_think_parallel.py` (4 tests). The known-bad case proves four
+  ungated calls are inside the server at once; with `max_parallel = 1` the peak is 1 and queue time
+  is not billed to the call. First version of that test asserted on wall-clock thresholds and failed
+  1 run in 4 under load; rewritten on a barrier and an interval identity before commit.
+- **Status:** unit-tested. **Not yet verified live**: the machine went off the network before the
+  first locked call ran.

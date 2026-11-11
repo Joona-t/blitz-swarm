@@ -81,3 +81,35 @@ Owner decision: Codex/OpenAI is out as a provider, permanently. Consequences for
   the check on M2 that matters: if judge-human kappa is below ~0.6, M2 is dropped from the write-up.
 - **Upside:** Claude reports cost, so every arm's cost is `reported`, not a lower bound.
 - **B2** (best-of-N picked by the judge) inherits the same-family caveat; B3 does not use a judge.
+
+## Amendment 2026-11-11 (late evening): run on the Forge, local Qwen generates
+
+Owner decision, relayed by the session coordinating the dual-GPU PC ("the Forge"), in Joona's words
+to that session: "It i s asking for a cli but we should run the tests in teh Forge", then "you can
+use qwen for testing and you be the observer". This replaces the "Claude generates" amendment above.
+It reached this branch's session second-hand; it was not typed here.
+
+- **Generator:** `qwen3.8:27b-q8_0` (open weights, 27B, Q8) served by Ollama on the Forge, for every
+  arm. Claude makes no generation or judging call. Claude sets up, launches, reads and verifies.
+- **Every result is labelled with the model.** Qwen runs are not paired with the 2026-11-04 Codex
+  runs or with any Claude run. All arms, S included, are (re-)run on Qwen.
+- **Judge:** Qwen judging Qwen is same-family, so the tightened rule above stands unchanged: only
+  **M1 and composite v2** (no model involved) can decide; M2 is secondary and flagged
+  (`--allow-same-family`); the human labels check it; below kappa ~0.6 it is dropped.
+- **What this pilot can and cannot say:** it compares architectures *on a 27B local model*. Whether
+  the ordering of arms carries over to a frontier model is not tested by it.
+- **Provider settings** (a local config selected with `BLITZ_CONFIG`; the shipped `blitz.toml` is
+  unchanged): `[backend] default = "ollama"`, all three tiers -> `qwen3.8:27b-q8_0`, and two options
+  added to the adapter for this run:
+  - `think = false|true`. A thinking model's reasoning is counted in `eval_count`; left on, it
+    inflates the output tokens the arms are budget-matched on. The setting used is recorded per run.
+  - `max_parallel = 1`. The server has one slot (`OLLAMA_NUM_PARALLEL` unset), so the swarm's
+    concurrent calls queue in-process before the request timer starts. Queue time is logged per call
+    (`queued_s`) and is not part of `elapsed_s`.
+- **Consequence for the swarm arm:** its parallelism buys no wall-clock on one model instance. Wall
+  time for S on this hardware is the *sum* of its calls; the comparison of interest is quality per
+  output token, not speed.
+- **Cost:** local, so USD is not reported. The cost axis is calls, input and output tokens, and GPU
+  seconds.
+- **Shared GPU:** every generating command runs under the machine's GPU lock, one prompt x one arm
+  per hold. A pilot size is proposed from measured smoke timings before anything long is queued.
