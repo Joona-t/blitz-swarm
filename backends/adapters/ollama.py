@@ -7,6 +7,7 @@ core package does not acquire optional HTTP dependencies.
 from __future__ import annotations
 
 import json
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -30,12 +31,32 @@ NO_MODEL_ERROR = (
 )
 
 
+_GATES: dict[tuple[str, int], threading.BoundedSemaphore] = {}
+_GATES_LOCK = threading.Lock()
+
+
+def _gate(base_url: str, n: int) -> threading.BoundedSemaphore:
+    """One semaphore per (server, limit), shared by every backend object in
+    the process, so role-routed backends cannot exceed the server's slots."""
+    with _GATES_LOCK:
+        return _GATES.setdefault((base_url.rstrip("/"), n), threading.BoundedSemaphore(n))
+
+
 @dataclass
 class OllamaHTTPBackend:
     model: str | None = None
     base_url: str = "http://localhost:11434"
     backend_id: str = "ollama"
     adapter_kind: str = "ollama_http"
+    # `think = false` in the provider table turns a thinking model's
+    # reasoning off; None leaves the server default. Thinking tokens are
+    # counted in eval_count, so leaving it on inflates output tokens.
+    think: bool | None = None
+    # 0 = no limit. Set to the server's parallel slots (1 when
+    # OLLAMA_NUM_PARALLEL is unset) so a swarm's concurrent calls queue
+    # here, before the request timer starts, instead of timing out while
+    # waiting inside the server.
+    max_parallel: int = 0
 
     capabilities = BackendCapabilities(
         adapter_kind="ollama_http",
@@ -76,6 +97,8 @@ class OllamaHTTPBackend:
         }
         if call.schema:
             payload["format"] = call.schema
+        if self.think is not None:
+            payload["think"] = bool(self.think)
 
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
@@ -85,7 +108,12 @@ class OllamaHTTPBackend:
             method="POST",
         )
 
+        gate = _gate(self.base_url, self.max_parallel) if self.max_parallel > 0 else None
+        queued_from = time.monotonic()
+        if gate is not None:
+            gate.acquire()
         start = time.monotonic()
+        queued_s = start - queued_from
         try:
             with urllib.request.urlopen(req, timeout=call.timeout_s) as resp:
                 raw = resp.read().decode("utf-8", errors="replace")
@@ -114,6 +142,9 @@ class OllamaHTTPBackend:
                 errored=True,
                 error=f"ollama request failed: {exc.reason!r}",
             )
+        finally:
+            if gate is not None:
+                gate.release()
 
         elapsed = time.monotonic() - start
         try:
@@ -138,5 +169,10 @@ class OllamaHTTPBackend:
             if isinstance(envelope, dict) else 0,
             output_tokens=int(envelope.get("eval_count", 0) or 0)
             if isinstance(envelope, dict) else 0,
-            metadata={"done": envelope.get("done")} if isinstance(envelope, dict) else {},
+            metadata={
+                "done": envelope.get("done"),
+                "done_reason": envelope.get("done_reason"),
+                "thinking_chars": len(envelope.get("thinking") or ""),
+                "queued_s": round(queued_s, 3),
+            } if isinstance(envelope, dict) else {},
         )

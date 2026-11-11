@@ -409,6 +409,8 @@ def _ensure_builtins() -> None:
             backend_id=kw.get("backend_id", "ollama"),
             model=kw.get("model") or None,
             base_url=kw.get("base_url") or OllamaHTTPBackend.base_url,
+            think=kw.get("think"),
+            max_parallel=int(kw.get("max_parallel") or 0),
         ),
         aliases=("ollama",),
         replace=True,
