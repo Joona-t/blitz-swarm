@@ -1,5 +1,42 @@
 # Bugs & Iterations
 
+## 2026-11-12: ITER-P1d — first live runs on vLLM (Forge, qwen3.8-27b-fp8): five defects the live run surfaced
+
+Phase A smoke: every arm once on s001, thinking off and thinking on, against the shared vLLM server.
+Uncommitted for the lead architect's review. Run folders: `bench/runs/20261112-vllm-{think-off,think-on}/`
+on the Forge (not in git).
+
+| Defect (found live) | Root cause | Fix | Test |
+|---|---|---|---|
+| A report cut at the token limit was invisible | `openai_http` put `finish_reason` in result metadata, but `bench/arms.py` `_CallLog.add` and the swarm's per-agent telemetry dropped metadata | call log rows carry `finish_reason` (or Ollama's `done_reason`), `thinking_chars`, `reasoning_tokens`; the arm record counts `truncated_calls`; swarm outputs carry `_finish_reason` and each round in `metrics.jsonl` gets `finish_reasons` counts | `tests/bench/test_arms.py::test_call_log_records_finish_reason_so_truncation_is_visible`, `tests/test_metrics.py::test_end_round_counts_finish_reasons_so_truncation_is_visible`, `::test_invoke_agent_telemetry_carries_finish_reason` |
+| A reply with choices but no content became a "report" made of the raw JSON envelope | `openai_http` fell back to `text = raw` whenever content was empty | raw fallback only when the body is not chat-shaped; empty content is `errored` with the finish_reason in the message. Seen live with thinking on: `empty content (finish_reason='stop')` | `tests/test_openai_http_extra_body.py::test_empty_content_is_an_error_not_the_raw_envelope` |
+| The swarm sent 32 requests at once to a server shared with another client (cap: 8) | selector pairwise judging fans out every pair x judge with `gather`; `openai_http` had no gate (only `ollama_http` had one) | `max_parallel` provider option on `openai_http`, one semaphore per (server, limit) per process, mirroring `ollama_http`; wait reported as `queued_s` | `::test_max_parallel_caps_requests_in_flight` |
+| Judge-ensemble and selector calls could not be given more than 90 s, the bench B2 judge not more than 300 s | `min(AGENT_TIMEOUT_SECONDS, 90)` hard-coded twice in `orchestrator.py`; `make_ask` default 300 | `[swarm] judge_timeout_seconds` (0 keeps the old limits) | `tests/test_judge_timeout_config.py` |
+| Thinking tokens: no record of how many of `output_tokens` were reasoning | vLLM reports `completion_tokens_details.reasoning_tokens`; the adapter ignored it | `reasoning_tokens` in metadata, call log and swarm telemetry | `::test_reasoning_tokens_from_vllm_usage_details` |
+
+**Open, not fixed (needs a decision):** with thinking off, about 1 in 10 schema-constrained swarm calls
+(evaluators, researchers) ran away emitting whitespace (`"\n\n\n    \r\n"` repeated) until the 65,536-token
+context limit: 63,113 output tokens, about 9 minutes each, `finish_reason: length`. The adapter sends no
+`max_tokens`, so vLLM allows the rest of the context. Bench arms B0, B1, B3 send no schema and showed none.
+These tokens count toward S's `output_tokens`, which is B1's budget (thinking-off S: 180,195 output
+tokens, 126,247 of them from two runaways; B1 hit its 9-call cap without reaching the budget).
+
+**Open: thinking on.** S did not finish within the bench's 3,600 s per-prompt limit (rounds of 11-13
+minutes; cut in round 4, no report, no metrics record), so B1 had no budget and was not run. Thinking
+tokens are inside `completion_tokens` (vLLM), so they count in `output_tokens`, in B1's stop rule and in
+S's totals alike; they are not in the saved report text (content only). B0, B2, B3 completed:
+46,800 of B0's 54,511 output tokens were reasoning.
+
+**Open: comparing conditions.** `bench/compare.py` merges runs of the same arm by prompt id
+(`arms.setdefault(run["arm"], {}).update(scored)`), so passing thinking-off and thinking-on runs together
+would silently overwrite one with the other. No condition dimension exists yet.
+
+**Open: a timed-out prompt does not stop its calls.** `bench/runner.py` cancels a prompt with
+`asyncio.wait_for`, but arm and agent calls run in threads (`asyncio.to_thread`) that cannot be
+cancelled. After a per-prompt timeout the threads already started, and any waiting at the
+`max_parallel` gate, go on to make their requests. Gate waiting is not counted in a call's own
+timeout; it is counted in the per-prompt wall limit. Read from the code, not reproduced live.
+
 ## 2026-11-11: ITER-P1 — Phase 1 measuring stick built; live pilot blocked by the machine, not the code
 
 **What hurt:** the bench's primary score gave 30% for citations that were only well-formed; the
@@ -414,4 +451,6 @@ Not fixed, by decision: live bench slate run and mythos-bench regeneration (need
   tokens would inflate the output-token budgets the arms are matched on. `finish_reason` shows a
   report cut off at the token limit.
 - **Check:** `tests/test_openai_http_extra_body.py` (2 tests, config file to request body).
-- **Status:** unit-tested. **Not verified live.**
+- **Status:** unit-tested. Used live on 2026-11-12 (see ITER-P1d): the lead session reports 0
+  reasoning tokens on every logged thinking-off call. Those run folders are not in git and were not
+  re-read from this branch.

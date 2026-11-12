@@ -318,3 +318,40 @@ def test_format_metrics_report_unknown_cost_is_na_and_override_marked():
     assert "| n/a |" in out
     assert "| yes* |" in out and "| no |" in out
     assert "Trends" not in out
+
+
+def test_end_round_counts_finish_reasons_so_truncation_is_visible():
+    """2026-11-12 (vLLM live run): a swarm call cut at the token limit left no
+    trace in metrics; the adapter's finish_reason now reaches the round record."""
+    mc = MetricsCollector()
+    mc.start_run("r1", "topic")
+    mc.start_round("round_1")
+    mc.end_round("round_1", [
+        {"agent_id": "a", "_finish_reason": "stop"},
+        {"agent_id": "b", "_finish_reason": "length"},
+        {"agent_id": "c"},
+    ])
+    assert mc.run.rounds["round_1"]["finish_reasons"] == {"stop": 1, "length": 1, "none": 1}
+
+
+def test_invoke_agent_telemetry_carries_finish_reason(monkeypatch, tmp_path):
+    import orchestrator
+    from agents import BlitzAgent
+    from backends import AgentResult
+
+    class B:
+        backend_id = "gen"
+        adapter_kind = "fake"
+        capabilities = None
+
+        def is_available(self):
+            return True
+
+        def call(self, call):
+            return AgentResult(backend_id="gen", adapter_kind="fake", model="m", text="{}", raw_stdout="",
+                               parsed={"findings": "f", "key_points": [], "confidence": 0.5},
+                               elapsed_s=0.1, metadata={"finish_reason": "length", "thinking_chars": 7})
+
+    agent = BlitzAgent(id="r0", role="researcher", subtopic="t", system_prompt="S")
+    out = orchestrator.invoke_agent(agent, "ctx", "task", backend=B(), scratch_dir=tmp_path)
+    assert out["_finish_reason"] == "length" and out["_thinking_chars"] == 7

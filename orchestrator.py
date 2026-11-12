@@ -72,6 +72,9 @@ AGENT_TIMEOUT_SECONDS = _config.swarm.timeout_seconds
 # live run 2026-11-04: Codex needed > 300 s and timed out, so it gets its
 # own budget ([swarm] synthesizer_timeout_seconds, default 2x).
 SYNTHESIZER_TIMEOUT_SECONDS = _config.swarm.synthesizer_timeout_seconds or AGENT_TIMEOUT_SECONDS * 2
+# Judge-ensemble and selector calls: `[swarm] judge_timeout_seconds`, else the
+# historical cap of min(timeout_seconds, 90). A slow local server needs more.
+JUDGE_TIMEOUT_SECONDS = _config.swarm.judge_timeout_seconds or min(AGENT_TIMEOUT_SECONDS, 90)
 OUTPUT_DIR = Path(_config.storage.output_dir) if not Path(_config.storage.output_dir).is_absolute() else Path(_config.storage.output_dir)
 if not OUTPUT_DIR.is_absolute():
     OUTPUT_DIR = Path(__file__).parent / _config.storage.output_dir
@@ -339,6 +342,11 @@ def invoke_agent(
                 "_schema_mode": result.schema_mode,
                 "_input_tokens": result.input_tokens,
                 "_output_tokens": result.output_tokens,
+                # "length" = cut at the token limit (adapters that report it).
+                "_finish_reason": ((result.metadata or {}).get("finish_reason")
+                                   or (result.metadata or {}).get("done_reason")),   # openai_http | ollama_http
+                "_thinking_chars": (result.metadata or {}).get("thinking_chars"),
+                "_reasoning_tokens": (result.metadata or {}).get("reasoning_tokens"),
                 "_validation_errors": result.validation_errors,
                 "backend_id": result.backend_id,
                 "model": result.model or model,
@@ -941,7 +949,7 @@ def _make_judge_fn(
             system_prompt="Return JSON only. Be strict, independent, and concise.",
             schema=_judge_vote_schema(tuple(rubric_dims)),
             model=model,
-            timeout_s=min(AGENT_TIMEOUT_SECONDS, 90),
+            timeout_s=JUDGE_TIMEOUT_SECONDS,
             cwd=scratch_dir,
             sandbox=sandbox,
             approval_policy=provider.approval_policy,
@@ -1131,7 +1139,7 @@ def _make_pairwise_judge_fn(
             system_prompt="Return JSON only with winner and rationale.",
             schema=PAIRWISE_VERDICT_SCHEMA,
             model=model,
-            timeout_s=min(AGENT_TIMEOUT_SECONDS, 90),
+            timeout_s=JUDGE_TIMEOUT_SECONDS,
             cwd=scratch_dir,
             sandbox=sandbox,
             approval_policy=provider.approval_policy,

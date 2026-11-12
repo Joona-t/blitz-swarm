@@ -258,3 +258,34 @@ def test_preflight_names_each_problem(tmp_path, cfg):
                          which=lambda b: "/bin/" + b,
                          disk_usage=lambda p: type("U", (), {"free": 5e8})())
     assert any("GB free" in m for m in full)
+
+
+def test_call_log_records_finish_reason_so_truncation_is_visible(tmp_path, cfg):
+    """2026-11-12 (vLLM live run): the adapter put finish_reason in metadata but
+    the call log dropped it, so a report cut at the token limit looked complete."""
+
+    class Truncating(FakeBackend):
+        def call(self, call):
+            r = super().call(call)
+            r.metadata = {"finish_reason": "length", "thinking_chars": 0}
+            return r
+
+    ctx = _ctx(tmp_path, cfg, Truncating())
+    _, _, record = _run("B0", ctx)
+    row = _log_rows(ctx)[0]
+    assert row["finish_reason"] == "length" and row["thinking_chars"] == 0
+    assert record["truncated_calls"] == 1
+    # A backend that reports nothing logs None, not a guess.
+    ctx2 = _ctx(tmp_path / "b", cfg, FakeBackend())
+    _, _, record2 = _run("B0", ctx2)
+    assert _log_rows(ctx2)[0]["finish_reason"] is None and record2["truncated_calls"] == 0
+
+    class OllamaTruncating(FakeBackend):
+        def call(self, call):
+            r = super().call(call)
+            r.metadata = {"done_reason": "length"}
+            return r
+
+    ctx3 = _ctx(tmp_path / "c", cfg, OllamaTruncating())
+    _, _, record3 = _run("B0", ctx3)
+    assert _log_rows(ctx3)[0]["finish_reason"] == "length" and record3["truncated_calls"] == 1

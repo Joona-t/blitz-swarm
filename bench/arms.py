@@ -90,6 +90,7 @@ class _CallLog:
         self.cost_usd: float | None = None
         self.cost_unknown = 0
         self.providers: set[str] = set()
+        self.truncated = 0             # calls with finish_reason == "length"
 
     def add(self, kind: str, result) -> None:
         self.calls += 1
@@ -101,13 +102,21 @@ class _CallLog:
             self.cost_usd = (self.cost_usd or 0.0) + float(result.cost_usd)
         else:
             self.cost_unknown += 1
-        provider = (result.metadata or {}).get("routed_provider") or result.backend_id
+        meta = result.metadata or {}
+        provider = meta.get("routed_provider") or result.backend_id
         self.providers.add(str(provider))
+        # finish_reason "length" = the reply was cut at the token limit; without
+        # it in the log a truncated report looks like a complete one.
+        finish_reason = meta.get("finish_reason") or meta.get("done_reason")   # openai_http | ollama_http
+        if finish_reason == "length":
+            self.truncated += 1
         row = {
             "kind": kind, "provider": provider, "model": result.model,
             "input_tokens": int(result.input_tokens or 0), "output_tokens": int(result.output_tokens or 0),
             "elapsed_s": round(float(result.elapsed_s or 0), 1), "cost_usd": result.cost_usd,
             "cost_policy": result.cost_policy, "errored": bool(result.errored), "error": result.error,
+            "finish_reason": finish_reason, "thinking_chars": meta.get("thinking_chars"),
+            "reasoning_tokens": meta.get("reasoning_tokens"),
         }
         with self.path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(row) + "\n")
@@ -118,6 +127,7 @@ class _CallLog:
             "total_cost_usd": self.cost_usd, "cost_incomplete": self.cost_unknown > 0,
             "total_input_tokens": self.input_tokens, "total_output_tokens": self.output_tokens,
             "generation_output_tokens": self.gen_output_tokens, "calls": self.calls,
+            "truncated_calls": self.truncated,
             "providers": sorted(self.providers), "total_wall_clock_s": round(time.monotonic() - started, 1),
             "consensus_reached": False, "rounds_to_consensus": 0,
         }
@@ -236,7 +246,8 @@ def run_b2(ctx: ArmContext, topic: str):
     best = 0
     if len(drafts) > 1:
         ask = J.make_ask(ctx.backend, ctx.cfg, backend_id=ctx.backend_id,
-                         scratch_dir=ctx.run_dir / "scratch", on_result=log.add)
+                         scratch_dir=ctx.run_dir / "scratch", on_result=log.add,
+                         timeout_s=ctx.cfg.swarm.judge_timeout_seconds or 300)
         ids = [str(i) for i in range(len(drafts))]
         wins: dict[tuple[str, str], float] = {}
         for i in range(len(drafts)):

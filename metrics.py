@@ -63,6 +63,9 @@ class RoundMetrics:
     providers_by_role: dict[str, str] = field(default_factory=dict)
     input_tokens: int = 0
     output_tokens: int = 0
+    # finish_reason -> count over the round's agent calls ("length" = cut at
+    # the token limit); calls whose adapter reports none count under "none".
+    finish_reasons: dict[str, int] = field(default_factory=dict)
     ready_votes: int = 0
     total_voters: int = 0
     avg_confidence: float = 0.0
@@ -144,8 +147,11 @@ class MetricsCollector:
         round_output_tokens = 0
         policies: set[str] = set()
         providers: dict[str, str] = {}
+        finish_reasons: dict[str, int] = {}
 
         for o in outputs:
+            fr = str(o.get("_finish_reason") or "none")
+            finish_reasons[fr] = finish_reasons.get(fr, 0) + 1
             if o.get("_error"):
                 msg = o.get("_error_msg", "") or o.get("findings", "")
                 if "timed out" in msg.lower() or "timeout" in msg.lower():
@@ -192,6 +198,7 @@ class MetricsCollector:
             providers_by_role=providers,
             input_tokens=round_input_tokens,
             output_tokens=round_output_tokens,
+            finish_reasons=finish_reasons,
         )
 
         self.run.rounds[round_name] = asdict(rm)

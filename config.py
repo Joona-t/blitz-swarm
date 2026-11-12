@@ -50,6 +50,7 @@ class SwarmConfig:
     max_rounds: int = 5
     timeout_seconds: int = 180
     synthesizer_timeout_seconds: int = 0      # 0 = 2 x timeout_seconds
+    judge_timeout_seconds: int = 0            # 0 = built-in caps (swarm judges 90 s, bench judge 300 s)
     max_agents: int = 12
     domain: str = "general"           # which prompts/<domain>/ preset to load
     persona_critics: bool = False     # MAR-style persona-typed critics (Phase 1 opt-in)

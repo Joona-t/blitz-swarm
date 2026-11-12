@@ -452,9 +452,10 @@ def _ensure_builtins() -> None:
             model=kw.get("model") or None,
             api_key_env=kw.get("api_key_env") or "",
             reasoning_effort=kw.get("reasoning_effort") or None,
+            max_parallel=int(kw.get("max_parallel") or 0),
             metadata=_extras(
                 kw, "command", "model", "reasoning_effort", "sandbox",
-                "approval_policy", "ephemeral", "base_url", "api_key_env",
+                "approval_policy", "ephemeral", "base_url", "api_key_env", "max_parallel",
             ),
         ),
         replace=True,

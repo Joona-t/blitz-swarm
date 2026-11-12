@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -35,6 +36,18 @@ NO_MODEL_ERROR = (
 )
 
 
+_GATES: dict[tuple[str, int], threading.BoundedSemaphore] = {}
+_GATES_LOCK = threading.Lock()
+
+
+def _gate(base_url: str, n: int) -> threading.BoundedSemaphore:
+    """One semaphore per (server, limit), shared by every backend object in
+    the process (mirrors ollama_http), so role-routed backends and the
+    selector's fan-out cannot exceed the slots this client may use."""
+    with _GATES_LOCK:
+        return _GATES.setdefault((base_url.rstrip("/"), n), threading.BoundedSemaphore(n))
+
+
 @dataclass
 class OpenAIHTTPBackend:
     base_url: str = ""
@@ -44,6 +57,11 @@ class OpenAIHTTPBackend:
     backend_id: str = "local"
     adapter_kind: str = "openai_http"
     metadata: dict = field(default_factory=dict)
+    # 0 = no limit. `max_parallel` in the provider table caps this process's
+    # requests in flight to the server (a shared vLLM server: our share of its
+    # slots). Calls wait here before the request timer starts; the wait is
+    # reported as metadata["queued_s"].
+    max_parallel: int = 0
 
     # A bare chat endpoint has no tools at all, so "no tools" is met by
     # construction (allowlist with an empty set); a call that ASKS for tools
@@ -129,7 +147,12 @@ class OpenAIHTTPBackend:
             method="POST",
         )
 
+        gate = _gate(self.base_url, self.max_parallel) if self.max_parallel > 0 else None
+        queued_from = time.monotonic()
+        if gate is not None:
+            gate.acquire()
         start = time.monotonic()
+        queued_s = round(start - queued_from, 3)
         try:
             with urllib.request.urlopen(req, timeout=call.timeout_s) as resp:
                 raw = resp.read().decode("utf-8", errors="replace")
@@ -159,6 +182,9 @@ class OpenAIHTTPBackend:
                 model, f"openai_http exception: {exc!r}",
                 elapsed_s=time.monotonic() - start,
             )
+        finally:
+            if gate is not None:
+                gate.release()
         elapsed = time.monotonic() - start
 
         try:
@@ -168,9 +194,11 @@ class OpenAIHTTPBackend:
         text = ""
         finish_reason = None
         thinking_chars = 0
+        has_choice = False
         if isinstance(envelope, dict):
             choices = envelope.get("choices") or []
             if choices and isinstance(choices[0], dict):
+                has_choice = True
                 finish_reason = choices[0].get("finish_reason")
                 message = choices[0].get("message") or {}
                 reasoning = message.get("reasoning_content") or message.get("reasoning")
@@ -180,11 +208,17 @@ class OpenAIHTTPBackend:
                     text = content
                 elif isinstance(message.get("refusal"), str):
                     text = message["refusal"]
-        if not text:
+        # Raw body only when the server did not answer in the chat shape. A
+        # well-formed reply with no content (e.g. a thinking model that spent
+        # every token on reasoning, finish_reason "length") is an error, not a
+        # report whose text is the JSON envelope.
+        if not text and not has_choice:
             text = raw
         usage = envelope.get("usage", {}) if isinstance(envelope, dict) else {}
         usage = usage or {}
-        errored = not (200 <= status < 300)
+        http_ok = 200 <= status < 300
+        empty = http_ok and has_choice and not text.strip()
+        errored = not http_ok or empty
         return normalize_result(
             backend_id=self.backend_id,
             adapter_kind=self.adapter_kind,
@@ -194,10 +228,16 @@ class OpenAIHTTPBackend:
             schema=call.schema,
             elapsed_s=elapsed,
             errored=errored,
-            error=f"openai_http HTTP {status}" if errored else None,
+            error=(f"openai_http HTTP {status}" if not http_ok
+                   else f"openai_http: empty content (finish_reason={finish_reason!r})" if empty
+                   else None),
             input_tokens=int(usage.get("prompt_tokens", 0) or 0),
             output_tokens=int(usage.get("completion_tokens", 0) or 0),
-            metadata={"effort": effort, "finish_reason": finish_reason, "thinking_chars": thinking_chars},
+            # reasoning_tokens: the part of completion_tokens (= output_tokens)
+            # spent thinking, when the server reports it (vLLM does).
+            metadata={"effort": effort, "finish_reason": finish_reason, "thinking_chars": thinking_chars,
+                      "queued_s": queued_s,
+                      "reasoning_tokens": (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")},
             strict_nulls=True,
         )
 
