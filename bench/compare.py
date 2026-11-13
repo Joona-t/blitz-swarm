@@ -30,11 +30,23 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 METRICS = ("composite_v2", "citations_ratio", "coverage", "composite_v1")
 
 
-def _arm_of(run_dir: Path) -> str:
+def _arm_of(run_dir: Path, condition: str | None = None) -> str:
+    """The run's label: its arm, or `arm@condition` when the run has a
+    condition (config.json `condition`, or one given on the command line).
+    Runs with different conditions are different rows, never merged."""
     try:
-        return json.loads((run_dir / "config.json").read_text(encoding="utf-8")).get("arm") or "S"
+        cfg = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return "S"
+        cfg = {}
+    arm = cfg.get("arm") or "S"
+    condition = condition if condition is not None else (cfg.get("condition") or "")
+    return f"{arm}@{condition}" if condition else arm
+
+
+def ref_label(label: str, ref: str) -> str:
+    """The reference a label is compared with: the reference arm in the
+    same condition (`S@think-on` -> `B1@think-on`)."""
+    return f"{ref}@{label.split('@', 1)[1]}" if "@" in label else ref
 
 
 def _report_path(run_dir: Path, row: dict) -> Path | None:
@@ -53,7 +65,7 @@ def _report_path(run_dir: Path, row: dict) -> Path | None:
     return None
 
 
-def load_run(run_dir: Path) -> dict:
+def load_run(run_dir: Path, condition: str | None = None) -> dict:
     """{arm, run_dir, rows: {prompt_id: row}, skipped: {prompt_id: reason}}."""
     run_dir = Path(run_dir)
     rows, skipped = {}, {}
@@ -66,7 +78,7 @@ def load_run(run_dir: Path) -> dict:
             skipped[pid] = row.get("error") or "timeout"
         else:
             rows[pid] = row
-    return {"arm": _arm_of(run_dir), "run_dir": run_dir, "rows": rows, "skipped": skipped}
+    return {"arm": _arm_of(run_dir, condition), "run_dir": run_dir, "rows": rows, "skipped": skipped}
 
 
 def score_run(run: dict, slate, *, citations: str = "offline", check=check_report) -> dict:
@@ -98,6 +110,7 @@ def score_run(run: dict, slate, *, citations: str = "offline", check=check_repor
             "length_chars": fc["length_chars"],
             "output_tokens": row.get("output_tokens", 0),
             "generation_output_tokens": row.get("generation_output_tokens") or row.get("output_tokens", 0),
+            "finished_generation_output_tokens": row.get("finished_generation_output_tokens"),
             "calls": row.get("calls", 0), "elapsed_s": row.get("elapsed_s", 0.0),
             "cost_usd": row.get("cost_usd", 0.0), "cost_incomplete": row.get("cost_incomplete", False),
             "beta": (row.get("beta") or {}).get("beta"),
@@ -162,16 +175,17 @@ def cohens_kappa(a: list[str], b: list[str]) -> float | None:
 
 
 def judge_arms(scores: dict[str, dict], ref: str, ask, cache: dict) -> dict:
-    """M2 for every arm vs the reference on shared prompts."""
+    """M2 for every arm vs the reference of its own condition, shared prompts."""
     from bench import judge as J
     out = {}
     for arm, arm_scores in scores.items():
-        if arm == ref:
+        its_ref = ref_label(arm, ref)
+        if arm == its_ref or its_ref not in scores:
             continue
         w = t = l = flips = errors = 0
         per_prompt = {}
-        for pid in sorted(set(arm_scores) & set(scores[ref])):
-            v = J.compare(arm_scores[pid]["task"], arm_scores[pid]["text"], scores[ref][pid]["text"], ask, cache=cache)
+        for pid in sorted(set(arm_scores) & set(scores[its_ref])):
+            v = J.compare(arm_scores[pid]["task"], arm_scores[pid]["text"], scores[its_ref][pid]["text"], ask, cache=cache)
             per_prompt[pid] = {k: v.get(k) for k in ("winner", "x_wins", "y_wins", "ties", "order_flips", "errored", "criteria")}
             errors += int(bool(v.get("errored")))
             flips += int(v.get("order_flips", 0))
@@ -217,20 +231,37 @@ def kappa_vs_labels(labels_path: Path, judge_cache: dict) -> dict:
 
 
 def build(run_dirs: list[Path], slate, *, ref: str = "B1", citations: str = "offline",
-          ask=None, judge_cache: dict | None = None, labels: Path | None = None, check=check_report) -> dict:
-    runs = [load_run(Path(d)) for d in run_dirs]
+          ask=None, judge_cache: dict | None = None, labels: Path | None = None, check=check_report,
+          conditions: dict[str, str] | None = None) -> dict:
+    """`conditions` maps a run folder name to a condition label, for runs
+    whose config.json has none."""
+    conditions = conditions or {}
+    runs = [load_run(Path(d), conditions.get(Path(d).name)) for d in run_dirs]
     arms: dict[str, dict] = {}
     skipped: dict[str, dict] = {}
+    run_names: dict[str, list[str]] = {}
     for run in runs:
         scored = score_run(run, slate, citations=citations, check=check)
-        arms.setdefault(run["arm"], {}).update(scored)          # several runs may form one arm
+        have = arms.setdefault(run["arm"], {})
+        # Several runs may form one arm (a split or resumed slate), but only on
+        # different prompts: the same prompt twice means two conditions.
+        twice = sorted(set(have) & set(scored))
+        if twice:
+            raise ValueError(
+                f"{run['run_dir'].name} and an earlier run both have arm {run['arm']!r} for {', '.join(twice)}. "
+                "If they differ in condition, label them (bench.runner --condition, or --condition RUN=LABEL here)."
+            )
+        have.update(scored)
         skipped.setdefault(run["arm"], {}).update(run["skipped"])
-    if ref not in arms:
+        run_names.setdefault(run["arm"], []).append(run["run_dir"].name)
+    refs = {a: ref_label(a, ref) for a in arms}
+    if not any(a == r for a, r in refs.items()):
         raise ValueError(f"reference arm {ref!r} is not among the runs ({', '.join(sorted(arms))})")
     all_prompts = sorted(set().union(*[set(s) for s in arms.values()]))
     result: dict = {"ref": ref, "citations_mode": citations, "arms": {}, "paired": {}, "judge": None, "kappa": None,
                     "missing": {a: sorted(set(all_prompts) - set(s)) for a, s in arms.items()},
-                    "skipped": skipped, "runs": {r["arm"]: str(r["run_dir"].name) for r in runs}}
+                    "skipped": skipped, "runs": {a: ", ".join(n) for a, n in run_names.items()},
+                    "refs": refs, "no_reference": sorted(a for a, r in refs.items() if r not in arms)}
     for arm, s in arms.items():
         rows = list(s.values())
         block = {m: _mean_ci([r.get(m) for r in rows]) for m in METRICS}
@@ -238,6 +269,9 @@ def build(run_dirs: list[Path], slate, *, ref: str = "B1", citations: str = "off
         for key in ("length_chars", "generation_output_tokens", "calls", "elapsed_s", "cost_usd"):
             vals = [r.get(key) or 0 for r in rows]
             block[key] = round(statistics.mean(vals), 1) if vals else 0
+        fin = [r["finished_generation_output_tokens"] for r in rows
+               if isinstance(r.get("finished_generation_output_tokens"), int)]
+        block["finished_generation_output_tokens"] = round(statistics.mean(fin), 1) if len(fin) == len(rows) and fin else None
         block["cost_incomplete"] = any(r.get("cost_incomplete") for r in rows)
         for key in ("n_cited", "resolved", "not_found", "title_mismatch", "unverifiable"):
             vals = [r.get(key) for r in rows if isinstance(r.get(key), int)]
@@ -245,8 +279,8 @@ def build(run_dirs: list[Path], slate, *, ref: str = "B1", citations: str = "off
         betas = [r["beta"] for r in rows if isinstance(r.get("beta"), (int, float))]
         block["beta_mean"] = round(statistics.mean(betas), 3) if betas else None
         result["arms"][arm] = block
-        if arm != ref:
-            result["paired"][arm] = {m: paired(s, arms[ref], m) for m in METRICS}
+        if arm != refs[arm] and refs[arm] in arms:
+            result["paired"][arm] = {m: paired(s, arms[refs[arm]], m) for m in METRICS}
     ns = [v["composite_v1"]["n"] for v in result["paired"].values() if "composite_v1" in v and v["composite_v1"].get("n")]
     result["min_detectable_dz"] = min_detectable_dz(min(ns)) if ns else None
     if ask is not None:
@@ -266,7 +300,10 @@ def _fmt(block: dict | None, pct: bool = False) -> str:
 
 def render(result: dict) -> str:
     ref = result["ref"]
-    order = sorted(result["arms"], key=lambda a: (a != ref, a))
+    refs = result.get("refs") or {a: ref for a in result["arms"]}
+    # each condition's reference first, then its arms
+    order = sorted(result["arms"], key=lambda a: (a.split("@", 1)[1] if "@" in a else "", a != refs[a], a))
+    compared = [a for a in order if a in result["paired"]]
     L = [f"# Arm comparison (reference: {ref})", "",
          f"Runs: " + ", ".join(f"{a} = `{r}`" for a, r in sorted(result["runs"].items())),
          f"Citation check: {result['citations_mode']}. Every arm re-scored from its report text by this tool.", ""]
@@ -284,18 +321,18 @@ def render(result: dict) -> str:
         L.append("| " + " | ".join([a] + [("n/a" if b[k] is None else str(b[k]))
                                           for k in ("n_cited", "resolved", "not_found", "title_mismatch", "unverifiable")]) + " |")
     L += ["", "## Cost (mean per prompt)", "",
-          "| Arm | calls | generation output tokens | wall s | reported $ | report chars | beta (coverage co-failure) |",
-          "|---|---|---|---|---|---|---|"]
+          "| Arm | calls | generation output tokens | of which finished normally | wall s | reported $ | report chars | beta (coverage co-failure) |",
+          "|---|---|---|---|---|---|---|---|"]
     for a in order:
         b = result["arms"][a]
         cost = f"{'>= ' if b['cost_incomplete'] else ''}{b['cost_usd']:.2f}"
-        L.append(f"| {a} | {b['calls'] or 'n/r'} | {b['generation_output_tokens']:.0f} | {b['elapsed_s']:.0f} | {cost} | "
+        fin = b.get("finished_generation_output_tokens")
+        L.append(f"| {a} | {b['calls'] or 'n/r'} | {b['generation_output_tokens']:.0f} | "
+                 f"{'n/r' if fin is None else format(fin, '.0f')} | {b['elapsed_s']:.0f} | {cost} | "
                  f"{b['length_chars']:.0f} | {'n/a' if b['beta_mean'] is None else b['beta_mean']} |")
-    L += ["", f"## Paired differences vs {ref} (arm minus {ref}, shared prompts only)", ""]
-    for a in order:
-        if a == ref:
-            continue
-        L += [f"### {a}", "", "| Metric | n | mean delta | 95% CI | t | p | d_z | CI excludes 0 |", "|---|---|---|---|---|---|---|---|"]
+    L += ["", f"## Paired differences vs {ref} (arm minus {ref} of the same condition, shared prompts only)", ""]
+    for a in compared:
+        L += [f"### {a} vs {refs[a]}", "", "| Metric | n | mean delta | 95% CI | t | p | d_z | CI excludes 0 |", "|---|---|---|---|---|---|---|---|"]
         for m in METRICS:
             p = result["paired"][a][m]
             if p.get("n", 0) < 2:
@@ -310,8 +347,8 @@ def render(result: dict) -> str:
     if result.get("judge"):
         L += ["", f"## Blind pairwise judge vs {ref} (both orders; an order flip is a tie)", "",
               "| Arm | wins | ties | losses | sign-test p | order flips | judge errors |", "|---|---|---|---|---|---|---|"]
-        for a in order:
-            if a == ref:
+        for a in compared:
+            if a not in result["judge"]:
                 continue
             j = result["judge"][a]
             L.append(f"| {a} | {j['wins']} | {j['ties']} | {j['losses']} | {j['sign_test_p']} | {j['order_flips']} | {j['errors']} |")
@@ -321,8 +358,10 @@ def render(result: dict) -> str:
               f"Cohen's kappa = {k['kappa']} over {k['n_judgements']} criterion-level judgements "
               f"(raw agreement {k['raw_agreement']}). Below ~0.6 the judged table above should not be trusted."]
     miss = {a: m for a, m in result["missing"].items() if m}
-    if miss or any(result["skipped"].values()):
+    if miss or any(result["skipped"].values()) or result.get("no_reference"):
         L += ["", "## Not scored", ""]
+        for a in result.get("no_reference") or []:
+            L.append(f"- {a} has no {refs[a]} run to be compared with")
         for a in order:
             if result["missing"].get(a):
                 L.append(f"- {a} has no report for: {', '.join(result['missing'][a])}")
@@ -342,9 +381,12 @@ def main():
     ap.add_argument("--allow-same-family", action="store_true")
     ap.add_argument("--labels", default=None)
     ap.add_argument("--out", default=None, help="output dir (default: bench/comparisons/<ref>_<n runs>)")
+    ap.add_argument("--condition", action="append", default=[], metavar="RUN=LABEL",
+                    help="condition label for a run folder whose config.json has none (repeatable)")
     args = ap.parse_args()
 
     slate = load_slate(args.slate)
+    conditions = dict(c.split("=", 1) for c in args.condition)
     out = Path(args.out) if args.out else Path(__file__).parent / "comparisons" / f"vs_{args.ref}"
     out.mkdir(parents=True, exist_ok=True)
     ask, cache = None, None
@@ -360,7 +402,8 @@ def main():
     elif args.labels:
         ask = lambda p, s, schema: None          # cache-only: judge what is already judged
     result = build([Path(r) for r in args.runs], slate, ref=args.ref, citations=args.citations,
-                   ask=ask, judge_cache=cache, labels=Path(args.labels) if args.labels else None)
+                   ask=ask, judge_cache=cache, labels=Path(args.labels) if args.labels else None,
+                   conditions=conditions)
     if cache is not None:
         J.save_cache(out / "judge_cache.json", cache)
     (out / "comparison.json").write_text(json.dumps(result, indent=1) + "\n", encoding="utf-8")

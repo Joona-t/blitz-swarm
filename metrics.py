@@ -105,6 +105,10 @@ class RunMetrics:
     cost_incomplete: bool = False         # WP4: some call had no cost -> total is a lower bound
     total_input_tokens: int = 0
     total_output_tokens: int = 0
+    # Output tokens of agent calls that ended normally: no error, not cut at
+    # the token limit, and not the judge / selector hooks. The bench matches
+    # the self-revising baseline's budget on this, not on the total.
+    finished_generation_output_tokens: int = 0
     estimated_cost_units: float = 0.0
 
 
@@ -148,6 +152,7 @@ class MetricsCollector:
         policies: set[str] = set()
         providers: dict[str, str] = {}
         finish_reasons: dict[str, int] = {}
+        finished_generation = 0
 
         for o in outputs:
             fr = str(o.get("_finish_reason") or "none")
@@ -182,6 +187,8 @@ class MetricsCollector:
                 providers[str(o.get("role") or "?")] = str(o["_backend_id"])
             round_input_tokens += in_tok
             round_output_tokens += out_tok
+            if "_hook_calls" not in o and not o.get("_error") and o.get("_finish_reason") != "length":
+                finished_generation += out_tok
 
         rm = RoundMetrics(
             round_name=round_name,
@@ -209,6 +216,7 @@ class MetricsCollector:
             self.run.cost_incomplete = True
         self.run.total_input_tokens += round_input_tokens
         self.run.total_output_tokens += round_output_tokens
+        self.run.finished_generation_output_tokens += finished_generation
 
     def record_consensus_state(self, round_name: str, ready_count: int,
                                 total_voters: int, avg_confidence: float):

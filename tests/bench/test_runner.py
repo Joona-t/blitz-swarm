@@ -188,7 +188,7 @@ async def test_run_one_prompt_timeout(tmp_path, slate_path):
 
     slate = load_slate(slate_path)
     prompt = slate.by_id("s001")
-    cfg = make_cfg(slate_path, per_prompt_timeout_s=0.1)
+    cfg = make_cfg(slate_path, per_prompt_timeout_s=0.1, arm="B1")
     run_dir = tmp_path / "run"
     run_dir.mkdir()
 
@@ -196,6 +196,7 @@ async def test_run_one_prompt_timeout(tmp_path, slate_path):
                                   swarm_fn=slow_swarm, metrics_path=metrics_path)
     assert result.timeout is True
     assert result.error == "timeout"
+    assert result.arm == "B1", "a timed-out row keeps its arm"
     assert "FM-3.1" in result.mast_flags
 
 

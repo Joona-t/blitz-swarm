@@ -355,3 +355,18 @@ def test_invoke_agent_telemetry_carries_finish_reason(monkeypatch, tmp_path):
     agent = BlitzAgent(id="r0", role="researcher", subtopic="t", system_prompt="S")
     out = orchestrator.invoke_agent(agent, "ctx", "task", backend=B(), scratch_dir=tmp_path)
     assert out["_finish_reason"] == "length" and out["_thinking_chars"] == 7
+
+
+def test_finished_generation_tokens_exclude_cut_off_errored_and_hook_calls():
+    mc = MetricsCollector()
+    mc.start_run("r1", "t")
+    mc.start_round("r")
+    mc.end_round("r", [
+        {"findings": "a", "_output_tokens": 1000, "_finish_reason": "stop"},
+        {"findings": "b", "_output_tokens": 16384, "_finish_reason": "length"},      # whitespace runaway
+        {"findings": "", "_error": True, "_error_msg": "empty content", "_output_tokens": 500},
+        {"findings": "judge", "_hook_calls": 12, "_output_tokens": 983014},          # pairwise judging
+        {"findings": "c", "_output_tokens": 200},                                    # adapter reports no reason
+    ])
+    assert mc.run.total_output_tokens == 1000 + 16384 + 500 + 983014 + 200
+    assert mc.run.finished_generation_output_tokens == 1200

@@ -66,7 +66,8 @@ class ArmContext:
     backend_id: str | None = None
     output_token_budget: int = 0      # B1 stop rule; 0 = stop at B1_MIN_CALLS
     n_drafts: int = 0                 # B2/B3; 0 = the planner's researcher count
-    timeout_s: int = 900
+    timeout_s: int = 900              # per model call (bench --arm-call-timeout)
+    prompt_timeout_s: int = 0         # the runner's per-prompt limit; 0 = none. No call starts after it
     allow_same_family: bool = False
     system_prompt: str = ""           # researcher system prompt; "" = load the swarm's
     judge_cache: dict = field(default_factory=dict)
@@ -91,6 +92,12 @@ class _CallLog:
         self.cost_unknown = 0
         self.providers: set[str] = set()
         self.truncated = 0             # calls with finish_reason == "length"
+        self.errored = 0               # calls that returned an error (their tokens are still counted above)
+        # Generation tokens from calls that ended normally: no error and not
+        # cut at the token limit. This is what B1's budget is matched on, so a
+        # runaway or an all-reasoning reply is a cost, not budget.
+        self.finished_gen_output_tokens = 0
+        self.started = time.monotonic()
 
     def add(self, kind: str, result) -> None:
         self.calls += 1
@@ -110,6 +117,10 @@ class _CallLog:
         finish_reason = meta.get("finish_reason") or meta.get("done_reason")   # openai_http | ollama_http
         if finish_reason == "length":
             self.truncated += 1
+        if result.errored:
+            self.errored += 1
+        elif kind != "judge" and finish_reason != "length":
+            self.finished_gen_output_tokens += int(result.output_tokens or 0)
         row = {
             "kind": kind, "provider": provider, "model": result.model,
             "input_tokens": int(result.input_tokens or 0), "output_tokens": int(result.output_tokens or 0),
@@ -127,7 +138,8 @@ class _CallLog:
             "total_cost_usd": self.cost_usd, "cost_incomplete": self.cost_unknown > 0,
             "total_input_tokens": self.input_tokens, "total_output_tokens": self.output_tokens,
             "generation_output_tokens": self.gen_output_tokens, "calls": self.calls,
-            "truncated_calls": self.truncated,
+            "finished_generation_output_tokens": self.finished_gen_output_tokens,
+            "truncated_calls": self.truncated, "errored_calls": self.errored,
             "providers": sorted(self.providers), "total_wall_clock_s": round(time.monotonic() - started, 1),
             "consensus_reached": False, "rounds_to_consensus": 0,
         }
@@ -149,20 +161,43 @@ def _researcher_setup(ctx: ArmContext, topic: str) -> tuple[str, int]:
     return system, ctx.n_drafts or max(2, len(researchers))
 
 
+def _call_timeout(ctx: ArmContext, log: _CallLog, kind: str) -> int:
+    """Seconds this call may take. Raises ArmError once the prompt's time
+    limit has passed: the runner stops waiting at that limit, but it cannot
+    stop this thread, so the arm stops itself instead of calling on."""
+    if not ctx.prompt_timeout_s:
+        return ctx.timeout_s
+    left = ctx.prompt_timeout_s - (time.monotonic() - log.started)
+    if left <= 0:
+        raise ArmError(f"{kind} call not started: prompt time limit of {ctx.prompt_timeout_s}s reached")
+    return max(1, min(ctx.timeout_s, int(left)))
+
+
 def _generate(ctx: ArmContext, log: _CallLog, kind: str, prompt: str, system: str) -> str:
-    """One no-tools researcher-role call returning plain text; raises ArmError."""
+    """One no-tools researcher-role call returning plain text; raises ArmError.
+
+    An empty reply is asked for once more (a thinking model can spend the
+    whole request on reasoning). Both calls are logged and counted. Other
+    errors (HTTP, timeout) are not retried."""
     from backends import AgentCall
     from backends.models import resolve_model
     resolved = resolve_model("researcher", ctx.backend_id or ctx.cfg.backend.default, ctx.cfg)
-    result = ctx.backend.call(AgentCall(
-        role=f"bench_{kind}", model_role="researcher", prompt=prompt, system_prompt=system,
-        model=resolved.model, reasoning_effort=resolved.effort, timeout_s=ctx.timeout_s,
-        cwd=ctx.run_dir / "scratch", tools=None, max_turns=1,
-    ))
-    log.add(kind, result)
-    if result.errored or not (result.text or "").strip():
-        raise ArmError(f"{kind} call failed: {result.error or 'empty output'}")
-    return result.text.strip()
+    for attempt in (1, 2):
+        result = ctx.backend.call(AgentCall(
+            role=f"bench_{kind}", model_role="researcher", prompt=prompt, system_prompt=system,
+            model=resolved.model, reasoning_effort=resolved.effort, timeout_s=_call_timeout(ctx, log, kind),
+            cwd=ctx.run_dir / "scratch", tools=None, max_turns=1,
+        ))
+        log.add(kind, result)
+        text = (result.text or "").strip()
+        if text and not result.errored:
+            return text
+        empty_reply = not result.errored or "empty content" in (result.error or "")
+        if attempt == 1 and empty_reply:
+            continue
+        raise ArmError(f"{kind} call failed: {result.error or 'empty output'}"
+                       + (" (after one retry)" if attempt == 2 else ""))
+    raise AssertionError("unreachable")
 
 
 def _finish(ctx: ArmContext, arm: str, topic: str, report: str, drafts: list[str],
@@ -212,9 +247,9 @@ def run_b1(ctx: ArmContext, topic: str):
         critique = _generate(ctx, log, "critique", CRITIQUE_TASK.format(topic=topic, draft=draft), system)
         draft = _generate(ctx, log, "revise",
                           REVISE_TASK.format(topic=topic, draft=draft, critique=critique), system)
-        if log.calls + 2 > B1_MAX_CALLS:
+        if (log.calls - log.errored) + 2 > B1_MAX_CALLS:      # a retried empty reply is not a cycle
             break
-        if log.gen_output_tokens >= ctx.budget_by_key.get(prompt_key(topic), ctx.output_token_budget):
+        if log.finished_gen_output_tokens >= ctx.budget_by_key.get(prompt_key(topic), ctx.output_token_budget):
             break
     return _finish(ctx, "B1", topic, draft, [], log, started)
 
@@ -252,6 +287,7 @@ def run_b2(ctx: ArmContext, topic: str):
         wins: dict[tuple[str, str], float] = {}
         for i in range(len(drafts)):
             for j in range(i + 1, len(drafts)):
+                _call_timeout(ctx, log, "judge")          # stop judging once the prompt's time is up
                 v = J.compare(topic, drafts[i], drafts[j], ask, cache=ctx.judge_cache)
                 # criteria-level wins feed Bradley-Terry; ties split
                 wins[(ids[i], ids[j])] = wins.get((ids[i], ids[j]), 0.0) + v["x_wins"] + v["ties"] / 2
@@ -296,21 +332,23 @@ def make_arm(name: str, ctx: ArmContext | None):
 
 
 def tier_budgets(run_dir: Path, slate) -> dict[str, int]:
-    """Median OUTPUT tokens per tier from an S run's results.jsonl: the B1
-    budget (errored / timed-out prompts excluded)."""
+    """Median per tier of an S run's normally finished generation tokens
+    (results.jsonl): the B1 budget. Errored / timed-out prompts are excluded.
+    Rows from before that field existed fall back to all output tokens."""
     import statistics
     by_tier: dict[str, list[int]] = {}
     for line in (Path(run_dir) / "results.jsonl").read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
         row = json.loads(line)
-        if row.get("error") or row.get("timeout") or not row.get("output_tokens"):
+        tokens = row.get("finished_generation_output_tokens") or row.get("output_tokens")
+        if row.get("error") or row.get("timeout") or not tokens:
             continue
         try:
             tier = slate.by_id(row["prompt_id"]).tier
         except Exception:
             continue
-        by_tier.setdefault(tier, []).append(int(row["output_tokens"]))
+        by_tier.setdefault(tier, []).append(int(tokens))
     return {t: int(statistics.median(v)) for t, v in by_tier.items()}
 
 

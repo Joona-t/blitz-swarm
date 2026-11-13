@@ -89,6 +89,8 @@ class BenchConfig:
     allow_same_family: bool = False     # let B2's judge share the generator's provider (biased)
     citations: str = "off"              # M1: off | offline (cache only) | live
     output_token_cap: int = 0           # stop starting prompts once the run has generated this many
+    arm_call_timeout_s: int = 900       # baseline arms: limit for one generation call
+    condition: str = ""                 # label for what differs from other runs of this arm (e.g. "think-off")
 
     def filter_slate(self, slate: BenchSlate) -> list[BenchPrompt]:
         return slate.filter(
@@ -128,6 +130,7 @@ class PromptResult:
     arm: str = "S"
     calls: int = 0                       # model calls (baseline arms; 0 = not recorded for S)
     generation_output_tokens: int = 0    # output tokens excluding judge calls
+    finished_generation_output_tokens: int = 0   # ...and excluding errored / cut-off calls (B1's budget basis)
     cost_incomplete: bool = False        # some call reported no cost -> cost_usd is a lower bound
     citation_check: dict | None = None   # bench/citations.py M1 block (None = not run)
     beta: dict | None = None             # detectors.beta_coverage over the arm's drafts
@@ -453,9 +456,13 @@ async def run_one_prompt(
             timeout=cfg.per_prompt_timeout_s,
         )
     except asyncio.TimeoutError:
-        return _timeout_result(prompt, run_dir, started, started_utc_iso)
+        row = _timeout_result(prompt, run_dir, started, started_utc_iso)
+        row.arm = cfg.arm            # a failed row of a baseline arm is not an S row
+        return row
     except Exception as e:
-        return _error_result(prompt, run_dir, started, started_utc_iso, repr(e))
+        row = _error_result(prompt, run_dir, started, started_utc_iso, repr(e))
+        row.arm = cfg.arm
+        return row
 
     out_path, returned_rounds = _split_swarm_result(swarm_result)
     elapsed = round(time.monotonic() - started, 1)
@@ -552,6 +559,8 @@ async def run_one_prompt(
         generation_output_tokens=int(
             record.get("generation_output_tokens", record.get("total_output_tokens", 0)) or 0
         ) if record else 0,
+        finished_generation_output_tokens=int(
+            record.get("finished_generation_output_tokens", 0) or 0) if record else 0,
         cost_incomplete=bool(record.get("cost_incomplete", False)) if record else False,
         citation_check=citation_check,
         beta=beta,
@@ -954,6 +963,7 @@ async def run_bench(
                 backend=make_role_router(cfg.backend_id, blitz_cfg),
                 backend_id=cfg.backend_id, output_token_budget=cfg.output_token_budget,
                 n_drafts=cfg.n_drafts, allow_same_family=cfg.allow_same_family,
+                timeout_s=cfg.arm_call_timeout_s, prompt_timeout_s=cfg.per_prompt_timeout_s,
             )
             if cfg.budget_from:
                 budgets = tier_budgets(Path(cfg.budget_from), slate)
@@ -1107,6 +1117,10 @@ def main():
                     help="M1 citation resolution: live network, cache only, or off")
     ap.add_argument("--output-token-cap", type=int, default=0,
                     help="stop starting prompts once the run has generated this many output tokens")
+    ap.add_argument("--arm-call-timeout", type=int, default=900,
+                    help="baseline arms: seconds one generation call may take (never past the per-prompt limit)")
+    ap.add_argument("--condition", default="",
+                    help="label for this run's condition (e.g. think-off); bench.compare keeps conditions apart")
     ap.add_argument("--skip-preflight", action="store_true")
     args = ap.parse_args()
 
@@ -1128,6 +1142,8 @@ def main():
         allow_same_family=args.allow_same_family,
         citations=args.citations,
         output_token_cap=args.output_token_cap,
+        arm_call_timeout_s=args.arm_call_timeout,
+        condition=args.condition,
     )
     if not args.skip_preflight:
         from bench.preflight import run_preflight

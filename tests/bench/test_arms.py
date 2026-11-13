@@ -289,3 +289,103 @@ def test_call_log_records_finish_reason_so_truncation_is_visible(tmp_path, cfg):
     ctx3 = _ctx(tmp_path / "c", cfg, OllamaTruncating())
     _, _, record3 = _run("B0", ctx3)
     assert _log_rows(ctx3)[0]["finish_reason"] == "length" and record3["truncated_calls"] == 1
+
+
+# ---------------------------------------------------------------------------
+# ITER-P1e: fairness fixes after the thinking-on rerun
+# ---------------------------------------------------------------------------
+
+
+class ScriptedBackend(FakeBackend):
+    """Generation call number -> ("empty" | "length" | "http" | "slow")."""
+
+    def __init__(self, script, **kw):
+        super().__init__(**kw)
+        self.script = dict(script)
+        self.gen_calls = 0
+
+    def call(self, call):
+        if call.model_role == "judge":
+            return super().call(call)
+        self.gen_calls += 1
+        what = self.script.get(self.gen_calls)
+        if what == "empty":      # a thinking model that spent the whole request on reasoning
+            self.calls.append(call)
+            return AgentResult(backend_id="gen", adapter_kind="fake", model=call.model, text="", raw_stdout="",
+                               parsed=None, elapsed_s=0.1, errored=True, output_tokens=46795,
+                               error="openai_http: empty content (finish_reason='length')",
+                               metadata={"finish_reason": "length", "reasoning_tokens": 46795})
+        if what == "http":
+            self.calls.append(call)
+            return AgentResult(backend_id="gen", adapter_kind="fake", model=call.model, text="", raw_stdout="",
+                               parsed=None, elapsed_s=0.1, errored=True, error="openai_http HTTP 500: x")
+        result = super().call(call)
+        if what == "length":     # cut at the token limit but with some content
+            result.metadata = {"finish_reason": "length"}
+        return result
+
+
+def test_empty_reply_is_retried_once_and_both_calls_are_counted(tmp_path, cfg):
+    b = ScriptedBackend({3: "empty"}, out_tokens=1000)        # the first revise comes back empty
+    ctx = _ctx(tmp_path, cfg, b, output_token_budget=0)
+    path, _, record = _run("B1", ctx)
+    assert [c.role for c in b.calls] == ["bench_draft", "bench_critique", "bench_revise", "bench_revise"]
+    assert record["calls"] == 4 and record["errored_calls"] == 1 and path.read_text().startswith("# Report 3")
+    assert record["generation_output_tokens"] == 3000 + 46795, "the wasted call is still a cost"
+    assert record["finished_generation_output_tokens"] == 3000, "but it is not budget"
+    assert [r["errored"] for r in _log_rows(ctx)] == [False, False, True, False]
+
+
+def test_second_empty_reply_and_other_errors_fail_the_arm(tmp_path, cfg):
+    b = ScriptedBackend({1: "empty", 2: "empty"})
+    with pytest.raises(Exception, match="empty content.*after one retry"):
+        _run("B0", _ctx(tmp_path, cfg, b))
+    assert b.gen_calls == 2
+    b2 = ScriptedBackend({1: "http"})
+    with pytest.raises(Exception, match="HTTP 500"):
+        _run("B0", _ctx(tmp_path / "x", cfg, b2))
+    assert b2.gen_calls == 1, "an HTTP error is not retried"
+
+
+def test_b1_budget_counts_only_normally_finished_tokens_and_retry_is_not_a_cycle(tmp_path, cfg):
+    # Calls 2 and 3 are cut at the limit: 3 calls = 3000 tokens generated, 1000 finished.
+    b = ScriptedBackend({2: "length", 3: "length"}, out_tokens=1000)
+    _, _, record = _run("B1", _ctx(tmp_path, cfg, b, output_token_budget=2500))
+    assert record["calls"] == 5, "1000 finished < 2500, so one more cycle; 3000 >= 2500 stops"
+    assert record["generation_output_tokens"] == 5000 and record["finished_generation_output_tokens"] == 3000
+    # A retried empty reply does not use up one of the nine calls.
+    b2 = ScriptedBackend({3: "empty"}, out_tokens=10)
+    _, _, rec2 = _run("B1", _ctx(tmp_path / "y", cfg, b2, output_token_budget=10**9))
+    assert rec2["calls"] == B1_MAX_CALLS + 1 and rec2["errored_calls"] == 1
+
+
+def test_no_call_starts_after_the_prompt_time_limit(tmp_path, cfg, monkeypatch):
+    from bench import arms as A
+    now = [1000.0]
+    monkeypatch.setattr(A.time, "monotonic", lambda: now[0])
+
+    class Slow(FakeBackend):
+        def call(self, call):
+            now[0] += 40                      # every call takes 40 s
+            return super().call(call)
+
+    b = Slow(out_tokens=10)
+    ctx = _ctx(tmp_path, cfg, b, output_token_budget=10**9, prompt_timeout_s=100, timeout_s=900)
+    with pytest.raises(Exception, match="prompt time limit of 100s reached"):
+        A.run_b1(ctx, TOPIC)
+    assert len(b.calls) == 3, "calls at 0, 40 and 80 s start; the one due at 120 s does not"
+    assert [c.timeout_s for c in b.calls] == [100, 60, 20], "a call may not outlive the prompt's limit"
+    # Without a prompt limit the configured call timeout is used as is.
+    b2 = FakeBackend()
+    A.run_b0(_ctx(tmp_path / "z", cfg, b2, timeout_s=1234), TOPIC)
+    assert b2.calls[0].timeout_s == 1234
+
+
+def test_tier_budgets_prefer_finished_generation_tokens(tmp_path):
+    from bench import load_slate
+    slate = load_slate(Path(__file__).resolve().parents[2] / "bench" / "slate_v1.toml")
+    tier = slate.by_id("s001").tier
+    (tmp_path / "results.jsonl").write_text(json.dumps(
+        {"prompt_id": "s001", "output_tokens": 1468886, "finished_generation_output_tokens": 400000,
+         "error": None, "timeout": False}) + "\n", encoding="utf-8")
+    assert tier_budgets(tmp_path, slate) == {tier: 400000}

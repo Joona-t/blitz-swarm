@@ -140,3 +140,56 @@ def test_label_quit_keeps_finished_pairs_only(tmp_path):
     rows = [json.loads(l) for l in labels.read_text().splitlines()]
     assert n == 1 and len(rows) == 1
     assert rows[0]["criteria"] == {"accuracy": "x", "completeness": "y", "specificity": "tie", "consistency": "x"}
+
+
+# ---- ITER-P1e: conditions ---------------------------------------------------
+
+
+def _cond_run(tmp_path, arm, cond, texts, *, in_config=True):
+    run = _make_run(tmp_path / cond, arm, texts)
+    if in_config:
+        (run / "config.json").write_text(json.dumps({"arm": arm, "condition": cond}), encoding="utf-8")
+    return run
+
+
+def test_two_runs_of_one_arm_on_the_same_prompts_are_refused_not_merged(tmp_path):
+    slate = load_slate(SLATE)
+    texts = {p: _text(slate, p, 2) for p in PIDS}
+    a = _cond_run(tmp_path, "B1", "off", texts, in_config=False)
+    b = _cond_run(tmp_path, "B1", "on", texts, in_config=False)
+    with pytest.raises(ValueError, match="both have arm 'B1' for s001.*--condition"):
+        C.build([a, b], slate, ref="B1", citations="off")
+    # Disjoint prompts are one arm run in two parts and still merge.
+    c = _cond_run(tmp_path, "B1", "part1", {p: _text(slate, p, 2) for p in PIDS[:2]}, in_config=False)
+    d = _cond_run(tmp_path, "B1", "part2", {p: _text(slate, p, 2) for p in PIDS[2:]}, in_config=False)
+    assert C.build([c, d], slate, ref="B1", citations="off")["arms"]["B1"]["n_prompts"] == 5
+
+
+def test_each_arm_is_compared_with_the_reference_of_its_own_condition(tmp_path):
+    slate = load_slate(SLATE)
+    runs = [
+        _cond_run(tmp_path, "B1", "off", {p: _text(slate, p, 2) for p in PIDS}),
+        _cond_run(tmp_path, "S", "off", {p: _text(slate, p, 4) for p in PIDS}),     # S better with thinking off
+        _cond_run(tmp_path, "B1", "on", {p: _text(slate, p, 4) for p in PIDS}),
+        _cond_run(tmp_path, "S", "on", {p: _text(slate, p, 2) for p in PIDS}),      # and worse with it on
+        _cond_run(tmp_path, "B3", "other", {p: _text(slate, p, 3) for p in PIDS}),  # no B1 in this condition
+    ]
+    result = C.build(runs, slate, ref="B1", citations="off")
+    assert set(result["arms"]) == {"B1@off", "S@off", "B1@on", "S@on", "B3@other"}
+    assert set(result["paired"]) == {"S@off", "S@on"}
+    assert result["paired"]["S@off"]["coverage"]["mean_delta"] > 0.3
+    assert result["paired"]["S@on"]["coverage"]["mean_delta"] < -0.3
+    assert result["no_reference"] == ["B3@other"]
+    md = C.render(result)
+    assert "### S@off vs B1@off" in md and "### S@on vs B1@on" in md
+    assert "B3@other has no B1@other run to be compared with" in md
+
+
+def test_condition_can_be_given_for_runs_recorded_without_one(tmp_path):
+    slate = load_slate(SLATE)
+    texts = {p: _text(slate, p, 2) for p in PIDS}
+    a = _cond_run(tmp_path, "B1", "off", texts, in_config=False)
+    b = _cond_run(tmp_path, "B1", "on", texts, in_config=False)
+    b = b.rename(b.parent / "run_B1_on")
+    result = C.build([a, b], slate, ref="B1", citations="off", conditions={"run_B1_on": "on"})
+    assert set(result["arms"]) == {"B1", "B1@on"}

@@ -1,5 +1,39 @@
 # Bugs & Iterations
 
+## 2026-11-13: ITER-P1e — five fairness defects closed after the swarm/B1 rerun (thinking off and on)
+
+Joona, 2026-11-13: "Yes, fix them". Evidence is the lead session's rerun on the Forge
+(`bench/runs/20261112-vllm-rerun-think-{off,on}/`, not in git; one run each on s001, nothing scored).
+The four `results.jsonl` rows were read back for this entry; call-level figures are as the lead reported them.
+
+| Defect | Root cause | Fix | Test |
+|---|---|---|---|
+| One reply that was all reasoning ended a baseline arm (thinking on: B1 call 7, 46,795 output tokens, all reasoning, no content, 3,304 s lost) while the swarm survives a failed agent | `bench/arms.py` `_generate` raised on the first empty reply | an empty reply is asked for once more; both calls are logged and counted; a second empty reply, an HTTP error or a timeout still fails the arm | `tests/bench/test_arms.py::test_empty_reply_is_retried_once_and_both_calls_are_counted`, `::test_second_empty_reply_and_other_errors_fail_the_arm` |
+| B1's budget was the swarm's total output tokens: thinking off, a quarter of it was one whitespace runaway; thinking on, 983,014 of 1,468,886 were the selector's pairwise judging, which B1 has no counterpart for | `tier_budgets` read `output_tokens`; B1 compared its own total generation tokens | new `finished_generation_output_tokens` on both sides: tokens of generation calls that ended without error and were not cut at the token limit. Swarm: agent calls only, judge-ensemble and selector hooks excluded (`metrics.py`). B1 stops on its own finished tokens; a retried empty reply is not one of its nine calls. Total and generation tokens are still recorded as costs, and `bench.compare` prints both columns | `::test_b1_budget_counts_only_normally_finished_tokens_and_retry_is_not_a_cycle`, `::test_tier_budgets_prefer_finished_generation_tokens`, `tests/test_metrics.py::test_finished_generation_tokens_exclude_cut_off_errored_and_hook_calls` |
+| A timed-out prompt kept calling (reproduced live: runner recorded timeout at 3,600 s with 0 tokens; all 9 B1 calls ran on to 4,386 s and wrote a report) | the runner's `asyncio.wait_for` cannot stop the arm's thread | the arm knows the prompt's limit (`ArmContext.prompt_timeout_s`): no call or B2 judgement starts after it, and a call's own timeout is cut to the time left | `::test_no_call_starts_after_the_prompt_time_limit` |
+| Baseline generation calls were limited to 900 s whatever the model | `ArmContext.timeout_s = 900` was never set by the runner | `bench.runner --arm-call-timeout` (default 900) | same test (last assertion) |
+| Comparing two conditions overwrote one with the other | `bench/compare.py` merged runs of one arm by prompt id | a run has a condition (`bench.runner --condition`, or `bench.compare --condition RUN=LABEL` for runs recorded without one); rows are `arm@condition`; each arm is paired with the reference of its own condition; two runs of one label on the same prompt are refused with the fix named in the error | `tests/bench/test_compare.py::test_two_runs_of_one_arm_on_the_same_prompts_are_refused_not_merged`, `::test_each_arm_is_compared_with_the_reference_of_its_own_condition`, `::test_condition_can_be_given_for_runs_recorded_without_one` |
+
+Also: a timed-out or errored row of a baseline arm was written with `arm: "S"` (the dataclass default);
+it now keeps its arm (`tests/bench/test_runner.py::test_run_one_prompt_timeout`).
+
+Checked outside the diff (blast radius): the old `compare.build` on two same-arm runs gave one row with
+n = 1 and no error, the new one refuses (script run against `git show HEAD:bench/compare.py`); the swarm's
+record carries the new field through `asdict(self.run)`; nothing but `compare.render` reads
+`result["runs"]`. Suite: 927 passed, 17 skipped.
+
+**Still open.**
+- The swarm arm itself: after a per-prompt timeout its calls already in flight finish (bounded by the
+  agent and judge timeouts); no new round starts. Not changed here.
+- Waiting at the `max_parallel` gate is not inside a call's timeout, so a baseline call can start late and
+  end up to one call-timeout after the prompt's limit.
+- When the selector writes the final report, its synthesis tokens are in the excluded hook total, so the
+  swarm's finished figure is a lower bound there (it favours the swarm on cost, B1 gets less budget).
+- The whitespace runaway on schema-constrained calls is bounded by `extra_body.max_tokens`, not prevented.
+- With thinking on, one request can still be filled by prompt plus reasoning (65,536-token server limit);
+  the retry is a second chance, not a cure. Raising the limit is a shared-server setting.
+- None of this has been run live yet.
+
 ## 2026-11-12: ITER-P1d — first live runs on vLLM (Forge, qwen3.8-27b-fp8): five defects the live run surfaced
 
 Phase A smoke: every arm once on s001, thinking off and thinking on, against the shared vLLM server.
